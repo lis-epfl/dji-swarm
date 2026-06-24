@@ -150,7 +150,7 @@ class OlfatiSaber:
     instance can serve the whole swarm; per-drone state comes through args."""
 
     def __init__(self, r0_coh=150.0, delta=0.1, a=0.9, b=1.5, c=0.0,
-                 c_vm=1.0, scale=10.0):
+                 c_vm=0.0, scale=10.0):
         self.r0_coh = r0_coh
         self.delta  = delta
         self.a = a
