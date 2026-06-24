@@ -1,0 +1,55 @@
+{
+  "supportedMSDKVersion": "5.3.0",
+  "productType" : "DJI_MINI_3_PRO_AIRLINK",
+  "supportedMinFirmwareVersion" : "00.00.00.00",
+  "component" :
+      {
+            "className": "DJIAirLinkKey",
+            "keyList":[
+              {
+                "keyName" : "KeyConnection"
+              },
+             {
+               "keyName" : "KeyAirLinkType"
+             },
+              {
+                "keyName" : "KeySignalQuality"
+              },
+             {
+               "keyName" : "KeyVideoDataRate"
+             },
+             {
+               "keyName" : "KeyFrequencyInterference"
+             },
+             {
+               "keyName" : "KeyFrequencyBandRange"
+             },
+             {
+               "keyName" : "KeyFrequencyBand"
+             },
+             {
+               "keyName" : "KeyChannelSelectionMode"
+             },
+             {
+               "keyName" : "KeyBandwidth"
+             },
+             {
+               "keyName" : "KeyFrequencyPointRange"
+             },
+             {
+               "keyName" : "KeyFrequencyPoint"
+             },
+              {
+                "keyName" : "KeyWlmLinkQualityLevel"
+              },
+              {
+                "keyName" : "KeyWlmAircraftDongleListInfo"
+              },
+              {
+                "keyName" : "KeyWlmRcDongleListInfo"
+              }
+           ]
+     }
+
+
+}

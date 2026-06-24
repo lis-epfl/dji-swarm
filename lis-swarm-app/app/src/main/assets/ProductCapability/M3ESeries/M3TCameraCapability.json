@@ -1,0 +1,541 @@
+{
+  "supportedMSDKVersion": "5.2.0",
+  "productType" : "M3T Camera",
+  "supportedMinFirmwareVersion" : "10.00.31.10",
+  "component" :
+    {
+           "className": "DJICameraKey",
+           "keyList":[
+             {
+               "keyName" : "KeyConnection",
+               "supportedLens": [
+                 "CAMERA_LENS_DEFAULT"
+               ]
+             },
+             {
+               "keyName" : "KeyCameraType",
+               "supportedLens": [
+                 "CAMERA_LENS_DEFAULT"
+               ]
+             },
+             {
+               "keyName" : "KeyFirmwareVersion",
+               "supportedLens": [
+                 "CAMERA_LENS_DEFAULT"
+               ]
+             },
+           {
+             "keyName" : "KeyCameraModeRange",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]      
+           },
+           {
+             "keyName" : "KeyCameraMode",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]      
+           },           
+           {
+             "keyName" : "KeyIsShootingPhoto",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyStartShootPhoto",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyStopShootPhoto",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+             {
+               "keyName" : "KeyCaptureCameraStreamSettings",
+               "supportedLens": [
+                 "CAMERA_LENS_DEFAULT"
+               ]
+             },
+           {
+             "keyName" : "KeyPhotoFileFormatRange",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyPhotoFileFormat",
+             "supportedLens": [
+                "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyPhotoIntervalShootSettings",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyPhotoIntervalCountdown",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+             {
+               "keyName" : "KeySuperResolutionInfo",
+               "supportedLens": [
+                 "CAMERA_LENS_DEFAULT"
+               ]
+             },
+             {
+               "keyName" : "KeySuperResolutionCaptureArea",
+               "supportedLens": [
+                 "CAMERA_LENS_DEFAULT"
+               ]
+             },
+             {
+             "keyName" : "KeyPhotoPanoramaMode",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },    
+           {
+             "keyName" : "KeyIsShootingPhotoPanorama",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },               
+           {
+             "keyName" : "KeyPhotoPanoramaProgress",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+           "keyName" : "KeyIsRecording",
+           "supportedLens": [
+             "CAMERA_LENS_DEFAULT"
+             ]
+          },
+           {
+             "keyName" : "KeyStartRecord",
+             "supportedLens": [
+              "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyStopRecord",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+
+           {
+             "keyName" : "KeyRecordingTime",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+             {
+               "keyName" : "KeyRecordCameraStreamSettings",
+               "supportedLens": [
+                 "CAMERA_LENS_DEFAULT"
+               ]
+             },
+           {
+             "keyName" : "KeyVideoFileFormatRange",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyVideoFileFormat",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyNewlyGeneratedMediaFile",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },                    
+           {
+             "keyName" : "KeyCustomExpandDirectoryNameSettings",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyCustomExpandFileNameSettings",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyCameraStorageInfos",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyCameraVideoCaptionEnabled",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyCameraWatermarkSettings",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyWatermarkDisplayContentSettings",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyWatermarkUserCustomInfo",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyLockGimbalDuringShootPhotoEnabled",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyAutoTurnOffLEDMode",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+             {
+               "keyName" : "KeyCameraVideoStreamSourceRange",
+               "supportedLens": [
+                 "CAMERA_LENS_DEFAULT"
+               ]
+             },
+           {
+             "keyName" : "KeyCameraVideoStreamSource",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+             ]
+           },
+           {
+             "keyName" : "KeyExposureModeRange",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyExposureMode",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyExposureCompensationRange",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyExposureCompensation",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyAELockEnabled",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+             {
+               "keyName" : "KeyCameraMeteringMode",
+               "supportedLens": [
+                 "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]
+             },
+             {
+               "keyName" : "KeySpotMeteringPoint",
+               "supportedLens": [
+                 "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]
+             },
+             {
+               "keyName" : "KeyRegionMeteringArea",
+               "supportedLens": [
+                 "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]
+             },
+           {
+             "keyName" : "KeyISORange",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyISO",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyShutterSpeedRange",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyShutterSpeed",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyPhotoRatioRange",
+             "supportedLens": [
+                "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE","CAMERA_LENS_THERMAL"
+               ]     
+           },
+           {
+             "keyName" : "KeyPhotoRatio",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE","CAMERA_LENS_THERMAL"
+               ]     
+           },
+           {
+             "keyName" : "KeyVideoResolutionFrameRateRange",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyVideoResolutionFrameRate",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+            "keyName" : "KeyCameraZoomRatios",
+            "supportedLens": [
+              "CAMERA_LENS_ZOOM"
+              ]     
+           },
+           {
+            "keyName" : "KeyCameraZoomFocalLength",
+           "supportedLens": [
+             "CAMERA_LENS_ZOOM"
+              ]     
+           },
+           {
+             "keyName" : "KeyCameraFocusMode",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyCameraFocusRingMinValue",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyCameraFocusRingMaxValue",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyCameraFocusRingValue",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+           {
+             "keyName" : "KeyCameraFocusTarget",
+             "supportedLens": [
+               "CAMERA_LENS_ZOOM","CAMERA_LENS_WIDE"
+               ]     
+           },
+             {
+               "keyName" : "KeyThermalTemperatureMeasureMode",
+               "supportedLens": [
+                 "CAMERA_LENS_THERMAL"
+               ]
+             },
+             {
+             "keyName" : "KeyThermalSpotMetersurePoint",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           }, 
+           {
+             "keyName" : "KeyThermalSpotMetersureTemperature",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },  
+           {
+             "keyName" : "KeyThermalRegionMetersureArea",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },  
+           {
+             "keyName" : "KeyThermalRegionMetersureTemperature",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },                             
+           {
+             "keyName" : "KeyThermalGainMode",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },  
+           {
+             "keyName" : "KeyThermalGainModeTemperatureRange",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },           
+           {
+             "keyName" : "KeyThermalPaletteRange",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },  
+           {
+             "keyName" : "KeyThermalPalette",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },                       
+           {
+             "keyName" : "KeyThermalIsothermEnabled",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },                 
+           {
+             "keyName" : "KeyThermalIsothermUnit",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },      
+           {
+             "keyName" : "KeyThermalIsothermUpperValue",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },      
+           {
+             "keyName" : "KeyThermalIsothermLowerValue",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },
+           {
+             "keyName" : "KeyThermalDisplayMode",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]
+           },
+             {
+               "keyName" : "KeyThermalPIPPosition",
+               "supportedLens": [
+                 "CAMERA_LENS_THERMAL"
+               ]
+             },
+           {
+             "keyName" : "KeyThermalFFCMode",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },
+           {
+             "keyName" : "KeyThermalTriggerFFC",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },      
+           {
+             "keyName" : "KeyThermalZoomRatios",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },
+             {
+               "keyName" : "KeyLinkZoomEnabled",
+               "supportedLens": [
+                 "CAMERA_LENS_THERMAL"
+               ]
+             },
+             {
+             "keyName" : "KeyThermalSuperResolution",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },                            
+           {
+             "keyName" : "KeyThermalROI",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },                            
+           {
+             "keyName" : "KeyThermalScene",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },    
+           {
+             "keyName" : "KeyThermalDDE",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },    
+           {
+             "keyName" : "KeyThermalContrast",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },    
+           {
+             "keyName" : "KeyThermalBrightness",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]     
+           },
+           {
+             "keyName" : "KeyThermalTriggerFFC",
+             "supportedLens": [
+               "CAMERA_LENS_THERMAL"
+               ]
+           },
+          
+           {
+             "keyName" : "KeyResetCameraSetting",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           },
+           {
+             "keyName" : "KeyFormatStorage",
+             "supportedLens": [
+               "CAMERA_LENS_DEFAULT"
+               ]     
+           }
+           ]
+     }
+}

@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs grep:*)",
+      "Read(//c/Users/jarvis/Documents/DJI_Swarm/LIS_Swarm_App ./gradlew :app:dependencies --configuration debugRuntimeClasspath 2 1 grep -E ^[+/**)",
+      "Read(//dev/**)",
+      "Read(//c/Users/jarvis/.gradle/caches/modules-2/files-2.1/com.dji/dji-sdk-v5-aircraft-provided/5.9.0/**)",
+      "Bash(unzip -l 835eb02512892298d3c3a080cf955e3fa51c0a/dji-sdk-v5-aircraft-provided-5.9.0.jar)",
+      "Bash(grep \"\\\\.class$\")",
+      "Read(//c/Users/jarvis/Documents/DJI_Swarm/**)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\jarvis\\Documents\\DJI_Swarm"
+    ]
+  }
+}

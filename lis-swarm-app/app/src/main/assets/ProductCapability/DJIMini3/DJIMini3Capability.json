@@ -1,0 +1,450 @@
+{
+  "supportedMSDKVersion": "5.3.0",
+  "productType": "DJI_MINI_3",
+  "supportedMinFirmwareVersion": "01.00.0450",
+  "airLink": [
+    {
+      "productType": "DJI_MINI_3_AIRLINK",
+      "capabilityFile": "DJIMini3/DJIMini3AirLinkCapability.json"
+    }
+  ],
+  "camera": [
+    {
+      "productType": "DJI_MINI_3",
+      "supportedComponentIndexType": [
+        "LEFT_OR_MAIN"
+      ],
+      "capabilityFile": "DJIMini3/DJIMini3CameraCapability.json"
+    }
+  ],
+  "gimbal": [
+    {
+      "productType": "DJI_MINI_3_GIMBAL",
+      "supportedComponentIndexType": [
+        "LEFT_OR_MAIN"
+      ],
+      "capabilityFile": "DJIMini3/DJIMini3GimbalCapability.json"
+    }
+  ],
+  "remoteController": [
+    {
+      "productType": "DJI_RC_N1_S",
+      "capabilityFile": "RemoteController/DJIRCN1SCapability.json"
+    }
+  ],
+  "flightController": [
+    {
+      "productType": "DJI_MINI_3_FC",
+      "capabilityFile": "DJIMini3/DJIMini3FlightControllerCapability.json"
+    }
+  ],
+  "battery": [
+    {
+      "productType": "DJI_MINI_3_BATTERY",
+      "capabilityFile": "DJIMini3/DJIMini3GimbalCapability.json"
+    }
+  ],
+  "userAccount": {
+    "className": "UserAccountManager",
+    "methodList": [
+      {
+        "methodName": "getLoginInfo"
+      },
+      {
+        "methodName": "logInDJIUserAccount"
+      },
+      {
+        "methodName": "logOutDJIUserAccount"
+      },
+      {
+        "methodName": "addLoginInfoUpdateListener"
+      },
+      {
+        "methodName": "removeLoginInfoUpdateListener"
+      },
+      {
+        "methodName": "clearAllLoginInfoUpdateListener"
+      }
+    ]
+  },
+  "mediaDataCenter": {
+    "className": "MediaDataCenter",
+    "methodList": [
+      {
+        "methodName": "getVideoStreamManager"
+      },
+      {
+        "methodName": "getMediaManager"
+      },
+      {
+        "methodName": "getLiveStreamManager"
+      }
+    ]
+  },
+  "videoStream": {
+    "className": "VideoStreamManager",
+    "methodList": [
+      {
+        "methodName": "getAvailableStreamSources"
+      },
+      {
+        "methodName": "addStreamSourcesListener"
+      },
+      {
+        "methodName": "removeStreamSourcesListener"
+      },
+      {
+        "methodName": "clearAllStreamSourcesListeners"
+      },
+      {
+        "methodName": "getAvailableVideoChannels"
+      },
+      {
+        "methodName": "getAvailableVideoChannel"
+      }
+    ]
+  },
+  "media": {
+    "className": "MediaManager",
+    "methodList": [
+      {
+        "methodName": "enable"
+      },
+      {
+        "methodName": "disable"
+      },
+      {
+        "methodName": "addMediaFileListStateListener"
+      },
+      {
+        "methodName": "removeMediaFileListStateListener"
+      },
+      {
+        "methodName": "removeAllMediaFileListStateListener"
+      },
+      {
+        "methodName": "getMediaFileListState"
+      },
+      {
+        "methodName": "setMediaFileDataSource"
+      },
+      {
+        "methodName": "pullMediaFileListFromCamera"
+      },
+      {
+        "methodName": "getMediaFileListData"
+      },
+      {
+        "methodName": "deleteMediaFiles"
+      },
+      {
+        "methodName": "playVideo"
+      },
+      {
+        "methodName": "seekVideo"
+      },
+      {
+        "methodName": "pauseVideo"
+      },
+      {
+        "methodName": "resumeVideo"
+      },
+      {
+        "methodName": "stopVideo"
+      },
+      {
+        "methodName": "addVideoPlayStateListener"
+      },
+      {
+        "methodName": "removeVideoPlayStateListener"
+      },
+      {
+        "methodName": "removeAllVideoPlayStateListener"
+      }
+    ]
+  },
+  "liveStream": {
+    "className": "LiveStreamManager",
+    "methodList": [
+      {
+        "methodName": "isStreaming"
+      },
+      {
+        "methodName": "setLiveStreamSettings"
+      },
+      {
+        "methodName": "getLiveStreamSettings"
+      },
+      {
+        "methodName": "setVideoChannelType"
+      },
+      {
+        "methodName": "getVideoChannelType"
+      },
+      {
+        "methodName": "startStream"
+      },
+      {
+        "methodName": "stopStream"
+      },
+      {
+        "methodName": "setLiveStreamQuality"
+      },
+      {
+        "methodName": "getLiveStreamQuality"
+      },
+      {
+        "methodName": "setLiveVideoBitrateMode"
+      },
+      {
+        "methodName": "getLiveVideoBitrateMode"
+      },
+      {
+        "methodName": "setLiveVideoBitrate"
+      },
+      {
+        "methodName": "getLiveVideoBitrate"
+      },
+      {
+        "methodName": "addLiveStreamStatusListener"
+      },
+      {
+        "methodName": "removeLiveStreamStatusListener"
+      }
+    ]
+  },
+  "virtualStick": {
+    "className": "VirtualStickManager",
+    "methodList": [
+      {
+        "methodName": "enableVirtualStick"
+      },
+      {
+        "methodName": "disableVirtualStick"
+      },
+      {
+        "methodName": "getLeftStick"
+      },
+      {
+        "methodName": "getRightStick"
+      },
+      {
+        "methodName": "setVirtualStickAdvancedModeEnabled"
+      },
+      {
+        "methodName": "sendVirtualStickAdvancedParam"
+      },
+      {
+        "methodName": "setVirtualStickStateListener"
+      },
+      {
+        "methodName": "removeVirtualStickStateListener"
+      },
+      {
+        "methodName": "clearAllVirtualStickStateListener"
+      }
+    ]
+  },
+  "flyZone": {
+    "className": "FlyZoneManager",
+    "methodList": [
+      {
+        "methodName": "addFlySafeNotificationListener"
+      },
+      {
+        "methodName": "removeFlySafeNotificationListener"
+      },
+      {
+        "methodName": "clearAllFlySafeNotificationListener"
+      },
+      {
+        "methodName": "getFlyZonesInSurroundingArea"
+      },
+      {
+        "methodName": "unlockAllEnhancedWarningFlyZone"
+      },
+      {
+        "methodName": "unlockAuthorizationFlyZone"
+      },
+      {
+        "methodName": "downloadFlyZoneLicensesFromServer"
+      },
+      {
+        "methodName": "getFlyZonesByAreaID"
+      },
+      {
+        "methodName": "pushFlyZoneLicensesToAircraft"
+      },
+      {
+        "methodName": "pullFlyZoneLicensesFromAircraft"
+      },
+      {
+        "methodName": "deleteFlyZoneLicensesFromAircraft"
+      },
+      {
+        "methodName": "setFlyZoneLicensesEnabled"
+      }
+    ]
+  },
+  "upgrade": {
+    "className": "UpgradeManager",
+    "methodList": [
+      {
+        "methodName": "addUpgradeableComponentListener"
+      },
+      {
+        "methodName": "removeUpgradeableComponentListener"
+      },
+      {
+        "methodName": "removeAllUpgradeComponentChangeListener"
+      },
+      {
+        "methodName": "getUpgradeableComponents"
+      },
+      {
+        "methodName": "checkUpgradeableComponents"
+      }
+    ]
+  },
+  "flightLog": {
+    "className": "FlightLogManager",
+    "methodList": [
+      {
+        "methodName": "getFlightRecordPath"
+      },
+      {
+        "methodName": "getFlyClogPath"
+      }
+    ]
+  },
+  "areaCode": {
+    "className": "AreaCodeManager",
+    "methodList": [
+      {
+        "methodName": "getAreaCode"
+      },
+      {
+        "methodName": "addAreaCodeChangeListener"
+      },
+      {
+        "methodName": "removeAreaCodeChangeListener"
+      },
+      {
+        "methodName": "clearAllListeners"
+      }
+    ]
+  },
+  "UASRemoteID": {
+    "className": "UASRemoteIDManager",
+    "methodList": [
+      {
+        "methodName": "setAreaCode"
+      },
+      {
+        "methodName": "getUASRemoteIDStatus"
+      },
+      {
+        "methodName": "addUASRemoteIDStatusListener"
+      },
+      {
+        "methodName": "removeUASRemoteIDStatusListener"
+      },
+      {
+        "methodName": "clearUASRemoteIDStatusListener"
+      },
+      {
+        "methodName": "setElectronicIDEnabled"
+      },
+      {
+        "methodName": "getElectronicIDEnabled"
+      },
+      {
+        "methodName": "addElectronicIDStatusListener"
+      },
+      {
+        "methodName": "removeElectronicIDStatusListener"
+      },
+      {
+        "methodName": "clearAllElectronicIDStatusListener"
+      },
+      {
+        "methodName": "setUARegistrationNumber"
+      },
+      {
+        "methodName": "getUARegistrationNumber"
+      },
+      {
+        "methodName": "addUARegistrationNumberStatusListener"
+      },
+      {
+        "methodName": "removeUARegistrationNumberStatusListener"
+      },
+      {
+        "methodName": "clearAllUARegistrationNumberStatusListener"
+      }
+    ]
+  },
+  "LDM": {
+    "className": "ILDMManager",
+    "methodList": [
+      {
+        "methodName": "isLDMLicenseLoaded"
+      },
+      {
+        "methodName": "isLDMEnabled"
+      },
+      {
+        "methodName": "isNetworkServiceEnabledForModule"
+      },
+      {
+        "methodName": "loadLocalLDMLicenseContent"
+      },
+      {
+        "methodName": "getLocalLDMLicensePath"
+      },
+      {
+        "methodName": "isLDMEnabled"
+      },
+      {
+        "methodName": "enableLDM"
+      },
+      {
+        "methodName": "disableLDM"
+      }
+    ]
+  },
+  "deviceStatus": {
+    "className": "DeviceStatusManager",
+    "methodList": [
+      {
+        "methodName": "addDJIDeviceStatusChangeListener"
+      },
+      {
+        "methodName": "removeDJIDeviceStatusChangeListener"
+      },
+      {
+        "methodName": "clearAllListeners"
+      },
+      {
+        "methodName": "getCurrentDJIDeviceStatus"
+      }
+    ]
+  },
+  "deviceHealth": {
+    "className": "DeviceHealthManager",
+    "methodList": [
+      {
+        "methodName": "addDJIDeviceHealthInfoChangeListener"
+      },
+      {
+        "methodName": "removeDJIDeviceHealthInfoChangeListener"
+      },
+      {
+        "methodName": "clearAllListeners"
+      },
+      {
+        "methodName": "getCurrentDJIDeviceHealthInfos"
+      }
+    ]
+  }
+}

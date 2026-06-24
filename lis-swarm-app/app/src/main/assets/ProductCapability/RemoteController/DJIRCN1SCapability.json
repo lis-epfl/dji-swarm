@@ -1,0 +1,72 @@
+{
+  "supportedMSDKVersion": "5.2.0",
+  "productType" : "DJI_RC_N1_S",
+  "supportedMinFirmwareVersion" : "04.16.0200",
+  "component" :
+{
+      "className": "DJIRemoteControllerKey",
+      "keyList":[
+          {
+            "keyName" : "KeyConnection"
+          },
+          {
+            "keyName" : "KeyRemoteControllerType"
+          },
+          {
+            "keyName" : "KeyControlMode"
+          },
+          {
+            "keyName" : "KeyBatteryInfo"
+          },
+          {
+            "keyName" : "KeySerialNumber"
+          },
+          {
+            "keyName" : "KeyFirmwareVersion"
+          },
+          {
+            "keyName" : "KeyStickLeftVertical"
+          },
+          {
+            "keyName" : "KeyStickLeftHorizontal"
+          },
+          {
+            "keyName" : "KeyStickRightVertical"
+          },
+          {
+            "keyName" : "KeyStickRightHorizontal"
+          },
+          {
+            "keyName" : "KeyShutterButtonDown"
+          },
+          {
+            "keyName" : "KeyRecordButtonDown"
+          },
+          {
+            "keyName" : "KeyGoHomeButtonDown"
+          },
+        {
+          "keyName" : "KeyRCSwitchButtonDown"
+        },
+          {
+            "keyName" : "KeyLeftDial"
+          },
+          {
+            "keyName" : "KeyCustomButton1Down"
+          },
+          {
+            "keyName" : "KeyRequestPairing"
+          },
+          {
+            "keyName" : "KeyStopPairing"
+          },
+          {
+            "keyName" : "KeyPairingStatus"
+          },
+        {
+          "keyName" : "KeyRebootDevice"
+        }
+      ]
+    }
+
+}

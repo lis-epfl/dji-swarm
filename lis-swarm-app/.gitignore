@@ -1,0 +1,26 @@
+# Gradle / Android
+.gradle/
+build/
+*/build/
+app/build/
+
+# APKs
+*.apk
+*.aab
+
+# Heap dumps
+*.hprof
+
+# Native build
+.externalNativeBuild/
+.cxx/
+
+# IDE
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/

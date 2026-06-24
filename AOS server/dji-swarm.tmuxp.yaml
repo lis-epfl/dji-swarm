@@ -1,0 +1,29 @@
+# DJI Swarm — joystick + UDP controller bridge
+#
+# On Windows: tmux/tmuxp aren't supported — use ./dji-joystick.ps1 instead
+# (for single-drone direct stick), or ./dji-flocking.ps1 for the Olfati-Saber
+# multi-drone flocking controller.
+#
+# Launches the two halves of the control pipeline side by side:
+#   left pane:  joystick_controller.py  (this repo, drives the drone via ds_wrapper)
+#   right pane: readController.py       (vr-swarm-simulation, reads the gamepad and
+#                                        ships JoystickData JSON over UDP :5055)
+#
+# Usage:
+#   tmuxp load dji-swarm.tmuxp.yaml
+#
+# Path convention:
+#   Paths below use WSL's mount layout (/mnt/c/...). If your tmux runs under
+#   Git Bash change "/mnt/c" to "/c"; under Cygwin, "/cygdrive/c".
+
+session_name: dji-swarm
+windows:
+  - window_name: drone-control
+    layout: even-horizontal
+    panes:
+      - start_directory: "/mnt/c/Users/jarvis/Documents/DJI_Swarm/AOS server"
+        shell_command:
+          - python joystick_controller.py
+      - start_directory: "/mnt/c/Users/jarvis/Documents/vr-swarm-simulation/Assets/script/control"
+        shell_command:
+          - python readController.py

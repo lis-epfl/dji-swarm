@@ -1,0 +1,8 @@
+{
+  "dependKeyName": "CameraVideoStreamSource",
+  "dependKeyValue": "{\"value\":3}",
+  "valueParamList": [
+    "{\"value\":1}",
+    "{\"value\":2}"
+  ]
+}

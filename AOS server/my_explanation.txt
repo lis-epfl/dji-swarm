@@ -1,0 +1,22 @@
+Publisher thread:   (Also called data steraming)
+                    - Creates mqtt broker for each drone in (num_drones_for_map_visualization).
+                    - Reads the telemetry and image
+                    - Writes the image to shared memory (MEEE)
+                    - Formats the telemetry and image as droneContent and adds it to a msg
+                    - Publishes this msg to the drone topic so the visualizer can render it
+
+Server thread:      - Reads waypoint data from a http server (address 8000)
+                    - Saves the waypoint data to a file
+                    - Sends back the data
+                    - Prints and shuts down
+
+
+Main thread:        - Load the waypoint data
+                    - Create arrays for each drones data
+                    - Create waypoint arrays for waypoint data for each drone/waypoint
+                    - Read the current telemetry of each drone and save in the takeoff/land Variable
+                    - 'q' pressed then stops publisher thread
+                    - 't' pressed 
+                        - make a mission of two waypoints using the takeoff telem, plus altitude and camera from first waypoint
+                        - Run the drone waypoint thread
+                            - Set go and update based on the two waypoints sent to the thread

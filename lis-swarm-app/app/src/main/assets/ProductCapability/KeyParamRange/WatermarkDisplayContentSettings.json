@@ -1,0 +1,6 @@
+{
+  "valueParamList": [
+    "{\"droneTypeEnabled\":true,\"droneSnEnabled\":true,\"cameraTypeEnabled\":true,\"cameraSnEnabled\":true,\"dateTimeEnabled\":true,\"timeZoneEnabled\":false,\"gpsLonLatEnabled\":true,\"gpsAltitudeEnabled\":true,\"userCustomStringEnabled\":true,\"manufacturerEnabled\":true,\"lengthUnit\":0,\"lonLatFormat\":0,\"screenLocation\":0}",
+    "{\"droneTypeEnabled\":false,\"droneSnEnabled\":false,\"cameraTypeEnabled\":false,\"cameraSnEnabled\":false,\"dateTimeEnabled\":false,\"timeZoneEnabled\":false,\"gpsLonLatEnabled\":false,\"gpsAltitudeEnabled\":false,\"userCustomStringEnabled\":false,\"manufacturerEnabled\":false,\"lengthUnit\":0,\"lonLatFormat\":0,\"screenLocation\":0}"
+  ]
+}

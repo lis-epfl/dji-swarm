@@ -1,0 +1,81 @@
+{
+  "supportedMSDKVersion": "5.2.0",
+  "productType" : "DJI_RC_PRO",
+  "supportedMinFirmwareVersion" : "03.01.0505",
+  "component" :
+{
+      "className": "DJIRemoteControllerKey",
+      "keyList":[  
+          {
+            "keyName" : "KeyConnection"
+          },
+          {
+            "keyName" : "KeyRemoteControllerType"
+          },
+          {
+            "keyName" : "KeyControlMode"
+          },
+          {
+            "keyName" : "KeyBatteryInfo"
+          },
+          {
+            "keyName" : "KeySerialNumber"
+          },
+          {
+            "keyName" : "KeyFirmwareVersion"
+          },
+          {
+            "keyName" : "KeyStickLeftVertical"
+          },
+          {
+            "keyName" : "KeyStickLeftHorizontal"
+          },
+          {
+            "keyName" : "KeyStickRightVertical"
+          },
+          {
+            "keyName" : "KeyStickRightHorizontal"
+          },
+          {
+            "keyName" : "KeyShutterButtonDown"
+          },
+          {
+            "keyName" : "KeyRecordButtonDown"
+          },
+          {
+            "keyName" : "KeyGoHomeButtonDown"
+          },
+          {
+            "keyName" : "KeyPauseButtonDown"
+          },
+          {
+            "keyName" : "KeyLeftDial"
+          },
+          {
+            "keyName" : "KeyRightDial"
+          },
+          {
+            "keyName" : "KeyFiveDimensionPressedStatus"
+          },     
+          {
+            "keyName" : "KeyCustomButton1Down"
+          },
+          {
+            "keyName" : "KeyCustomButton2Down"
+          },
+          {
+            "keyName" : "KeyRequestPairing"
+          },
+          {
+            "keyName" : "KeyStopPairing"
+          },
+          {
+            "keyName" : "KeyPairingStatus"
+          },
+        {
+          "keyName" : "KeyRebootDevice"
+        }
+      ]
+    }
+
+}

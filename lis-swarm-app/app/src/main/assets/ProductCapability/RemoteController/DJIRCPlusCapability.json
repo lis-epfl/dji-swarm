@@ -1,0 +1,126 @@
+{
+  "supportedMSDKVersion": "5.2.0",
+  "productType" : "DJI_RC_PLUS",
+  "supportedMinFirmwareVersion" : "00.03.0256",
+  "component" :
+{
+      "className": "DJIRemoteControllerKey",
+      "keyList":[  
+          {
+            "keyName" : "KeyConnection"
+          },
+          {
+            "keyName" : "KeyRemoteControllerType"
+          },
+          {
+            "keyName" : "KeyControlMode"
+          },
+          {
+            "keyName" : "KeyBatteryInfo"
+          },
+          {
+            "keyName" : "KeySerialNumber"
+          },
+          {
+            "keyName" : "KeyFirmwareVersion"
+          },
+          {
+            "keyName" : "KeyStickLeftVertical"
+          },
+          {
+            "keyName" : "KeyStickLeftHorizontal"
+          },
+          {
+            "keyName" : "KeyStickRightVertical"
+          },
+          {
+            "keyName" : "KeyStickRightHorizontal"
+          },
+          {
+            "keyName" : "KeyShutterButtonDown"
+          },
+          {
+            "keyName" : "KeyRecordButtonDown"
+          },
+          {
+            "keyName" : "KeyGoHomeButtonDown"
+          },
+          {
+            "keyName" : "KeyPauseButtonDown"
+          },
+          {
+            "keyName" : "KeyLeftDial"
+          },
+          {
+            "keyName" : "KeyRightDial"
+          },
+        {
+          "keyName" : "KeyScrollWheel1"
+        },
+          {
+            "keyName" : "KeyFiveDimensionPressedStatus"
+          },     
+          {
+            "keyName" : "KeyCustomButton1Down"
+          },
+          {
+            "keyName" : "KeyCustomButton2Down"
+          },
+          {
+            "keyName" : "KeyCustomButton3Down"
+          },
+          {
+            "keyName" : "KeyRequestPairing"
+          },
+          {
+            "keyName" : "KeyStopPairing"
+          },
+          {
+            "keyName" : "KeyPairingStatus"
+          },
+        {
+          "keyName" : "KeyRebootDevice"
+        },
+          {
+            "keyName" : "KeyMultiControlIsSupported"
+          },
+          {
+            "keyName" : "KeyMultiControlRequestPairing"
+          },
+          {
+            "keyName" : "KeyMultiControlChannel"
+          },
+          {
+            "keyName" : "KeyMultiControlOnlineRcCount"
+          },
+          {
+            "keyName" : "KeyMultiControlOnlineAppCount"
+          },
+          {
+            "keyName" : "KeyMultiControlStatus"
+          },
+          {
+            "keyName" : "KeyMultiControlFlightControlAuthorityOwner"
+          },
+          {
+            "keyName" : "KeyMultiControlGimbalAuthorityOwner"
+          },
+          {
+            "keyName" : "KeyMultiControlAuthorityObtain"
+          },
+          {
+            "keyName" : "KeyMultiControlLockAuthority"
+          },
+          {
+            "keyName" : "KeyMultiControlFlightControlAuthorityLockStatus"
+          },
+          {
+            "keyName" : "KeyMultiControlLostControlNotice"
+          },
+          {
+            "keyName" : "KeyMultiControlExecuteFailSafeActionWhenLostControl"
+          }
+      ]
+    }
+
+}

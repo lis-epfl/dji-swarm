@@ -1,0 +1,54 @@
+{
+  "supportedMSDKVersion": "5.2.0",
+  "productType" : "M3E_SERIES_BATTERY",
+  "supportedMinFirmwareVersion" : "08.75.02.08",
+  "component" :
+    {
+         "className": "DJIBatteryKey",
+         "keyList":[
+         {
+           "keyName" : "KeyConnection"
+         },
+         {
+           "keyName" : "KeyFullChargeCapacity"
+         },
+         {
+           "keyName" : "KeyChargeRemaining"
+         },
+         {
+           "keyName" : "KeyChargeRemainingInPercent"
+         },
+           {
+             "keyName" : "KeyBatteryTemperature"
+           },
+         {
+           "keyName" : "KeyVoltage"
+         },
+         {
+           "keyName" : "KeyCurrent"
+         },
+         {
+           "keyName" : "KeyNumberOfDischarges"
+         },
+         {
+           "keyName" : "KeyNumberOfCells"
+         },
+         {
+           "keyName" : "KeyCellVoltages"
+         },
+         {
+           "keyName" : "KeyBatteryManufacturedDate"
+         },
+         {
+           "keyName" : "KeySerialNumber"
+         },
+         {
+           "keyName" : "KeyFirmwareVersion"
+         },
+         {
+           "keyName" : "KeyBatterySelfDischargeInDays"
+         }
+         ]
+     }
+
+}

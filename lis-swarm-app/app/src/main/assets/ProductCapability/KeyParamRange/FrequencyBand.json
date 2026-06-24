@@ -1,0 +1,9 @@
+{
+  "dependKeyName": "ChannelSelectionMode",
+  "dependKeyValue": "{\"value\":0}",
+  "valueParamList": [
+    "{\"value\":1}",
+    "{\"value\":2}",
+    "{\"value\":0}"
+  ]
+}

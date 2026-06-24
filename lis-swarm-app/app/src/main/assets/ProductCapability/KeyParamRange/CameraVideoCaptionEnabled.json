@@ -1,0 +1,8 @@
+{
+  "dependKeyName": "CameraMode",
+  "dependKeyValue": "{\"value\":1}",
+  "valueParamList": [
+    "{\"value\":false}",
+    "{\"value\":true}"
+  ]
+}

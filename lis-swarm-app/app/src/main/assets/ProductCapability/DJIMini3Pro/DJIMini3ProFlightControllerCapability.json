@@ -1,0 +1,201 @@
+{
+  "supportedMSDKVersion": "5.3.0",
+  "productType" : "DJI_MINI_3_PRO_FC",
+  "supportedMinFirmwareVersion" : "30.05.17.01",
+  "component" :
+    {
+         "className": "DJIFlightControllerKey",
+         "keyList":[
+          {
+            "keyName" : "KeyConnection"
+          },
+          {
+            "keyName" : "KeyIsFlying"
+          },
+          {
+            "keyName" : "KeyFlightTimeInSeconds"
+          },
+          {
+            "keyName" : "KeyAircraftLocation3D"
+          },
+          {
+            "keyName" : "KeyAircraftAttitude"
+          },
+          {
+            "keyName" : "KeyAircraftVelocity"
+          },
+          {
+            "keyName" : "KeyTakeoffLocationAltitude"
+          },
+          {
+            "keyName" : "KeyFlightLogIndex"
+          },
+          {
+            "keyName" : "KeySerialNumber"
+          },
+          {
+            "keyName" : "KeyFirmwareVersion"
+          },
+          {
+            "keyName" : "KeyGPSSatelliteCount"
+          },
+          {
+            "keyName" : "KeyGPSSignalLevel"
+          },
+          {
+            "keyName" : "KeyCompassCount"
+          },
+          {
+            "keyName" : "KeyCompassHeading"
+          },
+          {
+            "keyName" : "KeyCompassHasError"
+          },
+          {
+            "keyName" : "KeyStartCompassCalibration"
+          },
+          {
+            "keyName" : "KeyStopCompassCalibration"
+          },
+          {
+            "keyName" : "KeyIsCompassCalibrating"
+          },
+          {
+            "keyName" : "KeyCompassCalibrationStatus"
+          },
+          {
+            "keyName" : "KeyIMUCount"
+          },
+          {
+            "keyName" : "KeyStartIMUCalibration"
+          },
+           {
+             "keyName" : "KeyIMUCalibrationInfo"
+           },
+          {
+            "keyName" : "KeyUltrasonicHeight"
+          },
+          {
+            "keyName" : "KeyWindWarning"
+          },
+          {
+            "keyName" : "KeyWindSpeed"
+          },
+          {
+            "keyName" : "KeyWindDirection"
+          },
+          {
+            "keyName" : "KeyMultipleFlightModeEnabled"
+          },
+          {
+            "keyName" : "KeyRemoteControllerFlightMode"
+          },
+           {
+             "keyName" : "KeyFlightMode"
+           },
+          {
+            "keyName" : "KeyIsFailSafe"
+          },
+          {
+            "keyName" : "KeyFailsafeAction"
+          },
+          {
+            "keyName" : "KeyLowBatteryWarningThreshold"
+          },
+          {
+            "keyName" : "KeyIsLowBatteryWarning"
+          },
+          {
+            "keyName" : "KeySeriousLowBatteryWarningThreshold"
+          },
+          {
+            "keyName" : "KeyIsSeriousLowBatteryWarning"
+          },
+          {
+            "keyName" : "KeyLEDsSettings"
+          },
+          {
+            "keyName" : "KeyAreMotorsOn"
+          },
+          {
+            "keyName" : "KeyLockMotors"
+          },
+          {
+            "keyName" : "KeyESCBeepEnabled"
+          },
+          {
+            "keyName" : "KeyStartTakeoff"
+          },
+          {
+            "keyName" : "KeyStopTakeoff"
+          },
+          {
+            "keyName" : "KeyStartAutoLanding"
+          },
+          {
+            "keyName" : "KeyStopAutoLanding"
+          },
+          {
+            "keyName" : "KeyIsLandingConfirmationNeeded"
+          },
+          {
+            "keyName" : "KeyConfirmLanding"
+          },
+          {
+            "keyName" : "KeyRebootDevice"
+          },
+          {
+            "keyName" : "KeyHeightLimitRange"
+          },
+          {
+            "keyName" : "KeyHeightLimit"
+          },
+          {
+            "keyName" : "KeyIsNearHeightLimit"
+          },
+          {
+            "keyName" : "KeyDistanceLimitEnabled"
+          },
+          {
+            "keyName" : "KeyDistanceLimitRange"
+          },
+          {
+            "keyName" : "KeyDistanceLimit"
+          },
+          {
+            "keyName" : "KeyIsNearDistanceLimit"
+          },
+          {
+            "keyName" : "KeyIsHomeLocationSet"
+          },
+          {
+            "keyName" : "KeyHomeLocation"
+          },
+          {
+            "keyName" : "KeyGoHomeHeight"
+          },
+          {
+            "keyName" : "KeyGoHomeHeightRange"
+          },
+          {
+            "keyName" : "KeyHomeLocationUsingCurrentAircraftLocation"
+          },
+          {
+            "keyName" : "KeyStartGoHome"
+          },
+          {
+            "keyName" : "KeyStopGoHome"
+          },
+          {
+            "keyName" : "KeyGoHomeStatus"
+          },
+          {
+            "keyName" : "KeyLowBatteryRTHEnabled"
+          },
+          {
+            "keyName" : "KeyLowBatteryRTHInfo"
+          }
+        ]
+     }
+
+}

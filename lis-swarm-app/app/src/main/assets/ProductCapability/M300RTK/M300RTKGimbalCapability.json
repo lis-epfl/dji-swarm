@@ -1,0 +1,79 @@
+{
+  "supportedMSDKVersion": "5.2.0",
+  "productType" : "M300_RTK_GIMBAL",
+  "supportedMinFirmwareVersion" : "00.00.00.00",
+  "component" :
+      {
+            "className": "DJIGimbalKey",
+            "keyList":[
+             {
+               "keyName" : "KeyConnection"
+             },
+             {
+               "keyName" : "KeyFirmwareVersion"
+             },
+             {
+               "keyName" : "KeyGimbalAttitude"
+             },
+             {
+               "keyName" : "KeyYawRelativeToAircraftHeading"
+             },
+             {
+               "keyName" : "KeyFineTunePitchTotalDegree"
+             },
+             {
+               "keyName" : "KeyFineTuneYawTotalDegree"
+             },
+             {
+               "keyName" : "KeyFineTuneRollTotalDegree"
+             },
+             {
+               "keyName" : "KeyGimbalMode"
+             },
+             {
+               "keyName" : "KeyRotateByAngle"
+             },
+             {
+               "keyName" : "KeyRotateBySpeed"
+             },
+             {
+               "keyName" : "KeyGimbalReset"
+             },
+             {
+               "keyName" : "KeyFineTunePitchInDegrees"
+             },
+             {
+               "keyName" : "KeyFineTuneYawInDegrees"
+             },
+             {
+               "keyName" : "KeyFineTuneRollInDegrees"
+             },
+             {
+               "keyName" : "KeyGimbalCalibrate"
+             },
+             {
+               "keyName" : "KeyGimbalCalibrationStatus"
+             },
+             {
+               "keyName" : "KeyRestoreFactorySettings"
+             },   
+             {
+               "keyName" : "KeyPitchRangeExtensionEnabled"
+             },
+             {
+               "keyName" : "KeyPitchControlMaxSpeed"
+             },
+             {
+               "keyName" : "KeyYawControlMaxSpeed"
+             },
+             {
+               "keyName" : "KeyPitchSmoothingFactor"
+             },
+             {
+               "keyName" : "KeyYawSmoothingFactor"
+             }
+           ]     
+     }        
+
+ 
+}

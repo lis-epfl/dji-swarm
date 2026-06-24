@@ -1,0 +1,61 @@
+# ===== OS / IDE =====
+.idea/
+*.iml
+.vs/
+*.user
+*.suo
+Thumbs.db
+.DS_Store
+
+# ===== Android (lis-swarm-app) =====
+.gradle/
+build/
+local.properties
+.cxx/
+captures/
+*.apk
+*.aab
+# heap dumps, e.g. lis-swarm-app/java_pid*.hprof (~780 MB)
+*.hprof
+
+# ===== Python (AOS server) =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== C++ / Visual Studio / MFC build output (AOS server) =====
+x64/
+Debug/
+Release/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.tlog
+*.lastbuildstate
+*.aps
+# CMake-generated (DroneSwarm_Wrapper/build/)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# NuGet restore output (restorable via packages.config)
+packages/
+
+# Regenerable binaries — rebuild via AOS server/README.md (FFmpeg/Paho libs,
+# the DroneSwarmServer.exe, the ds_wrapper Python module). Required Android
+# .so libs live under lis-swarm-app/app/src/main/{lib,jniLibs} and are NOT ignored.
+*.exe
+*.lib
+*.a
+*.pyd
+python37.dll
+
+# ===== Generated / captured runtime artifacts =====
+# bundled Edge WebView2 runtime next to DroneSwarmServer.exe
+*.WebView2/
+# captured drone image dumps from image_save.py
+saved_streams/

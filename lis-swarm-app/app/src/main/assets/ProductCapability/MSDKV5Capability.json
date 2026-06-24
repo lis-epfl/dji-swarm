@@ -1,0 +1,26 @@
+{
+  "supportedMSDKVersion": "5.2.0",
+  "productType" : "MSDK",
+  "supportedProductList" : [
+    {
+      "productType" : "M30_SERIES",
+      "capabilityFile" : "M30Series/M30SeriesCapability.json"
+    },
+    {
+      "productType" : "M300_RTK",
+      "capabilityFile" : "M300RTK/M300RTKCapability.json"
+    },
+    {
+      "productType" : "DJI_MAVIC_3_ENTERPRISE_SERIES",
+      "capabilityFile" : "M3ESeries/M3ESeriesCapability.json"
+    },
+    {
+      "productType" : "DJI_MINI_3",
+      "capabilityFile" : "DJIMini3/DJIMini3Capability.json"
+    },
+    {
+      "productType" : "DJI_MINI_3_PRO",
+      "capabilityFile" : "DJIMini3Pro/DJIMini3ProCapability.json"
+    }
+  ]
+}
