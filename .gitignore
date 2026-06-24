@@ -59,3 +59,5 @@ python37.dll
 *.WebView2/
 # captured drone image dumps from image_save.py
 saved_streams/
+# flight data logs from flight_logger.py (telemetry / commands CSVs)
+flight_logs/

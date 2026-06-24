@@ -37,16 +37,19 @@ class JoystickState:
 
 
 class JoystickReceiver:
-    def __init__(self, host="0.0.0.0", port=5055, stale_after=0.5):
+    def __init__(self, host="0.0.0.0", port=5055, stale_after=0.5, logger=None):
         """
         Args:
             host:        bind address (default 0.0.0.0 — all interfaces)
             port:        UDP port (default 5055, matches readController.py)
             stale_after: seconds after which get_state() returns None
+            logger:      optional FlightLogger; each received packet is logged
+                         as a user command. None = no logging.
         """
         self.host = host
         self.port = port
         self.stale_after = stale_after
+        self.logger = logger
         self._sock = None
         self._thread = None
         self._running = False
@@ -76,19 +79,22 @@ class JoystickReceiver:
                 lin = j.get("linear", {}) or {}
                 ang = j.get("angular", {}) or {}
                 sw = j.get("switches", {}) or {}
+                state = JoystickState(
+                    linear_x=float(lin.get("x", 0.0)),
+                    linear_y=float(lin.get("y", 0.0)),
+                    linear_z=float(lin.get("z", 0.0)),
+                    angular_x=float(ang.get("x", 0.0)),
+                    angular_y=float(ang.get("y", 0.0)),
+                    angular_z=float(ang.get("z", 0.0)),
+                    s1=int(sw.get("s1", 0)),
+                    s2=int(sw.get("s2", 0)),
+                    received_at=time.time(),
+                )
                 with self._lock:
-                    self._state = JoystickState(
-                        linear_x=float(lin.get("x", 0.0)),
-                        linear_y=float(lin.get("y", 0.0)),
-                        linear_z=float(lin.get("z", 0.0)),
-                        angular_x=float(ang.get("x", 0.0)),
-                        angular_y=float(ang.get("y", 0.0)),
-                        angular_z=float(ang.get("z", 0.0)),
-                        s1=int(sw.get("s1", 0)),
-                        s2=int(sw.get("s2", 0)),
-                        received_at=time.time(),
-                    )
+                    self._state = state
                     self._packet_count += 1
+                if self.logger:
+                    self.logger.log_user_command(state, source="udp")
             except (json.JSONDecodeError, ValueError, TypeError, UnicodeDecodeError):
                 continue
 

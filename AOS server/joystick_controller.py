@@ -39,6 +39,7 @@ import threading
 import ds_wrapper as w
 
 from udp_joystick_receiver import JoystickReceiver
+from flight_logger import FlightLogger
 from swarm_telemetry_feed import (
     TelemetryFeedPublisher,
     DEFAULT_GUI_HOST,
@@ -132,6 +133,9 @@ class DroneController:
         # Latest telemetry
         self.telemetry = {}
 
+        # Optional FlightLogger (set by the launch script); None = no logging.
+        self.logger = None
+
         # Background threads
         self._running = False
         self._send_thread = None
@@ -140,12 +144,18 @@ class DroneController:
     def send_command(self, command):
         """Send a raw command string to the drone."""
         w.sendWayPointData(command, self.drone_id)
+        if self.logger:
+            self.logger.log_drone_command(self.drone_id, "EVENT", cmd=command)
 
     def send_vs(self):
         """Send the current virtual stick state."""
         cmd = (f"VS:{self.pitch:.2f}:{self.roll:.2f}:{self.yaw:.2f}:"
                f"{self.throttle:.2f}:{self.gimbal_pitch:.2f}:{self.gimbal_yaw:.2f}")
         w.sendWayPointData(cmd, self.drone_id)
+        if self.logger:
+            self.logger.log_drone_command(
+                self.drone_id, "VS", self.pitch, self.roll, self.yaw,
+                self.throttle, self.gimbal_pitch, self.gimbal_yaw, cmd)
 
     def enable_vs(self):
         self.send_command("ENABLE_VS")
@@ -190,6 +200,8 @@ class DroneController:
         t = parse_telemetry(data)
         if t:
             self.telemetry = t
+            if self.logger:
+                self.logger.log_telemetry(self.drone_id, t)
         return t
 
     def start(self, send_rate_hz=20, telemetry_rate_hz=10):
@@ -240,6 +252,11 @@ class SwarmController:
         self.drones[drone_id] = ctrl
         return ctrl
 
+    def attach_logger(self, logger):
+        """Route command/telemetry logging for every drone to `logger`."""
+        for d in self.drones.values():
+            d.logger = logger
+
     def start_all(self, send_rate_hz=20, telemetry_rate_hz=10):
         for d in self.drones.values():
             d.start(send_rate_hz, telemetry_rate_hz)
@@ -287,6 +304,9 @@ def interactive_mode(controller):
 
         if not cmd:
             continue
+
+        if controller.logger:
+            controller.logger.log_user_command(None, source="cli", raw=" ".join(cmd))
 
         c = cmd[0].lower()
 
@@ -435,6 +455,10 @@ def main():
                     help=f"GUI telemetry UDP host (default {DEFAULT_GUI_HOST})")
     ap.add_argument("--gui-port", type=int, default=DEFAULT_GUI_PORT,
                     help=f"GUI telemetry UDP port (default {DEFAULT_GUI_PORT})")
+    ap.add_argument("--no-log", action="store_true",
+                    help="Disable background flight-data logging to flight_logs/")
+    ap.add_argument("--log-dir", default="flight_logs",
+                    help="Directory for flight-log session folders (default flight_logs)")
     args = ap.parse_args()
 
     print("LIS_Swarm Joystick Controller")
@@ -444,13 +468,22 @@ def main():
     decode = w.isHWDecoderEnabled()
     print(f"HW Decoder: {'enabled' if decode == 1 else 'disabled (SW)'}")
 
+    logger = None
+    if not args.no_log:
+        logger = FlightLogger(base_dir=args.log_dir, meta={
+            "script": "joystick_controller",
+            "drone": args.drone, "port": args.port, "cli": args.cli,
+        })
+        print(f"Flight logging -> {logger.session_dir} (disable with --no-log)")
+
     drone = DroneController(drone_id=args.drone)
+    drone.logger = logger
     drone.start(send_rate_hz=20, telemetry_rate_hz=10)
     print(f"Background threads started (drone {args.drone}, 20Hz commands, 10Hz telemetry)")
 
     receiver = None
     if not args.cli:
-        receiver = JoystickReceiver(port=args.port)
+        receiver = JoystickReceiver(port=args.port, logger=logger)
         receiver.start()
         print(f"UDP joystick receiver listening on :{args.port}")
 
@@ -476,6 +509,8 @@ def main():
         if receiver is not None:
             receiver.stop()
         drone.stop()
+        if logger is not None:
+            logger.close()
         print("Stopped.")
 
 

@@ -58,6 +58,7 @@ except AttributeError:
     pass  # Python <3.7
 
 from udp_joystick_receiver import JoystickReceiver
+from flight_logger import FlightLogger
 from swarm_telemetry_feed import (
     TelemetryFeedPublisher,
     DEFAULT_GUI_HOST,
@@ -251,7 +252,7 @@ class OlfatiSaber:
 
 # ---------- main loop ----------
 
-def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned"):
+def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None):
     print("\n--- Olfati-Saber Swarm Mode ---")
     print(f"  Drones: {sorted(swarm.drones.keys())}")
     print(f"  c_vm={olfati.c_vm}  r0_coh={olfati.r0_coh}  scale={olfati.scale}")
@@ -407,6 +408,10 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned"):
                 v_n_total = v_n_des + v_n_corr
                 v_e_total = v_e_des + v_e_corr
                 v_n_total, v_e_total = clamp_mag2(v_n_total, v_e_total, MAX_CMD_MPS)
+                if logger:
+                    logger.log_swarm_debug(
+                        did, v_n_des, v_e_des, v_n_corr, v_e_corr,
+                        v_n_total, v_e_total, d_ref, len(neighbours))
                 # DJI VS is in GROUND/VELOCITY mode (SwarmActivity sets
                 # FlightCoordinateSystem.GROUND), so pitch = north m/s and
                 # roll = east m/s. We send world-frame velocities directly —
@@ -480,6 +485,10 @@ def main():
                     help=f"GUI telemetry UDP host (default {DEFAULT_GUI_HOST})")
     ap.add_argument("--gui-port", type=int, default=DEFAULT_GUI_PORT,
                     help=f"GUI telemetry UDP port (default {DEFAULT_GUI_PORT})")
+    ap.add_argument("--no-log", action="store_true",
+                    help="Disable background flight-data logging to flight_logs/")
+    ap.add_argument("--log-dir", default="flight_logs",
+                    help="Directory for flight-log session folders (default flight_logs)")
     args = ap.parse_args()
 
     if args.drones < 1:
@@ -493,6 +502,17 @@ def main():
     for did in range(1, args.drones + 1):
         swarm.add_drone(did)
         print(f"  Added drone {did}")
+
+    logger = None
+    if not args.no_log:
+        logger = FlightLogger(base_dir=args.log_dir, meta={
+            "script": "swarm_flocking",
+            "drones": args.drones, "port": args.port,
+            "c_vm": args.c_vm, "r0": args.r0, "scale": args.scale,
+            "vel_frame": args.vel_frame, "dry_run": args.dry_run,
+        })
+        swarm.attach_logger(logger)
+        print(f"  Flight logging -> {logger.session_dir} (disable with --no-log)")
 
     # Synchronous probe: call sendWayPointData once per drone from the main
     # thread BEFORE starting any background threads. If a slot is missing in
@@ -525,7 +545,7 @@ def main():
 
     olfati = OlfatiSaber(r0_coh=args.r0, c_vm=args.c_vm, scale=args.scale)
 
-    receiver = JoystickReceiver(port=args.port)
+    receiver = JoystickReceiver(port=args.port, logger=logger)
     receiver.start()
     print(f"  UDP joystick listener on :{args.port}")
 
@@ -540,7 +560,7 @@ def main():
 
     try:
         run(swarm, receiver, olfati,
-            dry_run=args.dry_run, vel_frame=args.vel_frame)
+            dry_run=args.dry_run, vel_frame=args.vel_frame, logger=logger)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
@@ -548,6 +568,8 @@ def main():
             gui_feed.stop()
         receiver.stop()
         swarm.stop_all()
+        if logger is not None:
+            logger.close()
         print("Stopped.")
 
 
