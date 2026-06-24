@@ -58,6 +58,11 @@ joystick → Python script ──ds_wrapper.sendWayPointData()──► [shared 
   - `image_stream.py` / `image_save.py` / `image_replay.py` — video/image shared-memory pipeline + utils in `utils/imageSharingUtil.py`.
   - Standalone manual tests (no test framework): `receive_test.py` (read-only, safe),
     `test_telem.py`, `gimbal_test.py`, `altitude_test.py`, `altitude_iterator.py`.
+- **`*.ps1` launchers (`dji-joystick.ps1`, `dji-flocking.ps1`, `dji-gui.ps1`)** — these are
+  how the operator *actually* starts everything (Windows Terminal panes). They wrap the
+  `python ...` invocations and expose params that map onto the scripts' CLI flags, so they
+  **must be kept in sync** with the scripts. See [the launchers gotcha](#critical-gotchas)
+  and [Launchers](#launchers-ps1-files--how-the-operator-actually-starts-things) below.
 
 ### 2. `lis-swarm-app/` — Android app (the drone-side controller)
 Runs on the DJI RC (RC Pro). Package `com.lisswarm`, DJI SDK v5 (`5.3.0`), arm64-v8a only.
@@ -113,8 +118,39 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 - **`ds_wrapper.*.pyd` and `DroneSwarmServer.exe` must sit in the same folder** (currently `AOS server/`).
 - The `joystick_controller.py` "VS_Send" thread relays at 20 Hz; the app re-sends to DJI
   at its own 20 Hz. Stale-command handling matters — see the UDP staleness window in `udp_joystick_receiver.py`.
+- **The `.ps1` launchers are the real entry points — keep them in sync.** The operator does
+  not run `python …` by hand; they run `.\dji-joystick.ps1` / `.\dji-flocking.ps1` /
+  `.\dji-gui.ps1` (all in `AOS server/`). Each launcher hard-codes the `python` command line
+  and maps its own params onto the scripts' CLI flags: `-Drones`→`--drones`, `-Slow`→`--slow`,
+  `-NoGui`→`--no-gui`, `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0`. **If you rename
+  a script, change a CLI flag/default, or change how a script is invoked, update the matching
+  launcher(s) in the same change** — otherwise the operator's normal launch path silently
+  breaks even though the script "works" when run directly. The flocking/joystick launchers
+  also spawn `readController.py` (the UDP joystick source on :5055) from an *external* repo
+  (`vr_swarm_simulation/Assets/Scripts/Control`) under conda env `stitching` — those paths and
+  the env name are hard-coded near the top of the `.ps1` files; flag them if they need editing.
 
 ## Building & running
+
+### Launchers (`*.ps1` files) — how the operator actually starts things
+
+> **Do not skip these when editing the Python scripts.** The day-to-day way the operator
+> runs the system is the PowerShell launchers in `AOS server/`, **not** bare `python …`
+> commands. Each launcher hard-codes the command line, the working directories, and the
+> conda env, and opens the panes in Windows Terminal (`wt.exe`). The raw `python …` lines
+> in the sections below are what the launchers run under the hood / for debugging.
+
+| Launcher | Starts | Params → script flags |
+| --- | --- | --- |
+| `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
+| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | `-Drones`→`--drones`, `-Slow`→`--slow`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-HttpPort`→`swarm_gui.py --http-port` |
+| `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
+
+**If you change a script's CLI flags, defaults, filename, or how it's invoked, update the
+matching launcher in the same change** (see the [critical gotcha](#critical-gotchas)). Note
+`dji-joystick.ps1`/`dji-flocking.ps1` also launch `readController.py` — the UDP joystick
+source on :5055 — from an **external** repo (`vr_swarm_simulation/Assets/Scripts/Control`)
+under conda env `stitching`; those paths/env are hard-coded near the top of each `.ps1`.
 
 ### C++ `ds_wrapper` (Python module) and `DroneSwarmServer.exe`
 Windows + Visual Studio 2022 (MFC, C++/CLI) only. Full toolchain (CUDA, FFmpeg 7.0.1 w/
@@ -131,7 +167,9 @@ The wrapper itself has no source-level tests; verify it by importing in Python (
 
 ### Python scripts
 Python 3.7. Deps: `numpy opencv-python matplotlib keyboard paho-mqtt` (and `pygame` for
-`joyreporter.py`). Run from `AOS server/` **as Administrator**, with `DroneSwarmServer.exe` already running:
+`joyreporter.py`). In normal use these are started by the [`.ps1` launchers](#launchers-ps1-files--how-the-operator-actually-starts-things)
+above — the raw commands below are the equivalents the launchers run (and what to use for
+debugging). Run from `AOS server/` **as Administrator**, with `DroneSwarmServer.exe` already running:
 ```
 cd "AOS server"
 python receive_test.py                 # safe read-only health check of the telemetry/video path
