@@ -58,6 +58,11 @@ except AttributeError:
     pass  # Python <3.7
 
 from udp_joystick_receiver import JoystickReceiver
+from swarm_telemetry_feed import (
+    TelemetryFeedPublisher,
+    DEFAULT_GUI_HOST,
+    DEFAULT_GUI_PORT,
+)
 from joystick_controller import (
     DroneController,
     SwarmController,
@@ -469,6 +474,12 @@ def main():
                          "indicate vx/vy are actually body-frame forward/right).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print VS commands but do not send to drones")
+    ap.add_argument("--no-gui", action="store_true",
+                    help="Do not push telemetry to the browser GUI (swarm_gui.py)")
+    ap.add_argument("--gui-host", default=DEFAULT_GUI_HOST,
+                    help=f"GUI telemetry UDP host (default {DEFAULT_GUI_HOST})")
+    ap.add_argument("--gui-port", type=int, default=DEFAULT_GUI_PORT,
+                    help=f"GUI telemetry UDP port (default {DEFAULT_GUI_PORT})")
     args = ap.parse_args()
 
     if args.drones < 1:
@@ -518,12 +529,23 @@ def main():
     receiver.start()
     print(f"  UDP joystick listener on :{args.port}")
 
+    gui_feed = None
+    if not args.no_gui:
+        gui_feed = TelemetryFeedPublisher(
+            source=swarm.get_all_telemetry,
+            host=args.gui_host, port=args.gui_port)
+        gui_feed.start()
+        print(f"  GUI telemetry feed -> {args.gui_host}:{args.gui_port} "
+              f"(open swarm_gui.py; disable with --no-gui)")
+
     try:
         run(swarm, receiver, olfati,
             dry_run=args.dry_run, vel_frame=args.vel_frame)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
+        if gui_feed is not None:
+            gui_feed.stop()
         receiver.stop()
         swarm.stop_all()
         print("Stopped.")

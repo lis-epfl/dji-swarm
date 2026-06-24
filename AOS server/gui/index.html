@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>LIS_Swarm — Live Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<style>
+  :root {
+    --bg: #0d1117; --panel: rgba(20,26,34,0.92); --line: #2a3340;
+    --text: #e6edf3; --muted: #8b949e; --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: "Segoe UI", system-ui, sans-serif;
+               background: var(--bg); color: var(--text); overflow: hidden; }
+  #map { position: absolute; inset: 0; background: var(--bg); }
+
+  /* ---- top banner ---- */
+  #banner {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    z-index: 1000; padding: 6px 16px; border-radius: 20px; font-size: 13px;
+    font-weight: 600; letter-spacing: .3px; background: var(--panel);
+    border: 1px solid var(--line); box-shadow: 0 2px 10px rgba(0,0,0,.4);
+    display: flex; gap: 10px; align-items: center; white-space: nowrap;
+  }
+  #banner .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+  #banner.ok   .dot { background: var(--ok);   box-shadow: 0 0 8px var(--ok); }
+  #banner.warn .dot { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+  #banner.bad  .dot { background: var(--bad);  box-shadow: 0 0 8px var(--bad); }
+  #banner .sub { color: var(--muted); font-weight: 400; }
+
+  /* ---- status panel ---- */
+  #panel {
+    position: absolute; top: 10px; right: 10px; bottom: 10px; width: 300px;
+    z-index: 1000; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; box-shadow: 0 2px 14px rgba(0,0,0,.5);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  #panel h1 { font-size: 14px; margin: 0; padding: 12px 14px; border-bottom: 1px solid var(--line);
+              display: flex; justify-content: space-between; align-items: center; }
+  #panel h1 .count { color: var(--muted); font-weight: 400; font-size: 12px; }
+  #cards { overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  #cards:empty::after { content: "No drones reporting yet."; color: var(--muted);
+                        font-size: 13px; padding: 10px; }
+
+  .card { border: 1px solid var(--line); border-left-width: 4px; border-radius: 8px;
+          padding: 8px 10px; background: rgba(255,255,255,0.02); }
+  .card .hdr { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .card .badge { width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center;
+                 font-weight: 700; font-size: 12px; color: #06121e; }
+  .card .name { font-weight: 600; font-size: 13px; }
+  .card .pill { margin-left: auto; font-size: 11px; padding: 1px 8px; border-radius: 10px;
+                font-weight: 600; }
+  .pill.fix  { background: rgba(63,185,80,.18);  color: var(--ok); }
+  .pill.weak { background: rgba(210,153,34,.18);  color: var(--warn); }
+  .pill.nofix{ background: rgba(248,81,73,.18);   color: var(--bad); }
+  .pill.stale{ background: rgba(139,148,158,.18); color: var(--muted); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px; font-size: 12px; }
+  .grid .k { color: var(--muted); }
+  .grid .v { text-align: right; font-variant-numeric: tabular-nums; }
+  .vs-on  { color: var(--ok); font-weight: 600; }
+  .vs-off { color: var(--muted); }
+
+  /* ---- controls ---- */
+  #controls { position: absolute; left: 10px; bottom: 10px; z-index: 1000; display: flex; gap: 6px; }
+  #controls button, #controls label {
+    background: var(--panel); border: 1px solid var(--line); color: var(--text);
+    border-radius: 8px; padding: 7px 11px; font-size: 12px; cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0,0,0,.4); display: inline-flex; align-items: center; gap: 6px;
+  }
+  #controls button:hover { border-color: #3d4856; }
+
+  /* ---- drone marker ---- */
+  .drone-div { background: none; border: none; }
+  .drone-wrap { position: relative; width: 40px; height: 52px; }
+  .drone-arrow { position: absolute; top: 0; left: 0; width: 40px; height: 40px;
+                 transform-origin: 50% 50%; filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); }
+  .drone-id { position: absolute; top: 38px; left: 0; width: 40px; text-align: center;
+              font-size: 12px; font-weight: 700; text-shadow: 0 1px 3px #000, 0 0 3px #000; }
+
+  /* ---- distance label on each line ---- */
+  .dist-label { background: rgba(13,17,23,.82); border: 1px solid var(--line);
+                color: #cfe9ff; font-size: 11px; font-weight: 600; padding: 1px 6px;
+                border-radius: 6px; box-shadow: none; white-space: nowrap; }
+  .dist-label::before { display: none; }  /* hide Leaflet tooltip arrow */
+
+  .leaflet-container { background: #0d1117; }
+</style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="banner" class="bad">
+    <span class="dot"></span><span id="banner-text">Connecting…</span>
+    <span class="sub" id="banner-sub"></span>
+  </div>
+
+  <div id="panel">
+    <h1>Swarm status <span class="count" id="drone-count">0 drones</span></h1>
+    <div id="cards"></div>
+  </div>
+
+  <div id="controls">
+    <button id="btn-recenter" title="Fit the map to all drones">Recenter on swarm</button>
+    <button id="btn-epfl" title="Jump back to EPFL Lausanne">EPFL</button>
+    <label><input type="checkbox" id="chk-follow" /> Follow swarm</label>
+  </div>
+
+<script>
+"use strict";
+
+// EPFL Lausanne (Esplanade) — default view.
+const EPFL = [46.5191, 6.5668];
+const DEFAULT_ZOOM = 17;
+
+// A drone whose telemetry hasn't been refreshed within this many seconds is
+// considered gone (controller stopped sending it) and removed from the map.
+const DRONE_STALE_S = 5.0;
+// Below this satellite count we still place the drone but flag the fix as weak.
+const MIN_SATS_GOOD = 6;
+// Polling interval for /telemetry (ms).
+const POLL_MS = 200;
+
+// Stable per-drone colour palette (drone IDs are 1-based).
+const COLORS = ['#ff5a5a','#3fc0ff','#5cf2a6','#ffd23f','#d77bff',
+                '#ff8a3d','#33e6e6','#aaff4d','#ff5fa2','#e0ff3d'];
+const colorFor = (id) => COLORS[(parseInt(id, 10) - 1 + COLORS.length) % COLORS.length];
+
+// ---- map setup ----
+const map = L.map('map', { zoomControl: true, attributionControl: true })
+             .setView(EPFL, DEFAULT_ZOOM);
+
+const imagery = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom: 21, maxNativeZoom: 19,
+    attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics' }
+).addTo(map);
+
+// Transparent labels/roads overlay so place + street names sit on the imagery.
+const labels = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom: 21, maxNativeZoom: 19 }
+).addTo(map);
+
+L.control.layers(null, { 'Place & road labels': labels }, { collapsed: true }).addTo(map);
+
+const linesLayer = L.layerGroup().addTo(map);
+const markers = {};   // id -> L.marker
+
+// ---- helpers ----
+// Horizontal distance in metres (equirectangular; exact enough at swarm scale,
+// and matches the N/E hypot that swarm_flocking.py prints).
+function distMeters(a, b) {
+  const R = 6371000, d2r = Math.PI / 180;
+  const lat1 = a.lat * d2r, lat2 = b.lat * d2r;
+  const x = (b.lon - a.lon) * d2r * Math.cos((lat1 + lat2) / 2);
+  const y = (lat2 - lat1);
+  return Math.sqrt(x * x + y * y) * R;
+}
+
+function hasValidCoords(t) {
+  return t && typeof t.lat === 'number' && typeof t.lon === 'number'
+           && !(Math.abs(t.lat) < 1e-6 && Math.abs(t.lon) < 1e-6)
+           && Math.abs(t.lat) <= 90 && Math.abs(t.lon) <= 180;
+}
+
+function droneIcon(id, heading, color, weak) {
+  const h = Number.isFinite(heading) ? heading : 0;
+  const op = weak ? 0.55 : 1.0;
+  return L.divIcon({
+    className: 'drone-div',
+    iconSize: [40, 52],
+    iconAnchor: [20, 20],   // centre of the arrow sits on the GPS position
+    html: `
+      <div class="drone-wrap">
+        <div class="drone-arrow" style="transform: rotate(${h}deg);">
+          <svg width="40" height="40" viewBox="0 0 40 40">
+            <polygon points="20,3 32,35 20,28 8,35"
+                     fill="${color}" fill-opacity="${op}"
+                     stroke="#06121e" stroke-width="1.6" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="drone-id" style="color:${color}">${id}</div>
+      </div>`
+  });
+}
+
+function fmt(v, d, suffix) {
+  if (v === null || v === undefined || !Number.isFinite(v)) return '—';
+  return v.toFixed(d) + (suffix || '');
+}
+
+// ---- status cards ----
+function renderCard(id, t, age, status) {
+  const color = colorFor(id);
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.style.borderLeftColor = color;
+
+  const pill = { fix: ['fix', 'GPS OK'], weak: ['weak', 'WEAK GPS'],
+                 nofix: ['nofix', 'NO FIX'], stale: ['stale', 'STALE'],
+                 waiting: ['stale', 'WAITING'] }[status] || ['stale', '—'];
+
+  const spd = (Number.isFinite(t.vx) && Number.isFinite(t.vy))
+              ? Math.hypot(t.vx, t.vy) : null;
+  const vsOn = !!t.vs_enabled;
+
+  card.innerHTML = `
+    <div class="hdr">
+      <span class="badge" style="background:${color}">${id}</span>
+      <span class="name">Drone ${id}</span>
+      <span class="pill ${pill[0]}">${pill[1]}</span>
+    </div>
+    <div class="grid">
+      <span class="k">Alt</span>     <span class="v">${fmt(t.alt, 1, ' m')}</span>
+      <span class="k">Heading</span> <span class="v">${fmt(t.heading, 0, '°')}</span>
+      <span class="k">Gnd spd</span> <span class="v">${fmt(spd, 2, ' m/s')}</span>
+      <span class="k">Climb</span>   <span class="v">${fmt(t.vz, 2, ' m/s')}</span>
+      <span class="k">Sats</span>    <span class="v">${Number.isFinite(t.sat_count) ? t.sat_count : '—'}</span>
+      <span class="k">VS</span>      <span class="v ${vsOn ? 'vs-on' : 'vs-off'}">${vsOn ? 'ENABLED' : 'off'}</span>
+      <span class="k">Link</span>    <span class="v">${fmt(age, 1, ' s')}</span>
+    </div>`;
+  return card;
+}
+
+// ---- main render ----
+let didInitialFit = false;
+
+function render(data) {
+  // ----- feed banner -----
+  const banner = document.getElementById('banner');
+  const bText = document.getElementById('banner-text');
+  const bSub  = document.getElementById('banner-sub');
+  const fa = data.feed_age;
+  if (fa === null || fa === undefined) {
+    banner.className = 'bad';
+    bText.textContent = 'No telemetry feed';
+    bSub.textContent = '— is a controller running?';
+  } else if (fa <= 2.0) {
+    banner.className = 'ok';   bText.textContent = 'Feed connected';  bSub.textContent = `${fa.toFixed(1)} s ago`;
+  } else if (fa <= 10.0) {
+    banner.className = 'warn'; bText.textContent = 'Feed stale';      bSub.textContent = `${fa.toFixed(1)} s ago`;
+  } else {
+    banner.className = 'bad';  bText.textContent = 'Feed lost';       bSub.textContent = `${fa.toFixed(0)} s ago`;
+  }
+
+  const drones = data.drones || {};
+  const ids = Object.keys(drones).sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+
+  // ----- per-drone classification -----
+  const placed = [];   // {id, lat, lon} for drones drawn on the map
+  const cards = document.getElementById('cards');
+  cards.innerHTML = '';
+  let liveCount = 0;
+
+  for (const id of ids) {
+    const rec = drones[id] || {};
+    const t = rec.telem || {};
+    const age = rec.age;
+
+    let status;
+    if (age > DRONE_STALE_S)                 status = 'stale';
+    else if (Object.keys(t).length === 0)    status = 'waiting';
+    else if (!hasValidCoords(t))             status = 'nofix';
+    else if ((t.sat_count || 0) < MIN_SATS_GOOD) status = 'weak';
+    else                                     status = 'fix';
+
+    if (age <= DRONE_STALE_S) liveCount++;
+
+    // Place on the map when we have coordinates and the link is alive.
+    if (age <= DRONE_STALE_S && hasValidCoords(t)) {
+      placed.push({ id, lat: t.lat, lon: t.lon });
+      const weak = status === 'weak';
+      const icon = droneIcon(id, t.heading, colorFor(id), weak);
+      if (markers[id]) {
+        markers[id].setLatLng([t.lat, t.lon]).setIcon(icon);
+      } else {
+        markers[id] = L.marker([t.lat, t.lon], { icon, zIndexOffset: 1000 }).addTo(map);
+      }
+      markers[id].bindTooltip(`Drone ${id}`, { direction: 'top', offset: [0, -22] });
+    } else if (markers[id]) {
+      map.removeLayer(markers[id]);
+      delete markers[id];
+    }
+
+    // Status card for everything the controller still knows about.
+    if (age <= DRONE_STALE_S) cards.appendChild(renderCard(id, t, age, status));
+  }
+
+  document.getElementById('drone-count').textContent =
+    liveCount + (liveCount === 1 ? ' drone' : ' drones');
+
+  // ----- complete-graph distance lines -----
+  linesLayer.clearLayers();
+  for (let i = 0; i < placed.length; i++) {
+    for (let j = i + 1; j < placed.length; j++) {
+      const a = placed[i], b = placed[j];
+      const d = distMeters(a, b);
+      const poly = L.polyline([[a.lat, a.lon], [b.lat, b.lon]],
+        { color: '#9fd8ff', weight: 1.5, opacity: 0.7, dashArray: '4 4' });
+      poly.bindTooltip(`${d.toFixed(1)} m`,
+        { permanent: true, direction: 'center', className: 'dist-label' });
+      linesLayer.addLayer(poly);
+    }
+  }
+
+  // ----- camera -----
+  if (placed.length > 0) {
+    const follow = document.getElementById('chk-follow').checked;
+    if (follow || !didInitialFit) {
+      fitToSwarm(placed);
+      didInitialFit = true;
+    }
+  }
+}
+
+function fitToSwarm(placed) {
+  if (placed.length === 1) {
+    map.setView([placed[0].lat, placed[0].lon], Math.max(map.getZoom(), 18));
+  } else if (placed.length > 1) {
+    const b = L.latLngBounds(placed.map(p => [p.lat, p.lon]));
+    map.fitBounds(b, { padding: [80, 80], maxZoom: 20 });
+  }
+}
+
+// ---- controls ----
+document.getElementById('btn-recenter').addEventListener('click', () => {
+  const placed = Object.entries(markers).map(([id, m]) =>
+    ({ id, lat: m.getLatLng().lat, lon: m.getLatLng().lng }));
+  if (placed.length) fitToSwarm(placed);
+  else map.setView(EPFL, DEFAULT_ZOOM);
+});
+document.getElementById('btn-epfl').addEventListener('click', () => {
+  map.setView(EPFL, DEFAULT_ZOOM);
+});
+
+// ---- poll loop ----
+async function tick() {
+  try {
+    const resp = await fetch('/telemetry', { cache: 'no-store' });
+    render(await resp.json());
+  } catch (e) {
+    const banner = document.getElementById('banner');
+    banner.className = 'bad';
+    document.getElementById('banner-text').textContent = 'GUI server unreachable';
+    document.getElementById('banner-sub').textContent = '';
+  }
+}
+setInterval(tick, POLL_MS);
+tick();
+</script>
+</body>
+</html>

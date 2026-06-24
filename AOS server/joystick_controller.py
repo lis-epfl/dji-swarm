@@ -39,6 +39,11 @@ import threading
 import ds_wrapper as w
 
 from udp_joystick_receiver import JoystickReceiver
+from swarm_telemetry_feed import (
+    TelemetryFeedPublisher,
+    DEFAULT_GUI_HOST,
+    DEFAULT_GUI_PORT,
+)
 
 
 # Image data is 1920*1080*1.5 = 3,110,400 bytes (YUV), telemetry starts at offset 3,110,408
@@ -424,6 +429,12 @@ def main():
     ap.add_argument("--drone", type=int, default=1, help="Drone ID (default 1)")
     ap.add_argument("--port",  type=int, default=5055, help="UDP port for joystick (default 5055)")
     ap.add_argument("--cli",   action="store_true", help="Use keyboard CLI instead of UDP joystick")
+    ap.add_argument("--no-gui", action="store_true",
+                    help="Do not push telemetry to the browser GUI (swarm_gui.py)")
+    ap.add_argument("--gui-host", default=DEFAULT_GUI_HOST,
+                    help=f"GUI telemetry UDP host (default {DEFAULT_GUI_HOST})")
+    ap.add_argument("--gui-port", type=int, default=DEFAULT_GUI_PORT,
+                    help=f"GUI telemetry UDP port (default {DEFAULT_GUI_PORT})")
     args = ap.parse_args()
 
     print("LIS_Swarm Joystick Controller")
@@ -437,10 +448,20 @@ def main():
     drone.start(send_rate_hz=20, telemetry_rate_hz=10)
     print(f"Background threads started (drone {args.drone}, 20Hz commands, 10Hz telemetry)")
 
+    receiver = None
     if not args.cli:
         receiver = JoystickReceiver(port=args.port)
         receiver.start()
         print(f"UDP joystick receiver listening on :{args.port}")
+
+    gui_feed = None
+    if not args.no_gui:
+        gui_feed = TelemetryFeedPublisher(
+            source=lambda: {drone.drone_id: drone.telemetry},
+            host=args.gui_host, port=args.gui_port)
+        gui_feed.start()
+        print(f"GUI telemetry feed -> {args.gui_host}:{args.gui_port} "
+              f"(open swarm_gui.py; disable with --no-gui)")
 
     try:
         if args.cli:
@@ -450,6 +471,8 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
+        if gui_feed is not None:
+            gui_feed.stop()
         if receiver is not None:
             receiver.stop()
         drone.stop()

@@ -45,6 +45,16 @@ joystick → Python script ──ds_wrapper.sendWayPointData()──► [shared 
   - `swarm_flocking.py` — multi-drone Olfati-Saber flocking from one joystick.
   - `udp_joystick_receiver.py` — receives joystick JSON over UDP :5055 (used by the above).
   - `joyreporter.py` — pygame joystick debug readout.
+  - `swarm_gui.py` — browser GUI server: a satellite map (default EPFL Lausanne) showing
+    each drone's position + heading, a complete graph of inter-drone distance lines
+    (metres labelled), and a per-drone status panel. **Does NOT import `ds_wrapper`** — it
+    only LISTENS on UDP :5099 for telemetry pushed by a running controller (so it runs
+    unprivileged, in its own terminal, on any Python ≥3.7). Frontend assets in `gui/`
+    (Leaflet + Esri World Imagery tiles, needs internet, no API key).
+  - `swarm_telemetry_feed.py` — `TelemetryFeedPublisher` embedded by `joystick_controller.py`
+    and `swarm_flocking.py`; UDP-pushes a JSON telemetry snapshot to `swarm_gui.py` at 5 Hz
+    (on by default; `--no-gui` to disable, `--gui-host/--gui-port` to redirect). Best-effort
+    and fire-and-forget so it can never stall the control loop.
   - `image_stream.py` / `image_save.py` / `image_replay.py` — video/image shared-memory pipeline + utils in `utils/imageSharingUtil.py`.
   - Standalone manual tests (no test framework): `receive_test.py` (read-only, safe),
     `test_telem.py`, `gimbal_test.py`, `altitude_test.py`, `altitude_iterator.py`.
@@ -130,6 +140,19 @@ python swarm_flocking.py --drones 3    # multi-drone; --dry-run to print VS with
 ```
 There is no unit-test suite. The `*_test.py` scripts are manual hardware checks — start with
 `receive_test.py` (does not command motion) before running anything that flies the drone.
+
+### Browser GUI (`swarm_gui.py`)
+Runs in its **own** terminal (no admin, any Python ≥3.7) — it never touches `ds_wrapper`,
+it just renders telemetry a controller pushes to it over UDP. Start a controller first
+(both push by default), then:
+```
+cd "AOS server"
+python swarm_gui.py --open        # serves 127.0.0.1:8000, opens a browser
+python swarm_gui.py --http-host 0.0.0.0   # expose on the LAN (e.g. a tablet)
+# or: .\dji-gui.ps1
+```
+The banner reads "Feed connected" only while a controller is publishing; "No telemetry feed"
+means no controller is running (or it was started with `--no-gui`).
 
 ### Android app
 Gradle 8.11.1, but **no `gradlew` wrapper script is committed** — use Android Studio or a
