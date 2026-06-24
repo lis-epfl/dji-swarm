@@ -14,6 +14,8 @@ Telemetry comes back via:
 
 Usage:
     python joystick_controller.py              # UDP joystick mode (default)
+    python joystick_controller.py --slow       # slow test mode (30% speed)
+    python joystick_controller.py --slow 0.5   # slow test mode at 50% speed
     python joystick_controller.py --cli        # fallback keyboard CLI
 
 Joystick input comes from readController.py over UDP :5055 (see
@@ -71,6 +73,12 @@ JOYSTICK_DEADZONE = 0.05
 # 0.0 = frozen, 1.0 = raw stick (no smoothing). At the ~50 Hz UDP loop rate,
 # alpha=0.25 gives a time-constant of ~60 ms — kills jitter without feeling laggy.
 STICK_SMOOTHING_ALPHA = 0.25
+
+# Velocity scale applied by the --slow test flag when given with no value.
+# The flag multiplies all commanded motion (pitch/roll velocity, yaw rate, climb
+# rate) by this factor so the drone(s) can be flown and tuned at a safe, low
+# speed without changing the shape of the behaviour. 1.0 = full speed.
+SLOW_DEFAULT_SCALE = 0.3
 
 
 def _deadzone(v, dz=JOYSTICK_DEADZONE):
@@ -350,7 +358,7 @@ def interactive_mode(controller):
             print("Unknown command. Type 'quit' to exit.")
 
 
-def udp_joystick_mode(controller, receiver):
+def udp_joystick_mode(controller, receiver, speed_scale=1.0):
     """Drive the drone from UDP joystick data sent by readController.py.
 
     Stick → drone mapping:
@@ -361,10 +369,15 @@ def udp_joystick_mode(controller, receiver):
       angular.x -> gimbal pitch (axis is centered around 1.0)
       switch s1 -> toggle ENABLE_VS / DISABLE_VS  (rising edge)
       switch s2 -> LAND                            (rising edge)
+
+    speed_scale (--slow) uniformly multiplies the commanded velocity, yaw rate
+    and climb rate so the drone moves slowly for testing/tuning. 1.0 = full speed.
     """
     print("\n--- UDP Joystick Mode ---")
     print("Listening for readController.py on :5055")
     print("  s1: toggle VS    s2: LAND    Ctrl+C: stop and disable VS")
+    if speed_scale != 1.0:
+        print(f"  SLOW TEST MODE: all velocities/rates scaled to {speed_scale:.0%}")
     print()
 
     target_yaw = 0.0
@@ -424,19 +437,22 @@ def udp_joystick_mode(controller, receiver):
         raw_roll  = lin_y * MAX_ROLL_MPS
         smooth_pitch = STICK_SMOOTHING_ALPHA * raw_pitch + (1.0 - STICK_SMOOTHING_ALPHA) * smooth_pitch
         smooth_roll  = STICK_SMOOTHING_ALPHA * raw_roll  + (1.0 - STICK_SMOOTHING_ALPHA) * smooth_roll
-        target_yaw = _normalize_heading_180(target_yaw + ang_z * YAW_RATE_DEG_S * dt)
-        target_alt = max(MIN_ALT_M, min(MAX_ALT_M, target_alt + lin_z * VERT_RATE_MPS * dt))
+        target_yaw = _normalize_heading_180(target_yaw + ang_z * YAW_RATE_DEG_S * speed_scale * dt)
+        target_alt = max(MIN_ALT_M, min(MAX_ALT_M, target_alt + lin_z * VERT_RATE_MPS * speed_scale * dt))
 
         # Gimbal pitch from angular.x (centered 1.0, swing ±0.4 → [0.6, 1.4])
         ax = max(0.6, min(1.4, state.angular_x))
         raw_gimbal_pitch = GIMBAL_PITCH_MIN + ((ax - 0.6) / 0.8) * (GIMBAL_PITCH_MAX - GIMBAL_PITCH_MIN)
         smooth_gimbal_pitch = STICK_SMOOTHING_ALPHA * raw_gimbal_pitch + (1.0 - STICK_SMOOTHING_ALPHA) * smooth_gimbal_pitch
 
-        controller.set_velocity(smooth_pitch, smooth_roll, target_yaw, target_alt)
+        # --slow scales the translation command (yaw/climb already scaled above).
+        cmd_pitch = smooth_pitch * speed_scale
+        cmd_roll  = smooth_roll * speed_scale
+        controller.set_velocity(cmd_pitch, cmd_roll, target_yaw, target_alt)
         controller.set_gimbal(smooth_gimbal_pitch, 0)
 
         if now - last_print > 1.0:
-            print(f"  P={smooth_pitch:+5.2f}m/s  R={smooth_roll:+5.2f}m/s  Y={target_yaw:+6.1f}°  "
+            print(f"  P={cmd_pitch:+5.2f}m/s  R={cmd_roll:+5.2f}m/s  Y={target_yaw:+6.1f}°  "
                   f"Alt={target_alt:5.1f}m  Gim={smooth_gimbal_pitch:+5.1f}°  "
                   f"VS={'ON' if vs_local else 'off'}")
             last_print = now
@@ -449,6 +465,12 @@ def main():
     ap.add_argument("--drone", type=int, default=1, help="Drone ID (default 1)")
     ap.add_argument("--port",  type=int, default=5055, help="UDP port for joystick (default 5055)")
     ap.add_argument("--cli",   action="store_true", help="Use keyboard CLI instead of UDP joystick")
+    ap.add_argument("--slow", nargs="?", const=SLOW_DEFAULT_SCALE, type=float, default=1.0,
+                    metavar="SCALE",
+                    help="Test mode: scale all commanded velocities and yaw/climb "
+                         f"rates for slow, controlled tuning. Bare --slow uses "
+                         f"{SLOW_DEFAULT_SCALE}; pass a value (e.g. --slow 0.5) to "
+                         "override. Default 1.0 (full speed).")
     ap.add_argument("--no-gui", action="store_true",
                     help="Do not push telemetry to the browser GUI (swarm_gui.py)")
     ap.add_argument("--gui-host", default=DEFAULT_GUI_HOST,
@@ -461,8 +483,13 @@ def main():
                     help="Directory for flight-log session folders (default flight_logs)")
     args = ap.parse_args()
 
+    if args.slow <= 0:
+        ap.error("--slow SCALE must be > 0")
+
     print("LIS_Swarm Joystick Controller")
     print("Using ds_wrapper via DroneSwarmServer")
+    if args.slow != 1.0:
+        print(f"SLOW TEST MODE: velocities/rates scaled to {args.slow:.0%}")
     print()
 
     decode = w.isHWDecoderEnabled()
@@ -473,6 +500,7 @@ def main():
         logger = FlightLogger(base_dir=args.log_dir, meta={
             "script": "joystick_controller",
             "drone": args.drone, "port": args.port, "cli": args.cli,
+            "slow": args.slow,
         })
         print(f"Flight logging -> {logger.session_dir} (disable with --no-log)")
 
@@ -500,7 +528,7 @@ def main():
         if args.cli:
             interactive_mode(drone)
         else:
-            udp_joystick_mode(drone, receiver)
+            udp_joystick_mode(drone, receiver, speed_scale=args.slow)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:

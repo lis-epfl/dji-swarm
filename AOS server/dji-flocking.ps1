@@ -11,6 +11,7 @@
 #   .\dji-flocking.ps1 -Drones 2
 #   .\dji-flocking.ps1 -HttpPort 9000
 #   .\dji-flocking.ps1 -NoGui         # no map; also passes --no-gui to the controller
+#   .\dji-flocking.ps1 -Slow 0.3      # slow test mode: scale all velocities to 30%
 #
 # If PowerShell blocks the script, either run once with:
 #   powershell -ExecutionPolicy Bypass -File .\dji-flocking.ps1
@@ -20,8 +21,18 @@
 param(
     [int]$Drones = 3,
     [int]$HttpPort = 8000,
+    [double]$Slow = 1.0,
     [switch]$NoGui
 )
+
+if ($Slow -le 0) { throw "-Slow must be > 0 (e.g. -Slow 0.3 for 30% speed)" }
+
+# Forward --slow to swarm_flocking.py only when slowing down. Format invariantly
+# so the decimal point survives locales that use a comma separator.
+$SlowArg = ""
+if ($Slow -ne 1.0) {
+    $SlowArg = " --slow " + $Slow.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+}
 
 # The readController pane sources the conda hook and activates this env
 # before launching the script. Edit if your miniconda lives elsewhere.
@@ -34,7 +45,7 @@ if ($NoGui) {
     wt.exe --size 240,60 `
       new-tab --title "flocking" `
         -d "$AosDir" `
-        PowerShell -NoExit -Command "python swarm_flocking.py --drones $Drones --no-gui" `
+        PowerShell -NoExit -Command "python swarm_flocking.py --drones $Drones$SlowArg --no-gui" `
       `; split-pane -V --size 0.25 --title "controller" `
         -d "$CtrlDir" `
         PowerShell -NoExit -Command "& '$CondaHook' \; conda activate $EnvName \; python readController.py"
@@ -43,7 +54,7 @@ else {
     wt.exe --size 240,60 `
       new-tab --title "flocking" `
         -d "$AosDir" `
-        PowerShell -NoExit -Command "python swarm_flocking.py --drones $Drones" `
+        PowerShell -NoExit -Command "python swarm_flocking.py --drones $Drones$SlowArg" `
       `; split-pane -V --size 0.25 --title "controller" `
         -d "$CtrlDir" `
         PowerShell -NoExit -Command "& '$CondaHook' \; conda activate $EnvName \; python readController.py" `

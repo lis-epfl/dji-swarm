@@ -39,6 +39,8 @@ ScaleFactor = 10.
 Usage:
     python swarm_flocking.py --drones 3
     python swarm_flocking.py --drones 2 --c-vm 0.5     # gentler velocity matching
+    python swarm_flocking.py --drones 3 --slow         # slow test mode (30% speed)
+    python swarm_flocking.py --drones 3 --slow 0.5     # slow test mode at 50% speed
     python swarm_flocking.py --drones 3 --dry-run      # print VS commands, do not transmit
 """
 
@@ -76,6 +78,7 @@ from joystick_controller import (
     MIN_ALT_M,
     MAX_ALT_M,
     INITIAL_ALT_M,
+    SLOW_DEFAULT_SCALE,
 )
 
 
@@ -252,12 +255,15 @@ class OlfatiSaber:
 
 # ---------- main loop ----------
 
-def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None):
+def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
+        speed_scale=1.0):
     print("\n--- Olfati-Saber Swarm Mode ---")
     print(f"  Drones: {sorted(swarm.drones.keys())}")
     print(f"  c_vm={olfati.c_vm}  r0_coh={olfati.r0_coh}  scale={olfati.scale}")
     print(f"  Telemetry velocity frame: {vel_frame}  "
           f"(switch via --vel-frame if consensus oscillates)")
+    if speed_scale != 1.0:
+        print(f"  SLOW TEST MODE: commanded velocities/rates scaled to {speed_scale:.0%}")
     print(f"  s1: toggle VS-all    s2: LAND-all")
     print(f"  q  (PC keyboard): stop, hold position, disable VS, exit")
     print(f"  Ctrl+C: same, abrupt\n")
@@ -336,10 +342,11 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None):
         lin_z = _deadzone(js.linear_z)
         ang_z = _deadzone(js.angular_z)
 
-        # Shared integrated targets
-        target_yaw = _normalize_heading_180(target_yaw + ang_z * YAW_RATE_DEG_S * dt)
+        # Shared integrated targets (--slow scales the yaw and climb rates too)
+        target_yaw = _normalize_heading_180(
+            target_yaw + ang_z * YAW_RATE_DEG_S * speed_scale * dt)
         target_alt = max(MIN_ALT_M, min(MAX_ALT_M,
-                                        target_alt + lin_z * VERT_RATE_MPS * dt))
+                                        target_alt + lin_z * VERT_RATE_MPS * speed_scale * dt))
         d_ref = d_ref_from_ax(js.angular_x, scale=olfati.scale)
 
         # World-frame group desired velocity, shared across the swarm: every
@@ -408,6 +415,11 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None):
                 v_n_total = v_n_des + v_n_corr
                 v_e_total = v_e_des + v_e_corr
                 v_n_total, v_e_total = clamp_mag2(v_n_total, v_e_total, MAX_CMD_MPS)
+                # --slow: scale the combined command (joystick desired + swarm
+                # correction) uniformly so the whole motion just runs slower —
+                # the relative behaviour being tuned keeps its shape.
+                v_n_total *= speed_scale
+                v_e_total *= speed_scale
                 if logger:
                     logger.log_swarm_debug(
                         did, v_n_des, v_e_des, v_n_corr, v_e_corr,
@@ -477,6 +489,13 @@ def main():
                          "reports ground-frame velocity; switch to 'body' if "
                          "the consensus term causes oscillation (which would "
                          "indicate vx/vy are actually body-frame forward/right).")
+    ap.add_argument("--slow", nargs="?", const=SLOW_DEFAULT_SCALE, type=float, default=1.0,
+                    metavar="SCALE",
+                    help="Test mode: scale every commanded velocity (joystick "
+                         "desired + swarm correction) and the yaw/climb rates for "
+                         f"slow, controlled tuning. Bare --slow uses {SLOW_DEFAULT_SCALE}; "
+                         "pass a value (e.g. --slow 0.5) to override. Default 1.0 "
+                         "(full speed).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print VS commands but do not send to drones")
     ap.add_argument("--no-gui", action="store_true",
@@ -493,6 +512,8 @@ def main():
 
     if args.drones < 1:
         ap.error("--drones must be >= 1")
+    if args.slow <= 0:
+        ap.error("--slow SCALE must be > 0")
 
     print("LIS_Swarm Flocking Controller (Olfati-Saber)")
     print(f"  ds_wrapper HW Decoder: "
@@ -510,6 +531,7 @@ def main():
             "drones": args.drones, "port": args.port,
             "c_vm": args.c_vm, "r0": args.r0, "scale": args.scale,
             "vel_frame": args.vel_frame, "dry_run": args.dry_run,
+            "slow": args.slow,
         })
         swarm.attach_logger(logger)
         print(f"  Flight logging -> {logger.session_dir} (disable with --no-log)")
@@ -560,7 +582,8 @@ def main():
 
     try:
         run(swarm, receiver, olfati,
-            dry_run=args.dry_run, vel_frame=args.vel_frame, logger=logger)
+            dry_run=args.dry_run, vel_frame=args.vel_frame, logger=logger,
+            speed_scale=args.slow)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
