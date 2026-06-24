@@ -139,6 +139,17 @@ cd lis-swarm-app
 gradle :app:assembleDebug      # or build/run from Android Studio
 gradle :app:installDebug       # to a connected RC
 ```
-DJI app key is in `AndroidManifest.xml` (`com.dji.sdk.API_KEY`). Note `lis-swarm-app/` is
-its own nested git repo. A large stray `java_pid*.hprof` heap dump may sit in `lis-swarm-app/` —
-it's not part of the build; ignore/delete it, don't commit it.
+DJI app key is in `AndroidManifest.xml` (`com.dji.sdk.API_KEY`).
+
+## Version control
+
+Single git repo rooted at `DJI_Swarm/` (monorepo); `AOS server/` and `lis-swarm-app/` are
+plain subfolders. `lis-swarm-app/` was flattened in from its own repo — that history still
+lives at `github.com/lis-epfl/lis-swarm-app`. The root has no remote configured yet.
+
+The root `.gitignore` excludes build output (`build/`, `.gradle/`, `x64/`, NuGet `packages/`),
+regenerable C++ binaries (`*.exe`, `*.lib`, `*.a`, `*.pyd`, `python37.dll` — rebuild via
+`AOS server/README.md`), heap dumps (`*.hprof`), `__pycache__/`, and the bundled WebView2
+runtime. The prebuilt Android `.so` libs and assets under `lis-swarm-app/app/src/main/`
+**are** committed (no source exists for them); the largest, `libdjisdk_jni.so` (~55 MB),
+trips GitHub's >50 MB warning but is under the 100 MB hard limit.
