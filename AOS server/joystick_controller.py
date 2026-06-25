@@ -19,12 +19,15 @@ Usage:
     python joystick_controller.py --cli        # fallback keyboard CLI
 
 Joystick input comes from readController.py over UDP :5055 (see
-udp_joystick_receiver.py). The drone-side timer in SwarmActivity expects
-absolute heading (deg) and absolute altitude (m); the UDP loop integrates
-yaw-rate and vertical-rate stick inputs to produce those targets.
+udp_joystick_receiver.py). The drone-side VS timer in SwarmActivity runs yaw in
+angular-velocity (rate) mode and altitude in absolute-position mode; the UDP
+loop keeps an absolute target heading (for the heading-hold) but emits a yaw
+RATE, and integrates the vertical-rate stick into an absolute altitude target.
 
 Commands sent via sendWayPointData():
     "VS:pitch:roll:yaw:throttle:gimbal_pitch:gimbal_yaw"
+        pitch/roll = world N/E velocity m/s, yaw = yaw RATE deg/s,
+        throttle = absolute altitude m, gimbal angles = absolute deg.
     "ENABLE_VS"  - Enable virtual stick mode
     "DISABLE_VS" - Disable virtual stick mode
     "TAKEOFF"    - Auto takeoff
@@ -38,6 +41,7 @@ Telemetry format (from getImageAndTelemetryData, after image bytes):
 import argparse
 import time
 import threading
+from collections import deque
 import ds_wrapper as w
 
 from udp_joystick_receiver import JoystickReceiver
@@ -60,7 +64,7 @@ TELEMETRY_OFFSET = 3110408
 # angular.z is a yaw-rate stick in [-1, 1].
 MAX_PITCH_MPS    = 3.0     # forward velocity at full stick (m/s)
 MAX_ROLL_MPS     = 3.0     # right velocity at full stick (m/s)
-YAW_RATE_DEG_S   = 60.0    # yaw rate at full angular.z (deg/s) — integrated
+YAW_RATE_DEG_S   = 60.0    # yaw rate at full angular.z (deg/s) — stick feed-forward
 VERT_RATE_MPS    = 2.0     # climb/descent rate at full linear.z (m/s) — integrated
 MAX_ALT_M        = 30.0    # cap on the integrated altitude target
 INITIAL_ALT_M    = 4.0     # seed altitude when VS mode starts (drones never target 0 m)
@@ -73,6 +77,17 @@ JOYSTICK_DEADZONE = 0.05
 # 0.0 = frozen, 1.0 = raw stick (no smoothing). At the ~50 Hz UDP loop rate,
 # alpha=0.25 gives a time-constant of ~60 ms — kills jitter without feeling laggy.
 STICK_SMOOTHING_ALPHA = 0.25
+
+# Yaw heading-hold controller. The DJI VS yaw channel is now angular-velocity
+# (rate) mode — see SwarmActivity.startVsSendLoop. We keep an absolute target
+# heading and convert it into a smooth yaw RATE: stick feed-forward turns the
+# drone while a P term servos the measured heading back onto the target. ANGLE
+# mode (absolute heading straight to the FC) was the source of the old choppy,
+# stepwise yaw. KP_YAW is the only tuning knob: too high + laggy telemetry
+# oscillates, too low feels sluggish returning to heading. The loop response
+# time-constant is ~1/KP_YAW seconds.
+KP_YAW             = 1.5     # heading error (deg) -> yaw rate (deg/s)
+MAX_YAW_RATE_DEG_S = 100.0   # clamp on the commanded yaw rate (deg/s)
 
 # Velocity scale applied by the --slow test flag when given with no value.
 # The flag multiplies all commanded motion (pitch/roll velocity, yaw rate, climb
@@ -88,6 +103,26 @@ def _deadzone(v, dz=JOYSTICK_DEADZONE):
 def _normalize_heading_180(h):
     """Wrap any heading into [-180, 180]."""
     return ((h + 180.0) % 360.0) - 180.0
+
+
+def heading_hold_rate(target_heading, current_heading, ff_rate=0.0):
+    """Yaw RATE (deg/s) that drives current_heading toward target_heading.
+
+    The DJI VS yaw channel is angular-velocity mode, so instead of sending an
+    absolute heading we send a rate: ``ff_rate`` (stick feed-forward) plus a
+    proportional correction on the wrapped heading error. During a sustained
+    turn the error settles small (the FF carries the turn); when the stick is
+    centred FF=0 and the P term smoothly holds/returns to target_heading.
+
+    current_heading may be None (no telemetry/GPS yet) → feed-forward only.
+    Result is clamped to ±MAX_YAW_RATE_DEG_S.
+    """
+    if current_heading is None:
+        rate = ff_rate
+    else:
+        err = _normalize_heading_180(target_heading - current_heading)
+        rate = ff_rate + KP_YAW * err
+    return max(-MAX_YAW_RATE_DEG_S, min(MAX_YAW_RATE_DEG_S, rate))
 
 
 def parse_telemetry(raw_data):
@@ -167,7 +202,7 @@ class DroneController:
         # Current joystick state
         self.pitch = 0.0       # forward/back velocity m/s (-15 to 15)
         self.roll = 0.0        # left/right velocity m/s (-15 to 15)
-        self.yaw = 0.0         # heading angle degrees (-180 to 180)
+        self.yaw = 0.0         # yaw RATE deg/s (±MAX_YAW_RATE_DEG_S)
         self.throttle = 0.0    # altitude meters (absolute)
         self.gimbal_pitch = -90.0
         self.gimbal_yaw = 0.0
@@ -218,14 +253,14 @@ class DroneController:
 
     def set_velocity(self, pitch, roll, yaw, throttle):
         """Set joystick values.
-        pitch:    forward (+) / backward (-) m/s
-        roll:     right (+) / left (-) m/s
-        yaw:      heading angle in degrees
+        pitch:    forward (+) / backward (-) m/s  (world north in GROUND mode)
+        roll:     right (+) / left (-) m/s        (world east  in GROUND mode)
+        yaw:      yaw RATE deg/s (DJI VS angular-velocity yaw mode; + = CW)
         throttle: target altitude in meters
         """
         self.pitch = max(-15, min(15, pitch))
         self.roll = max(-15, min(15, roll))
-        self.yaw = max(-180, min(180, yaw))
+        self.yaw = max(-MAX_YAW_RATE_DEG_S, min(MAX_YAW_RATE_DEG_S, yaw))
         self.throttle = max(0, throttle)
 
     def set_gimbal(self, pitch, yaw=0):
@@ -346,7 +381,7 @@ def interactive_mode(controller):
     print("  disable         - Disable virtual stick")
     print("  takeoff         - Auto takeoff")
     print("  land            - Auto land")
-    print("  vs P R Y T      - Set velocity (pitch roll yaw throttle)")
+    print("  vs P R Y T      - Set velocity (pitch roll yaw-rate°/s throttle)")
     print("  gimbal P [Y]    - Set gimbal (pitch [yaw])")
     print("  telem           - Show latest telemetry")
     print("  stop            - Zero all velocities")
@@ -382,8 +417,8 @@ def interactive_mode(controller):
             controller.land()
             print("Sent LAND")
         elif c == "stop":
-            controller.set_velocity(0, 0, controller.yaw, controller.throttle)
-            print("Velocities zeroed (holding altitude & heading)")
+            controller.set_velocity(0, 0, 0, controller.throttle)
+            print("Velocities zeroed (yaw rate 0, holding altitude)")
         elif c == "vs" and len(cmd) >= 5:
             p, r, y, t = float(cmd[1]), float(cmd[2]), float(cmd[3]), float(cmd[4])
             controller.set_velocity(p, r, y, t)
@@ -486,7 +521,13 @@ def udp_joystick_mode(controller, receiver, speed_scale=1.0):
         raw_roll  = lin_y * MAX_ROLL_MPS
         smooth_pitch = STICK_SMOOTHING_ALPHA * raw_pitch + (1.0 - STICK_SMOOTHING_ALPHA) * smooth_pitch
         smooth_roll  = STICK_SMOOTHING_ALPHA * raw_roll  + (1.0 - STICK_SMOOTHING_ALPHA) * smooth_roll
-        target_yaw = _normalize_heading_180(target_yaw + ang_z * YAW_RATE_DEG_S * speed_scale * dt)
+        # Yaw: integrate the stick into an absolute heading target (the hold
+        # setpoint), then command a smooth yaw RATE toward it — stick feed-forward
+        # leads the turn, the P term holds heading when the stick is centred.
+        ff_yaw_rate = ang_z * YAW_RATE_DEG_S * speed_scale
+        target_yaw = _normalize_heading_180(target_yaw + ff_yaw_rate * dt)
+        cur_heading = controller.telemetry.get('heading') if controller.telemetry else None
+        cmd_yaw_rate = heading_hold_rate(target_yaw, cur_heading, ff_yaw_rate)
         target_alt = max(MIN_ALT_M, min(MAX_ALT_M, target_alt + lin_z * VERT_RATE_MPS * speed_scale * dt))
 
         # Gimbal pitch from angular.x (centered 1.0, swing ±0.4 → [0.6, 1.4])
@@ -497,11 +538,12 @@ def udp_joystick_mode(controller, receiver, speed_scale=1.0):
         # --slow scales the translation command (yaw/climb already scaled above).
         cmd_pitch = smooth_pitch * speed_scale
         cmd_roll  = smooth_roll * speed_scale
-        controller.set_velocity(cmd_pitch, cmd_roll, target_yaw, target_alt)
+        controller.set_velocity(cmd_pitch, cmd_roll, cmd_yaw_rate, target_alt)
         controller.set_gimbal(smooth_gimbal_pitch, 0)
 
         if now - last_print > 1.0:
-            print(f"  P={cmd_pitch:+5.2f}m/s  R={cmd_roll:+5.2f}m/s  Y={target_yaw:+6.1f}°  "
+            print(f"  P={cmd_pitch:+5.2f}m/s  R={cmd_roll:+5.2f}m/s  "
+                  f"Y={target_yaw:+6.1f}°→{cmd_yaw_rate:+5.1f}°/s  "
                   f"Alt={target_alt:5.1f}m  Gim={smooth_gimbal_pitch:+5.1f}°  "
                   f"VS={'ON' if vs_local else 'off'}")
             last_print = now

@@ -20,7 +20,8 @@ Joystick → swarm mapping:
     linear.x   → desired north velocity   (m/s, world frame)
     linear.y   → desired east  velocity   (m/s, world frame)
     linear.z   → climb (integrated into shared target altitude)
-    angular.z  → yaw rate (integrated into shared target heading)
+    angular.z  → yaw rate (feed-forward; a shared target heading is held per
+                 drone via heading_hold_rate → smooth yaw RATE to the DJI VS)
     angular.x  → d_ref, linear map [0.6, 1.4] → scaled [0.3, 0.8]
                  (≈ physical [3, 8] m at ScaleFactor = 10)
     switch s1  → toggle ENABLE_VS / DISABLE_VS for all drones (rising edge)
@@ -71,6 +72,7 @@ from joystick_controller import (
     SwarmController,
     _deadzone,
     _normalize_heading_180,
+    heading_hold_rate,
     MAX_PITCH_MPS,
     MAX_ROLL_MPS,
     YAW_RATE_DEG_S,
@@ -256,7 +258,7 @@ class OlfatiSaber:
 # ---------- main loop ----------
 
 def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
-        speed_scale=1.0):
+        speed_scale=1.0, meta=None):
     print("\n--- Olfati-Saber Swarm Mode ---")
     print(f"  Drones: {sorted(swarm.drones.keys())}")
     print(f"  c_vm={olfati.c_vm}  r0_coh={olfati.r0_coh}  scale={olfati.scale}")
@@ -290,11 +292,11 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
                 for did, drone in swarm.drones.items():
                     t = drone.telemetry
                     if t:
-                        hold_yaw = _normalize_heading_180(t.get('heading', target_yaw))
                         hold_alt = max(t.get('alt', target_alt), MIN_ALT_M)
                     else:
-                        hold_yaw, hold_alt = target_yaw, target_alt
-                    drone.set_velocity(0.0, 0.0, hold_yaw, hold_alt)
+                        hold_alt = target_alt
+                    # Yaw rate 0 = hold current heading; altitude holds at hold_alt.
+                    drone.set_velocity(0.0, 0.0, 0.0, hold_alt)
                 # Let the 20 Hz send threads emit a few zero-velocity commands
                 # so the drones are visibly braking before VS goes off.
                 time.sleep(0.4)
@@ -342,9 +344,12 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
         lin_z = _deadzone(js.linear_z)
         ang_z = _deadzone(js.angular_z)
 
-        # Shared integrated targets (--slow scales the yaw and climb rates too)
-        target_yaw = _normalize_heading_180(
-            target_yaw + ang_z * YAW_RATE_DEG_S * speed_scale * dt)
+        # Shared integrated targets (--slow scales the yaw and climb rates too).
+        # ff_yaw_rate is the shared stick feed-forward; each drone then gets a
+        # yaw RATE = ff + heading-hold P term on its own heading (below), so all
+        # drones smoothly servo their nose to the shared target_yaw.
+        ff_yaw_rate = ang_z * YAW_RATE_DEG_S * speed_scale
+        target_yaw = _normalize_heading_180(target_yaw + ff_yaw_rate * dt)
         target_alt = max(MIN_ALT_M, min(MAX_ALT_M,
                                         target_alt + lin_z * VERT_RATE_MPS * speed_scale * dt))
         d_ref = d_ref_from_ax(js.angular_x, scale=olfati.scale)
@@ -412,6 +417,9 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
                 continue  # no fix → DroneController holds last set_velocity
             try:
                 self_pos, self_vel, hdg = snap[did]
+                # Smooth yaw RATE for this drone: shared stick feed-forward plus
+                # a P term holding its own heading on the shared target_yaw.
+                cmd_yaw_rate = heading_hold_rate(target_yaw, hdg, ff_yaw_rate)
                 neighbours = [(snap[j][0], snap[j][1]) for j in snap if j != did]
                 # Swarm correction (consensus + cohesion) in world frame
                 v_n_corr, v_e_corr = olfati.compute(
@@ -438,11 +446,12 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
                           f"v_des=({v_n_des:+.2f}N,{v_e_des:+.2f}E)  "
                           f"corr=({v_n_corr:+.2f},{v_e_corr:+.2f})  "
                           f"cmd=({v_n_total:+.2f}N,{v_e_total:+.2f}E)  "
-                          f"hdg={hdg:+6.1f}°  yaw={target_yaw:+.1f}°  "
+                          f"hdg={hdg:+6.1f}°→{target_yaw:+.1f}° "
+                          f"yawrate={cmd_yaw_rate:+5.1f}°/s  "
                           f"alt={target_alt:.1f}m  "
                           f"d_ref={d_ref:.3f} (~{d_ref*olfati.scale:.1f}m)")
                 else:
-                    ctrl.set_velocity(v_n_total, v_e_total, target_yaw, target_alt)
+                    ctrl.set_velocity(v_n_total, v_e_total, cmd_yaw_rate, target_alt)
             except Exception as e:
                 print(f"[drone {did}] flocking error: {e}")
 

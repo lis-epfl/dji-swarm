@@ -84,7 +84,10 @@ VS:pitch:roll:yaw:throttle:gimbal_pitch:gimbal_yaw
 ENABLE_VS | DISABLE_VS | TAKEOFF | LAND
 ```
 Parsed in `SwarmActivity.onCommandReceived`. Fields: `pitch`/`roll` = velocity m/s,
-`yaw` = **absolute heading deg**, `throttle` = **absolute altitude m**, gimbal angles abs deg.
+`yaw` = **yaw RATE deg/s** (DJI VS angular-velocity mode; + = clockwise),
+`throttle` = **absolute altitude m**, gimbal angles abs deg. The PC keeps an absolute
+target heading and runs a heading-hold P controller (`joystick_controller.heading_hold_rate`)
+that emits this rate — see the [yaw gotcha](#critical-gotchas).
 
 **Telemetry string** (app → Python), appended after the image bytes in the shared-memory
 array. Colon-separated, 17 fields, produced by `DroneSwarmStreamData.setTelemetryData(...)`
@@ -100,12 +103,22 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 
 - **Coordinate frame (read before touching VS math).** `SwarmActivity.initVirtualStick`/
   the send loop set `FlightCoordinateSystem.GROUND` + `RollPitchControlMode.VELOCITY` +
-  `YawControlMode.ANGLE` + `VerticalControlMode.POSITION`. So the `VS:` `pitch` field is
-  **world-frame north velocity** and `roll` is **world-frame east velocity** — NOT body
-  forward/right. The drone does world→body rotation internally. **Never rotate
+  `YawControlMode.ANGULAR_VELOCITY` + `VerticalControlMode.POSITION`. So the `VS:` `pitch`
+  field is **world-frame north velocity** and `roll` is **world-frame east velocity** — NOT
+  body forward/right. The drone does world→body rotation internally. **Never rotate
   world→body in Python before filling pitch/roll** — doing so double-rotates and the
   drone scrambles directions at any heading ≠ 0. Telemetry `vx/vy/vz` are NED world-frame
   too. If anyone changes the app back to BODY mode, this whole assumption breaks.
+- **Yaw is a RATE, not an angle (read before touching yaw).** The app's VS yaw channel is
+  `YawControlMode.ANGULAR_VELOCITY`, so the `VS:` `yaw` field is **deg/s**, not an absolute
+  heading. ANGLE mode (the old default) fed the FC's position controller a stepped heading
+  setpoint and was visibly choppy both while turning and while holding. Absolute-heading hold
+  now lives on the PC: `joystick_controller.heading_hold_rate(target_yaw, current_heading,
+  ff_rate)` = stick feed-forward + `KP_YAW`×heading-error, clamped to `±MAX_YAW_RATE_DEG_S`.
+  `joystick_controller` and `swarm_flocking` both keep integrating an absolute `target_yaw`
+  and convert it through this helper per send. `KP_YAW` is the only tuning knob (too high +
+  laggy telemetry → oscillation). If you revert the app to `ANGLE`, also send absolute
+  heading again and drop the heading-hold helper.
 - **Gimbal needs VS enabled.** The app only sends gimbal commands inside the 20 Hz VS
   timer (`startVsSendLoop`). Gimbal moves do nothing unless VS is ENABLED.
 - **Multi-drone = 1-based `drone_id`** everywhere, mapping to `DroneSwarmServer` shared-memory slots.

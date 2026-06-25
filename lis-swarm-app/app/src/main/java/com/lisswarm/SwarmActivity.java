@@ -56,6 +56,8 @@ import java.util.TimerTask;
  *
  * Command protocol (received via MQTT):
  *   "VS:pitch:roll:yaw:throttle:gimbal_pitch:gimbal_yaw"
+ *     pitch/roll = world N/E velocity m/s, yaw = yaw RATE deg/s,
+ *     throttle = absolute altitude m, gimbal angles = absolute deg.
  *   "ENABLE_VS" / "DISABLE_VS"
  *   "TAKEOFF" / "LAND"
  */
@@ -74,7 +76,7 @@ public class SwarmActivity extends Activity {
     // Virtual stick state
     private volatile double vsPitch = 0;
     private volatile double vsRoll = 0;
-    private volatile double vsYaw = 0;
+    private volatile double vsYaw = 0;          // yaw RATE, deg/s (ANGULAR_VELOCITY mode)
     private volatile double vsThrottle = 0;
     private volatile double cmdGimbalPitch = -90;
     private volatile double cmdGimbalYaw = 0;
@@ -442,7 +444,12 @@ public class SwarmActivity extends Activity {
                 VirtualStickFlightControlParam param = new VirtualStickFlightControlParam();
                 param.setRollPitchCoordinateSystem(FlightCoordinateSystem.GROUND);
                 param.setRollPitchControlMode(RollPitchControlMode.VELOCITY);
-                param.setYawControlMode(YawControlMode.ANGLE);
+                // Yaw is RATE-controlled (deg/s), not absolute angle. ANGLE mode
+                // makes the FC's position controller chase a stepped heading
+                // setpoint, which is visibly jerky both while turning and while
+                // holding. The PC side runs a heading-hold P controller and sends
+                // a smooth yaw rate; vsYaw is deg/s. (See the yaw note in CLAUDE.md.)
+                param.setYawControlMode(YawControlMode.ANGULAR_VELOCITY);
                 param.setVerticalControlMode(VerticalControlMode.POSITION);
                 param.setPitch(vsPitch);
                 param.setRoll(vsRoll);
