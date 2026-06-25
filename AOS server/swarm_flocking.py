@@ -98,6 +98,11 @@ EARTH_M_PER_DEG = 111320.0
 # Drones with fewer satellites than this are excluded from the swarm snapshot.
 MIN_SAT_COUNT = 6
 
+# Floor for the shared altitude target seeded when swarming starts. The seed is
+# the average altitude of the drones we actually have telemetry from; if that
+# average is below this (e.g. drones still on the ground) we climb to this instead.
+START_ALT_FLOOR_M = 3.0
+
 
 # ---------- helpers ----------
 
@@ -338,6 +343,17 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
             print("[s2] LAND_ALL")
         last_s2 = js.s2
 
+            # altitude target from the AVERAGE altitude of all drones we actually
+            # have telemetry from (e.g. with --drones 3 but only 2 connected, just
+            # those 2), floored at START_ALT_FLOOR_M.
+            fixes = [d.telemetry for d in swarm.drones.values() if d.telemetry]
+            alts = [t['alt'] for t in fixes if t.get('alt') is not None]
+            if fixes:
+                target_yaw = _normalize_heading_180(fixes[0].get('heading', 0.0))
+            if alts:
+                target_alt = max(sum(alts) / len(alts), START_ALT_FLOOR_M)
+            else:
+                target_alt = max(INITIAL_ALT_M, START_ALT_FLOOR_M)
         # Stick channels
         lin_x = _deadzone(js.linear_x)
         lin_y = _deadzone(js.linear_y)
