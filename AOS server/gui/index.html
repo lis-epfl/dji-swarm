@@ -31,6 +31,8 @@
   #banner.warn .dot { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
   #banner.bad  .dot { background: var(--bad);  box-shadow: 0 0 8px var(--bad); }
   #banner .sub { color: var(--muted); font-weight: 400; }
+  #banner .chip { font-weight: 600; font-size: 12px; padding: 2px 10px; border-radius: 12px;
+                  background: rgba(159,216,255,.16); color: #9fd8ff; border: 1px solid var(--line); }
 
   /* ---- status panel ---- */
   #panel {
@@ -63,6 +65,7 @@
   .grid .v { text-align: right; font-variant-numeric: tabular-nums; }
   .vs-on  { color: var(--ok); font-weight: 600; }
   .vs-off { color: var(--muted); }
+  .warn-v { color: var(--warn); font-weight: 600; }
 
   /* ---- controls ---- */
   #controls { position: absolute; left: 10px; bottom: 10px; z-index: 1000; display: flex; gap: 6px; }
@@ -86,6 +89,8 @@
                 color: #cfe9ff; font-size: 11px; font-weight: 600; padding: 1px 6px;
                 border-radius: 6px; box-shadow: none; white-space: nowrap; }
   .dist-label::before { display: none; }  /* hide Leaflet tooltip arrow */
+  .dist-label.dist-ok  { color: #5cf2a6; border-color: rgba(92,242,166,.55); }
+  .dist-label.dist-off { color: #ffd23f; border-color: rgba(255,210,63,.55); }
 
   .leaflet-container { background: #0d1117; }
 </style>
@@ -96,6 +101,7 @@
   <div id="banner" class="bad">
     <span class="dot"></span><span id="banner-text">Connecting…</span>
     <span class="sub" id="banner-sub"></span>
+    <span class="chip" id="dref-chip" style="display:none"></span>
   </div>
 
   <div id="panel">
@@ -193,8 +199,18 @@ function fmt(v, d, suffix) {
   return v.toFixed(d) + (suffix || '');
 }
 
+// A Hz reading coloured against its nominal target rate: green near target,
+// amber if it has dropped below ~70% (e.g. a blocking ds_wrapper call).
+function hzCell(v, target) {
+  if (!Number.isFinite(v)) return '<span class="v">—</span>';
+  const cls = v >= 0.7 * target ? 'vs-on' : 'warn-v';
+  return `<span class="v ${cls}">${v.toFixed(1)} Hz</span>`;
+}
+
 // ---- status cards ----
-function renderCard(id, t, age, status) {
+function renderCard(id, rec, status) {
+  const t = rec.telem || {};
+  const age = rec.age;
   const color = colorFor(id);
   const card = document.createElement('div');
   card.className = 'card';
@@ -221,6 +237,8 @@ function renderCard(id, t, age, status) {
       <span class="k">Climb</span>   <span class="v">${fmt(t.vz, 2, ' m/s')}</span>
       <span class="k">Sats</span>    <span class="v">${Number.isFinite(t.sat_count) ? t.sat_count : '—'}</span>
       <span class="k">VS</span>      <span class="v ${vsOn ? 'vs-on' : 'vs-off'}">${vsOn ? 'ENABLED' : 'off'}</span>
+      <span class="k">Cmd rate</span>   ${hzCell(rec.send_hz, 20)}
+      <span class="k">Telem rate</span> ${hzCell(rec.recv_hz, 10)}
       <span class="k">Link</span>    <span class="v">${fmt(age, 1, ' s')}</span>
     </div>`;
   return card;
@@ -246,6 +264,17 @@ function render(data) {
   } else {
     banner.className = 'bad';  bText.textContent = 'Feed lost';       bSub.textContent = `${fa.toFixed(0)} s ago`;
   }
+
+  // ----- target spacing (d_ref) -----
+  const dref = (data.meta && Number.isFinite(data.meta.d_ref_m)) ? data.meta.d_ref_m : null;
+  const chip = document.getElementById('dref-chip');
+  if (dref !== null) {
+    chip.style.display = '';
+    chip.textContent = `Target spacing ${dref.toFixed(1)} m`;
+  } else {
+    chip.style.display = 'none';
+  }
+  const drefTol = dref !== null ? Math.max(1.0, 0.2 * dref) : null;
 
   const drones = data.drones || {};
   const ids = Object.keys(drones).sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
@@ -287,7 +316,7 @@ function render(data) {
     }
 
     // Status card for everything the controller still knows about.
-    if (age <= DRONE_STALE_S) cards.appendChild(renderCard(id, t, age, status));
+    if (age <= DRONE_STALE_S) cards.appendChild(renderCard(id, rec, status));
   }
 
   document.getElementById('drone-count').textContent =
@@ -299,10 +328,18 @@ function render(data) {
     for (let j = i + 1; j < placed.length; j++) {
       const a = placed[i], b = placed[j];
       const d = distMeters(a, b);
+      // When the target spacing is known, tint each line by how close the pair
+      // is to it: green within tolerance, amber when off-target.
+      let lineColor = '#9fd8ff', labelCls = 'dist-label';
+      if (dref !== null) {
+        if (Math.abs(d - dref) <= drefTol) { lineColor = '#5cf2a6'; labelCls = 'dist-label dist-ok'; }
+        else                               { lineColor = '#ffd23f'; labelCls = 'dist-label dist-off'; }
+      }
       const poly = L.polyline([[a.lat, a.lon], [b.lat, b.lon]],
-        { color: '#9fd8ff', weight: 1.5, opacity: 0.7, dashArray: '4 4' });
+        { color: lineColor, weight: 1.8, opacity: 0.8,
+          dashArray: dref !== null ? null : '4 4' });
       poly.bindTooltip(`${d.toFixed(1)} m`,
-        { permanent: true, direction: 'center', className: 'dist-label' });
+        { permanent: true, direction: 'center', className: labelCls });
       linesLayer.addLayer(poly);
     }
   }

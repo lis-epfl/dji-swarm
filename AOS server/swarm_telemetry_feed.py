@@ -18,9 +18,14 @@ swallowed so it can never disturb the 20 Hz control loop.
 Wire format — one UDP datagram per tick, JSON:
     {
       "t": 1719230000.123,                 # publisher send time (epoch seconds)
+      "meta": { "d_ref_m": 5.0 },          # optional swarm-level fields
       "drones": {
-        "1": { ...telemetry fields... },   # exactly what parse_telemetry produced
-        "2": {},                           # empty dict == no telemetry yet
+        "1": {                             # per drone
+          "telem": { ...telemetry fields... },  # exactly what parse_telemetry produced
+          "send_hz": 19.8,                 # measured command-send rate (or null)
+          "recv_hz": 9.7                   # measured telemetry-read rate (or null)
+        },
+        "2": { "telem": {}, "send_hz": null, "recv_hz": null },  # no telemetry yet
         ...
       }
     }
@@ -41,17 +46,24 @@ DEFAULT_GUI_PORT = 5099
 class TelemetryFeedPublisher:
     """Background thread that periodically UDP-sends a telemetry snapshot."""
 
-    def __init__(self, source, host=DEFAULT_GUI_HOST, port=DEFAULT_GUI_PORT,
-                 rate_hz=5.0):
+    def __init__(self, source, stats_source=None, meta_source=None,
+                 host=DEFAULT_GUI_HOST, port=DEFAULT_GUI_PORT, rate_hz=5.0):
         """
         Args:
             source:  zero-arg callable returning {drone_id: telemetry_dict}.
                      Called every tick; a telemetry_dict may be empty for a
                      drone that has not produced a fix yet.
+            stats_source: optional zero-arg callable returning
+                     {drone_id: {"send_hz": float, "recv_hz": float}} — measured
+                     loop rates per drone. Missing drones/keys become null.
+            meta_source:  optional zero-arg callable returning a dict of
+                     swarm-level fields (e.g. {"d_ref_m": 5.0}).
             host/port: UDP destination — the swarm_gui.py listener.
             rate_hz: publish rate (5 Hz is plenty for a map).
         """
         self._source = source
+        self._stats_source = stats_source
+        self._meta_source = meta_source
         self._addr = (host, int(port))
         self._interval = 1.0 / rate_hz if rate_hz > 0 else 0.2
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -62,10 +74,18 @@ class TelemetryFeedPublisher:
         while self._running:
             try:
                 snap = self._source() or {}
-                payload = {
-                    "t": time.time(),
-                    "drones": {str(did): (t or {}) for did, t in snap.items()},
-                }
+                stats = (self._stats_source() if self._stats_source else None) or {}
+                drones = {}
+                for did, telem in snap.items():
+                    s = stats.get(did) or {}
+                    drones[str(did)] = {
+                        "telem": telem or {},
+                        "send_hz": s.get("send_hz"),
+                        "recv_hz": s.get("recv_hz"),
+                    }
+                payload = {"t": time.time(), "drones": drones}
+                if self._meta_source:
+                    payload["meta"] = self._meta_source() or {}
                 self._sock.sendto(json.dumps(payload).encode("utf-8"), self._addr)
             except Exception:
                 # The GUI is non-critical to flight; never propagate.

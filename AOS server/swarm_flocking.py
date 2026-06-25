@@ -348,6 +348,11 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
         target_alt = max(MIN_ALT_M, min(MAX_ALT_M,
                                         target_alt + lin_z * VERT_RATE_MPS * speed_scale * dt))
         d_ref = d_ref_from_ax(js.angular_x, scale=olfati.scale)
+        # Publish the physical target spacing (metres) for the GUI. d_ref is in
+        # scaled units, so physical spacing = d_ref * scale (matches the "~Xm"
+        # the per-second status line prints).
+        if meta is not None:
+            meta["d_ref_m"] = round(d_ref * olfati.scale, 2)
 
         # World-frame group desired velocity, shared across the swarm: every
         # drone tries to move in the same compass direction regardless of its
@@ -571,10 +576,17 @@ def main():
     receiver.start()
     print(f"  UDP joystick listener on :{args.port}")
 
+    # Shared with run(): the live physical target spacing (d_ref in metres),
+    # published to the GUI by the feed below.
+    swarm_meta = {"d_ref_m": None}
+
     gui_feed = None
     if not args.no_gui:
         gui_feed = TelemetryFeedPublisher(
             source=swarm.get_all_telemetry,
+            stats_source=lambda: {did: {"send_hz": d.send_hz(), "recv_hz": d.recv_hz()}
+                                  for did, d in swarm.drones.items()},
+            meta_source=lambda: swarm_meta,
             host=args.gui_host, port=args.gui_port)
         gui_feed.start()
         print(f"  GUI telemetry feed -> {args.gui_host}:{args.gui_port} "
@@ -583,7 +595,7 @@ def main():
     try:
         run(swarm, receiver, olfati,
             dry_run=args.dry_run, vel_frame=args.vel_frame, logger=logger,
-            speed_scale=args.slow)
+            speed_scale=args.slow, meta=swarm_meta)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:

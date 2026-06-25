@@ -120,6 +120,40 @@ def parse_telemetry(raw_data):
     return None
 
 
+class _RateMeter:
+    """Sliding-window estimate of how often tick() is called, in Hz.
+
+    tick() runs in the producer thread (the send or telemetry loop); hz() is read
+    from the GUI-feed thread, hence the lock. The window auto-prunes, so a stalled
+    or stopped loop decays toward 0 Hz rather than reporting a stale rate — which
+    is exactly what makes this useful for spotting a blocking ds_wrapper call."""
+
+    def __init__(self, window=2.0):
+        self._window = window
+        self._ts = deque()
+        self._lock = threading.Lock()
+
+    def tick(self):
+        now = time.perf_counter()
+        with self._lock:
+            self._ts.append(now)
+            cutoff = now - self._window
+            while self._ts and self._ts[0] < cutoff:
+                self._ts.popleft()
+
+    def hz(self):
+        now = time.perf_counter()
+        with self._lock:
+            cutoff = now - self._window
+            while self._ts and self._ts[0] < cutoff:
+                self._ts.popleft()
+            n = len(self._ts)
+            if n < 2:
+                return 0.0
+            span = self._ts[-1] - self._ts[0]
+        return round((n - 1) / span, 1) if span > 0 else 0.0
+
+
 class DroneController:
     """Controls a single drone via ds_wrapper."""
 
@@ -143,6 +177,11 @@ class DroneController:
 
         # Optional FlightLogger (set by the launch script); None = no logging.
         self.logger = None
+
+        # Measured loop rates (Hz): how fast commands actually go out and
+        # telemetry actually comes back. Surfaced to the GUI.
+        self._send_meter = _RateMeter()
+        self._recv_meter = _RateMeter()
 
         # Background threads
         self._running = False
@@ -194,6 +233,14 @@ class DroneController:
         self.gimbal_pitch = pitch
         self.gimbal_yaw = yaw
 
+    def send_hz(self):
+        """Measured rate (Hz) at which VS commands are actually being sent."""
+        return self._send_meter.hz()
+
+    def recv_hz(self):
+        """Measured rate (Hz) at which telemetry is actually being read back."""
+        return self._recv_meter.hz()
+
     def get_image_and_telemetry(self):
         """Get raw image + telemetry data from the drone.
         Returns the full numpy array from ds_wrapper.
@@ -221,6 +268,7 @@ class DroneController:
             while self._running:
                 try:
                     self.send_vs()
+                    self._send_meter.tick()
                 except Exception as e:
                     print(f"[drone {self.drone_id}] send_vs error: {e}", flush=True)
                 time.sleep(interval)
@@ -230,6 +278,7 @@ class DroneController:
             while self._running:
                 try:
                     self.update_telemetry()
+                    self._recv_meter.tick()
                 except Exception as e:
                     print(f"[drone {self.drone_id}] update_telemetry error: {e}", flush=True)
                 time.sleep(interval)
@@ -519,6 +568,8 @@ def main():
     if not args.no_gui:
         gui_feed = TelemetryFeedPublisher(
             source=lambda: {drone.drone_id: drone.telemetry},
+            stats_source=lambda: {drone.drone_id: {
+                "send_hz": drone.send_hz(), "recv_hz": drone.recv_hz()}},
             host=args.gui_host, port=args.gui_port)
         gui_feed.start()
         print(f"GUI telemetry feed -> {args.gui_host}:{args.gui_port} "

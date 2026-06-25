@@ -55,25 +55,37 @@ class SwarmState:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._drones = {}        # id(str) -> {"telem": {...}, "rx": epoch}
+        self._drones = {}        # id(str) -> {"telem", "send_hz", "recv_hz", "rx"}
+        self._meta = {}          # swarm-level fields, e.g. {"d_ref_m": 5.0}
         self._last_packet = 0.0
 
     def update(self, payload):
         now = time.time()
         with self._lock:
             self._last_packet = now
-            for did, telem in payload.get("drones", {}).items():
-                self._drones[str(did)] = {"telem": telem or {}, "rx": now}
+            if "meta" in payload:
+                self._meta = payload.get("meta") or {}
+            for did, d in payload.get("drones", {}).items():
+                # Accept both the rich {"telem":..., "send_hz":...} form and a
+                # bare telemetry dict (older/simpler publishers).
+                if isinstance(d, dict) and "telem" in d:
+                    telem, send_hz, recv_hz = d.get("telem") or {}, d.get("send_hz"), d.get("recv_hz")
+                else:
+                    telem, send_hz, recv_hz = (d or {}), None, None
+                self._drones[str(did)] = {
+                    "telem": telem, "send_hz": send_hz, "recv_hz": recv_hz, "rx": now}
 
     def snapshot(self):
         now = time.time()
         with self._lock:
             drones = {
-                did: {"telem": rec["telem"], "age": round(now - rec["rx"], 2)}
+                did: {"telem": rec["telem"], "send_hz": rec["send_hz"],
+                      "recv_hz": rec["recv_hz"], "age": round(now - rec["rx"], 2)}
                 for did, rec in self._drones.items()
             }
             feed_age = round(now - self._last_packet, 2) if self._last_packet else None
-            return {"server_time": now, "feed_age": feed_age, "drones": drones}
+            return {"server_time": now, "feed_age": feed_age,
+                    "meta": dict(self._meta), "drones": drones}
 
 
 def udp_listener(state, host, port):
