@@ -74,7 +74,40 @@
     border-radius: 8px; padding: 7px 11px; font-size: 12px; cursor: pointer;
     box-shadow: 0 2px 8px rgba(0,0,0,.4); display: inline-flex; align-items: center; gap: 6px;
   }
-  #controls button:hover { border-color: #3d4856; }
+  #controls button:not(.swarm-btn):hover { border-color: #3d4856; }
+
+  /* Start/Stop swarming: chunky 3D pills — green = start, red = stop. The
+     button for the state you're already in greys out (can't press it again). */
+  #controls .swarm-btn {
+    font-weight: 700; color: #fff; border-style: solid; border-width: 1px;
+    border-bottom-width: 3px; padding: 7px 13px; text-shadow: 0 1px 1px rgba(0,0,0,.35);
+    transition: transform .05s ease, box-shadow .05s ease, filter .1s ease;
+  }
+  #controls #btn-start.swarm-btn {
+    background: linear-gradient(#3fb950, #2ea043);
+    border-color: #1a7f37; border-bottom-color: #115a28;
+    box-shadow: 0 2px 0 #115a28, 0 3px 7px rgba(0,0,0,.45);
+  }
+  #controls #btn-stop.swarm-btn {
+    background: linear-gradient(#fa6a63, #da3633);
+    border-color: #b62324; border-bottom-color: #861617;
+    box-shadow: 0 2px 0 #861617, 0 3px 7px rgba(0,0,0,.45);
+  }
+  #controls .swarm-btn:not(:disabled):hover  { filter: brightness(1.08); }
+  #controls .swarm-btn:not(:disabled):active {
+    transform: translateY(2px);
+    box-shadow: 0 0 0 rgba(0,0,0,0), 0 1px 3px rgba(0,0,0,.4);
+  }
+  /* The state you're already in: greyed, flattened, not clickable. */
+  #controls .swarm-btn:disabled {
+    background: #21262d; color: var(--muted);
+    border-color: var(--line); border-bottom-color: #161b22;
+    box-shadow: 0 2px 0 #161b22; text-shadow: none;
+    cursor: not-allowed; opacity: .5; filter: none; transform: none;
+  }
+
+  #banner .chip.swarm-on  { background: rgba(63,185,80,.18);  color: #7ee787; border-color: rgba(63,185,80,.45); }
+  #banner .chip.swarm-off { background: rgba(139,148,158,.16); color: var(--muted); }
 
   /* ---- drone marker ---- */
   .drone-div { background: none; border: none; }
@@ -102,6 +135,7 @@
     <span class="dot"></span><span id="banner-text">Connecting…</span>
     <span class="sub" id="banner-sub"></span>
     <span class="chip" id="dref-chip" style="display:none"></span>
+    <span class="chip" id="swarm-chip" style="display:none"></span>
   </div>
 
   <div id="panel">
@@ -110,6 +144,10 @@
   </div>
 
   <div id="controls">
+    <button id="btn-start" class="swarm-btn"
+            title="Start sending swarming commands (arms Virtual Stick)">&#9654; Start swarming</button>
+    <button id="btn-stop" class="swarm-btn" disabled
+            title="Stop swarming — drones hold position (disarms Virtual Stick)">&#9632; Stop swarming</button>
     <button id="btn-recenter" title="Fit the map to all drones">Recenter on swarm</button>
     <button id="btn-epfl" title="Jump back to EPFL Lausanne">EPFL</button>
     <label><input type="checkbox" id="chk-follow" /> Follow swarm</label>
@@ -276,6 +314,26 @@ function render(data) {
   }
   const drefTol = dref !== null ? Math.max(1.0, 0.2 * dref) : null;
 
+  // ----- swarming state (Start/Stop) -----
+  // The controller publishes meta.swarming; light up whichever button matches
+  // the live state so the GUI reflects s1 toggles and button presses alike.
+  const swarming = !!(data.meta && data.meta.swarming);
+  const feedLive = (fa !== null && fa !== undefined && fa <= 10.0);
+  const swarmChip = document.getElementById('swarm-chip');
+  const bStart = document.getElementById('btn-start');
+  const bStop  = document.getElementById('btn-stop');
+  if (feedLive) {
+    swarmChip.style.display = '';
+    swarmChip.className = 'chip ' + (swarming ? 'swarm-on' : 'swarm-off');
+    swarmChip.textContent = swarming ? 'SWARMING' : 'HOLDING';
+  } else {
+    swarmChip.style.display = 'none';
+  }
+  // Grey out the button for the state we're already in: Start is dead while
+  // swarming, Stop is dead while held (and until Start is first pressed).
+  bStart.disabled = swarming;
+  bStop.disabled = !swarming;
+
   const drones = data.drones || {};
   const ids = Object.keys(drones).sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
 
@@ -364,6 +422,21 @@ function fitToSwarm(placed) {
 }
 
 // ---- controls ----
+// Start/Stop swarming: POST to the GUI server, which forwards the action to the
+// flight controller over UDP. Best-effort; the live state comes back via
+// meta.swarming on the next /telemetry poll, so we don't optimistically flip.
+async function sendSwarmCommand(action) {
+  try {
+    await fetch('/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    });
+  } catch (e) { /* controller/GUI down — banner already shows feed health */ }
+}
+document.getElementById('btn-start').addEventListener('click', () => sendSwarmCommand('start'));
+document.getElementById('btn-stop').addEventListener('click', () => sendSwarmCommand('stop'));
+
 document.getElementById('btn-recenter').addEventListener('click', () => {
   const placed = Object.entries(markers).map(([id, m]) =>
     ({ id, lat: m.getLatLng().lat, lon: m.getLatLng().lng }));

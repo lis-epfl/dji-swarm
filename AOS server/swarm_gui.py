@@ -102,7 +102,7 @@ def udp_listener(state, host, port):
             continue  # ignore malformed packets, keep listening
 
 
-def make_handler(state):
+def make_handler(state, cmd_sock=None, cmd_addr=None):
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype):
             self.send_response(code)
@@ -141,6 +141,32 @@ def make_handler(state):
             with open(full, "rb") as f:
                 self._send(200, f.read(), ctype)
 
+        def do_POST(self):
+            # The only POST route: the Start/Stop swarming buttons. We forward the
+            # action to the flight controller (swarm_flocking.py) as a local UDP
+            # datagram on the command port. This server never touches ds_wrapper.
+            path = self.path.split("?", 1)[0]
+            if path != "/command":
+                self._send(404, b"not found", "text/plain")
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                action = (json.loads(body.decode("utf-8")).get("action") or "").lower()
+            except Exception:
+                self._send(400, b'{"ok":false,"error":"bad json"}', "application/json")
+                return
+            if action not in ("start", "stop", "toggle"):
+                self._send(400, b'{"ok":false,"error":"bad action"}', "application/json")
+                return
+            if cmd_sock is not None:
+                try:
+                    cmd_sock.sendto(json.dumps({"action": action}).encode("utf-8"),
+                                    cmd_addr)
+                except Exception:
+                    pass  # controller not up yet; button is best-effort
+            self._send(200, b'{"ok":true}', "application/json")
+
         def log_message(self, *args):
             pass  # quiet; telemetry polling would otherwise spam the console
 
@@ -156,6 +182,12 @@ def main():
                     help="UDP telemetry bind address (match the controller's --gui-host)")
     ap.add_argument("--udp-port", type=int, default=5099,
                     help="UDP telemetry port (match the controller's --gui-port)")
+    ap.add_argument("--cmd-host", default="127.0.0.1",
+                    help="Host to send Start/Stop commands to (the controller; "
+                         "default 127.0.0.1 — it runs on this same PC)")
+    ap.add_argument("--cmd-port", type=int, default=5098,
+                    help="UDP port the controller listens on for Start/Stop "
+                         "commands (match swarm_flocking.py --cmd-port)")
     ap.add_argument("--open", action="store_true",
                     help="Open the GUI in the default browser on startup")
     args = ap.parse_args()
@@ -170,12 +202,21 @@ def main():
                          daemon=True, name="UdpTelemetryListener")
     t.start()
 
-    httpd = ThreadingHTTPServer((args.http_host, args.http_port), make_handler(state))
+    # Outbound UDP socket for forwarding Start/Stop button presses to the
+    # controller (swarm_flocking.py). Co-located on this PC, so the default
+    # target is 127.0.0.1:5098.
+    cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cmd_addr = (args.cmd_host, args.cmd_port)
+
+    httpd = ThreadingHTTPServer((args.http_host, args.http_port),
+                                make_handler(state, cmd_sock, cmd_addr))
     url = f"http://{'127.0.0.1' if args.http_host in ('0.0.0.0', '') else args.http_host}:{args.http_port}"
     print("LIS_Swarm GUI server")
     print(f"  Open: {url}")
     print(f"  Waiting for telemetry from a running controller "
           f"(joystick_controller.py / swarm_flocking.py).")
+    print(f"  Start/Stop buttons -> {args.cmd_host}:{args.cmd_port} "
+          f"(swarm_flocking.py --cmd-port).")
     print("  Ctrl+C to stop.")
 
     if args.open:

@@ -46,9 +46,12 @@ Usage:
 """
 
 import argparse
+import json
 import math
 import msvcrt    # Windows console: non-blocking keyboard read for the 'q' stop
+import socket
 import sys
+import threading
 import time
 
 import ds_wrapper as w
@@ -260,10 +263,45 @@ class OlfatiSaber:
         return consensus_n + coh_n, consensus_e + coh_e
 
 
+# Reverse command channel: the browser GUI (swarm_gui.py) forwards Start/Stop
+# button presses here as JSON UDP datagrams. Distinct from the joystick (:5055)
+# and telemetry (:5099) ports.
+DEFAULT_CMD_HOST = "127.0.0.1"
+DEFAULT_CMD_PORT = 5098
+
+
+def command_listener(swarming, host, port):
+    """Receive Start/Stop datagrams from the GUI and toggle the swarming gate.
+
+    This thread ONLY mutates the shared `swarming` Event — it never touches
+    ds_wrapper. The main loop detects the edge and performs the actual VS
+    arm/disarm, so every hardware poke stays on the control-loop thread.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    print(f"  UDP command listener on {host}:{port} (GUI Start/Stop)")
+    while True:
+        try:
+            data, _ = sock.recvfrom(65535)
+            action = (json.loads(data.decode("utf-8")).get("action") or "").lower()
+            if action == "start":
+                swarming.set()
+                print("[gui] START swarming")
+            elif action == "stop":
+                swarming.clear()
+                print("[gui] STOP swarming")
+            elif action == "toggle":
+                (swarming.clear if swarming.is_set() else swarming.set)()
+                print(f"[gui] TOGGLE swarming -> {'ON' if swarming.is_set() else 'off'}")
+        except Exception:
+            continue  # ignore malformed packets, keep listening
+
+
 # ---------- main loop ----------
 
-def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
-        speed_scale=1.0, meta=None):
+def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
+        logger=None, speed_scale=1.0, meta=None):
     print("\n--- Olfati-Saber Swarm Mode ---")
     print(f"  Drones: {sorted(swarm.drones.keys())}")
     print(f"  c_vm={olfati.c_vm}  r0_coh={olfati.r0_coh}  scale={olfati.scale}")
@@ -271,13 +309,14 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
           f"(switch via --vel-frame if consensus oscillates)")
     if speed_scale != 1.0:
         print(f"  SLOW TEST MODE: commanded velocities/rates scaled to {speed_scale:.0%}")
-    print(f"  s1: toggle VS-all    s2: LAND-all")
+    print(f"  s1 / GUI button: toggle swarming (arm VS + flock)    s2: LAND-all")
     print(f"  q  (PC keyboard): stop, hold position, disable VS, exit")
     print(f"  Ctrl+C: same, abrupt\n")
 
     target_yaw = 0.0
     target_alt = INITIAL_ALT_M
     vs_on = False
+    last_swarming = swarming.is_set()   # starts cleared = held (do nothing)
     last_s1 = 0
     last_s2 = 0
     last_t = time.time()
@@ -307,42 +346,33 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
                 time.sleep(0.4)
                 swarm.disable_vs_all()
                 vs_on = False
+                swarming.clear()
                 print("[q] VS disabled — drones holding position autonomously")
                 return
 
         js = receiver.get_state()
-        if js is None:
-            # Stale joystick → hold last commands, don't integrate
-            time.sleep(0.05)
-            continue
 
-        # s1 rising edge: toggle VS on/off across the whole swarm
-        if js.s1 == 1 and last_s1 == 0:
-            if vs_on:
-                swarm.disable_vs_all()
-                vs_on = False
-                print("[s1] DISABLE_VS_ALL")
-            else:
-                seed = next((d.telemetry for d in swarm.drones.values()
-                             if d.telemetry), None)
-                if seed:
-                    target_yaw = _normalize_heading_180(seed.get('heading', 0.0))
-                    target_alt = max(seed.get('alt', INITIAL_ALT_M), INITIAL_ALT_M)
-                else:
-                    target_alt = INITIAL_ALT_M
-                swarm.enable_vs_all()
-                vs_on = True
-                print(f"[s1] ENABLE_VS_ALL  start heading={target_yaw:+.1f}°  "
-                      f"alt={target_alt:.1f} m")
-        last_s1 = js.s1
+        # s1 rising edge: toggle the shared swarming gate (identical to the GUI
+        # Start/Stop buttons). Needs the joystick, so only when one is present.
+        if js is not None:
+            if js.s1 == 1 and last_s1 == 0:
+                (swarming.clear if swarming.is_set() else swarming.set)()
+                print(f"[s1] {'START' if swarming.is_set() else 'STOP'} swarming")
+            last_s1 = js.s1
 
-        # s2 rising edge: LAND all drones
-        if js.s2 == 1 and last_s2 == 0:
-            for d in swarm.drones.values():
-                d.land()
-            print("[s2] LAND_ALL")
-        last_s2 = js.s2
+            # s2 rising edge: LAND all drones
+            if js.s2 == 1 and last_s2 == 0:
+                for d in swarm.drones.values():
+                    d.land()
+                print("[s2] LAND_ALL")
+            last_s2 = js.s2
 
+        # Swarming edge → arm/disarm VS. Done here (not in the listener thread or
+        # the s1 branch) so every ds_wrapper poke stays on this control-loop
+        # thread, and so the GUI can Start/Stop even with no joystick connected.
+        sw = swarming.is_set()
+        if sw and not last_swarming:
+            # Rising: arm VS. Seed heading from a drone with a fix, and the shared
             # altitude target from the AVERAGE altitude of all drones we actually
             # have telemetry from (e.g. with --drones 3 but only 2 connected, just
             # those 2), floored at START_ALT_FLOOR_M.
@@ -354,6 +384,38 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
                 target_alt = max(sum(alts) / len(alts), START_ALT_FLOOR_M)
             else:
                 target_alt = max(INITIAL_ALT_M, START_ALT_FLOOR_M)
+            swarm.enable_vs_all()
+            vs_on = True
+            print(f"[swarm] START: VS armed  heading={target_yaw:+.1f}°  "
+                  f"alt={target_alt:.1f} m")
+        elif (not sw) and last_swarming:
+            # Falling: zero velocities, brake briefly, then disarm VS so each
+            # drone holds position via its own autonomous GPS hover (same as 'q').
+            print("[swarm] STOP: zeroing velocities, holding position, disabling VS")
+            for did, drone in swarm.drones.items():
+                t = drone.telemetry
+                hold_alt = max(t.get('alt', target_alt), MIN_ALT_M) if t else target_alt
+                drone.set_velocity(0.0, 0.0, 0.0, hold_alt)
+            time.sleep(0.4)
+            swarm.disable_vs_all()
+            vs_on = False
+            print("[swarm] VS disabled — drones holding position autonomously")
+        last_swarming = sw
+
+        if meta is not None:
+            meta["swarming"] = sw
+
+        # Held → do nothing: VS is off and the drones hover autonomously until
+        # Start is pressed again.
+        if not sw:
+            time.sleep(0.02)
+            continue
+
+        # Armed but stale joystick → hold last commands, don't integrate.
+        if js is None:
+            time.sleep(0.05)
+            continue
+
         # Stick channels
         lin_x = _deadzone(js.linear_x)
         lin_y = _deadzone(js.linear_y)
@@ -476,7 +538,7 @@ def run(swarm, receiver, olfati, dry_run=False, vel_frame="ned", logger=None,
                   f"yaw={target_yaw:+6.1f}°  alt={target_alt:5.1f}m  "
                   f"d_ref={d_ref:.3f} (~{d_ref*olfati.scale:.1f}m)  "
                   f"fixes={len(snap)}/{len(swarm.drones)}  "
-                  f"VS={'ON' if vs_on else 'off'}")
+                  f"SWARM={'ON' if sw else 'off'}  VS={'ON' if vs_on else 'off'}")
             # Per-drone local position + the per-drone world-frame command
             # (which equals v_des once the swarm correction is added).
             for did in sorted(snap.keys()):
@@ -534,6 +596,12 @@ def main():
                     help=f"GUI telemetry UDP host (default {DEFAULT_GUI_HOST})")
     ap.add_argument("--gui-port", type=int, default=DEFAULT_GUI_PORT,
                     help=f"GUI telemetry UDP port (default {DEFAULT_GUI_PORT})")
+    ap.add_argument("--cmd-host", default=DEFAULT_CMD_HOST,
+                    help=f"UDP bind host for GUI Start/Stop commands "
+                         f"(default {DEFAULT_CMD_HOST})")
+    ap.add_argument("--cmd-port", type=int, default=DEFAULT_CMD_PORT,
+                    help=f"UDP port for GUI Start/Stop commands "
+                         f"(default {DEFAULT_CMD_PORT})")
     ap.add_argument("--no-log", action="store_true",
                     help="Disable background flight-data logging to flight_logs/")
     ap.add_argument("--log-dir", default="flight_logs",
@@ -601,9 +669,15 @@ def main():
     receiver.start()
     print(f"  UDP joystick listener on :{args.port}")
 
-    # Shared with run(): the live physical target spacing (d_ref in metres),
-    # published to the GUI by the feed below.
-    swarm_meta = {"d_ref_m": None}
+    # Shared with run(): the live physical target spacing (d_ref in metres) and
+    # whether swarming is currently active, both published to the GUI by the feed
+    # below. swarming starts cleared so the drones do nothing until Start.
+    swarm_meta = {"d_ref_m": None, "swarming": False}
+
+    swarming = threading.Event()   # cleared = held (do nothing); set = flocking
+    threading.Thread(target=command_listener,
+                     args=(swarming, args.cmd_host, args.cmd_port),
+                     daemon=True, name="GuiCommandListener").start()
 
     gui_feed = None
     if not args.no_gui:
@@ -618,7 +692,7 @@ def main():
               f"(open swarm_gui.py; disable with --no-gui)")
 
     try:
-        run(swarm, receiver, olfati,
+        run(swarm, receiver, olfati, swarming,
             dry_run=args.dry_run, vel_frame=args.vel_frame, logger=logger,
             speed_scale=args.slow, meta=swarm_meta)
     except KeyboardInterrupt:
