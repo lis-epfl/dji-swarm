@@ -570,8 +570,8 @@ def main():
                     help="Number of drones (creates IDs 1..N)")
     ap.add_argument("--port", type=int, default=5055,
                     help="UDP port for joystick (default 5055)")
-    ap.add_argument("--c-vm", type=float, default=1.0,
-                    help="Velocity-matching gain (default 1.0)")
+    ap.add_argument("--c-vm", type=float, default=0.0,
+                    help="Velocity-matching gain (default 0.0)")
     ap.add_argument("--r0", type=float, default=150.0,
                     help="Cohesion neighbour radius r0_coh (default 150.0)")
     ap.add_argument("--scale", type=float, default=10.0,
