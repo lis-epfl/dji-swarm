@@ -48,6 +48,16 @@
   #cards:empty::after { content: "No drones reporting yet."; color: var(--muted);
                         font-size: 13px; padding: 10px; }
 
+  /* ---- Olfati-Saber parameter footer ---- */
+  #params { border-top: 1px solid var(--line); padding: 10px 14px 12px;
+            background: rgba(255,255,255,0.015); }
+  #params .params-hd { font-size: 11px; font-weight: 700; letter-spacing: .4px;
+                       text-transform: uppercase; color: var(--muted); margin-bottom: 7px; }
+  #params-grid { display: grid; grid-template-columns: 1fr auto; gap: 3px 10px; font-size: 12px; }
+  #params-grid .pk { color: var(--muted); }
+  #params-grid .pv { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  #params-grid .pv.dyn { color: #9fd8ff; }
+
   .card { border: 1px solid var(--line); border-left-width: 4px; border-radius: 8px;
           padding: 8px 10px; background: rgba(255,255,255,0.02); }
   .card .hdr { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
@@ -141,6 +151,10 @@
   <div id="panel">
     <h1>Swarm status <span class="count" id="drone-count">0 drones</span></h1>
     <div id="cards"></div>
+    <div id="params" style="display:none">
+      <div class="params-hd">Olfati-Saber parameters</div>
+      <div id="params-grid"></div>
+    </div>
   </div>
 
   <div id="controls">
@@ -282,6 +296,36 @@ function renderCard(id, rec, status) {
   return card;
 }
 
+// ---- Olfati-Saber parameter footer ----
+// Compact number: trims trailing zeros so 10.0 -> "10", 0.9 -> "0.9".
+function fmtNum(v) {
+  if (!Number.isFinite(v)) return '—';
+  return (Math.round(v * 1000) / 1000).toString();
+}
+
+// Show the STATIC swarm-algorithm parameters (published in meta.olfati by
+// swarm_flocking.py) plus the live d_ref, so the operator can see the exact
+// tuning being used to compute each drone's command.
+function renderParams(o, dref) {
+  const box = document.getElementById('params');
+  const grid = document.getElementById('params-grid');
+  if (!o) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  const rows = [
+    // d_ref is dynamic (joystick angular.x); flag it so it reads as "live".
+    ['Target spacing d_ref', dref !== null ? fmtNum(dref) + ' m' : '—', true],
+    ['Velocity match c_vm', fmtNum(o.c_vm), false],
+    ['Cohesion radius r0', fmtNum(o.r0_coh), false],
+    ['Scale factor', fmtNum(o.scale), false],
+    ['ψ gain a', fmtNum(o.a), false],
+    ['ψ gain b', fmtNum(o.b), false],
+    ['ψ offset c', fmtNum(o.c), false],
+    ['Bump δ', fmtNum(o.delta), false],
+  ];
+  grid.innerHTML = rows.map(([k, v, dyn]) =>
+    `<span class="pk">${k}</span><span class="pv${dyn ? ' dyn' : ''}">${v}</span>`).join('');
+}
+
 // ---- main render ----
 let didInitialFit = false;
 
@@ -313,6 +357,9 @@ function render(data) {
     chip.style.display = 'none';
   }
   const drefTol = dref !== null ? Math.max(1.0, 0.2 * dref) : null;
+
+  // ----- Olfati-Saber parameters actually used for the command -----
+  renderParams(data.meta && data.meta.olfati, dref);
 
   // ----- swarming state (Start/Stop) -----
   // The controller publishes meta.swarming; light up whichever button matches

@@ -672,7 +672,24 @@ def main():
     # Shared with run(): the live physical target spacing (d_ref in metres) and
     # whether swarming is currently active, both published to the GUI by the feed
     # below. swarming starts cleared so the drones do nothing until Start.
-    swarm_meta = {"d_ref_m": None, "swarming": False}
+    #
+    # "olfati" carries the STATIC Olfati-Saber parameters actually used to
+    # compute each drone's command (velocity consensus + cohesion) so the GUI
+    # can display the live tuning. d_ref_m is the dynamic spacing target
+    # (joystick angular.x) and is refreshed each tick in run().
+    swarm_meta = {
+        "d_ref_m": None,
+        "swarming": False,
+        "olfati": {
+            "c_vm": olfati.c_vm,
+            "r0_coh": olfati.r0_coh,
+            "scale": olfati.scale,
+            "a": olfati.a,
+            "b": olfati.b,
+            "c": olfati.c,
+            "delta": olfati.delta,
+        },
+    }
 
     swarming = threading.Event()   # cleared = held (do nothing); set = flocking
     threading.Thread(target=command_listener,
