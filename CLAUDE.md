@@ -43,6 +43,14 @@ joystick → Python script ──ds_wrapper.sendWayPointData()──► [shared 
 - **Python control scripts** (run against the built `ds_wrapper.*.pyd`):
   - `joystick_controller.py` — primary single-drone joystick driver (UDP joystick or `--cli`).
   - `swarm_flocking.py` — multi-drone Olfati-Saber flocking from one joystick.
+  - `heading_convexhull.py` — GLOBAL_CONVEXHULL heading control (port of the Unity VR sim's
+    `AttitudeAlgorithm.cs`), used by `swarm_flocking.py`: drones on the swarm's convex hull
+    face outward along their vertex bisector (point-inwards flips it), interior drones hold
+    heading, stick yaw is ignored. Emits target headings in compass deg; `swarm_flocking.py`
+    converts them to yaw rates via `heading_hold_rate`. Mode + point-inwards are **runtime
+    settings owned by the GUI** (Heading selector in `swarm_gui.py`'s controls bar →
+    `/command` POST → UDP :5098 → `command_listener` → `meta["heading_mode"]`); the
+    `--heading`/`--point-inwards` CLI flags only seed them. Pure Python, no `ds_wrapper` import.
   - `udp_joystick_receiver.py` — receives joystick JSON over UDP :5055 (used by the above).
   - `joyreporter.py` — pygame joystick debug readout.
   - `swarm_gui.py` — browser GUI server: a satellite map (default EPFL Lausanne) showing
@@ -156,7 +164,7 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 | Launcher | Starts | Params → script flags |
 | --- | --- | --- |
 | `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
-| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | `-Drones`→`--drones`, `-Slow`→`--slow`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-HttpPort`→`swarm_gui.py --http-port` |
+| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | `-Drones`→`--drones`, `-Slow`→`--slow`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-HttpPort`→`swarm_gui.py --http-port` |
 | `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
 
 **If you change a script's CLI flags, defaults, filename, or how it's invoked, update the

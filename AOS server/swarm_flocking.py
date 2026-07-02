@@ -21,7 +21,11 @@ Joystick → swarm mapping:
     linear.y   → desired east  velocity   (m/s, world frame)
     linear.z   → climb (integrated into shared target altitude)
     angular.z  → yaw rate (feed-forward; a shared target heading is held per
-                 drone via heading_hold_rate → smooth yaw RATE to the DJI VS)
+                 drone via heading_hold_rate → smooth yaw RATE to the DJI VS).
+                 Ignored with --heading convexhull: there the per-drone target
+                 heading comes from the swarm's convex hull instead (boundary
+                 drones face outward, interior drones hold heading — port of
+                 the Unity sim's GLOBAL_CONVEXHULL, see heading_convexhull.py)
     angular.x  → d_ref, linear map [0.6, 1.4] → scaled [0.3, 0.8]
                  (≈ physical [3, 8] m at ScaleFactor = 10)
     switch s1  → toggle ENABLE_VS / DISABLE_VS for all drones (rising edge)
@@ -43,6 +47,7 @@ Usage:
     python swarm_flocking.py --drones 3 --slow         # slow test mode (30% speed)
     python swarm_flocking.py --drones 3 --slow 0.5     # slow test mode at 50% speed
     python swarm_flocking.py --drones 3 --dry-run      # print VS commands, do not transmit
+    python swarm_flocking.py --drones 3 --heading convexhull   # hull-facing headings
 """
 
 import argparse
@@ -70,6 +75,7 @@ from swarm_telemetry_feed import (
     DEFAULT_GUI_HOST,
     DEFAULT_GUI_PORT,
 )
+from heading_convexhull import ConvexHullHeading
 from joystick_controller import (
     DroneController,
     SwarmController,
@@ -93,6 +99,17 @@ from joystick_controller import (
 # clamping. DroneController.set_velocity also clamps body pitch/roll to ±15
 # m/s independently.
 MAX_CMD_MPS = 6.0
+
+# Gimbal pitch (tilt) target shared between the GUI slider and the swarm.
+# Bounded to the DJI Mini 3 Pro's controllable tilt range: -90° (straight down)
+# to +60° (up). The GUI (swarm_gui.py) forwards slider changes as
+# {"action":"gimbal","value":deg} to command_listener, which stores the clamped
+# target in swarm_meta; run() applies it to every drone whenever it changes (the
+# 20 Hz send loop then relays it to the flight controller — gimbal only actually
+# moves while VS is enabled).
+GIMBAL_PITCH_MIN = -90.0
+GIMBAL_PITCH_MAX = 60.0
+DEFAULT_GIMBAL_PITCH = -10.0
 
 # Equirectangular-projection constants for converting (lat, lon) deltas to
 # local meters. Valid for swarm scales (tens of meters).
@@ -270,21 +287,24 @@ DEFAULT_CMD_HOST = "127.0.0.1"
 DEFAULT_CMD_PORT = 5098
 
 
-def command_listener(swarming, host, port):
-    """Receive Start/Stop datagrams from the GUI and toggle the swarming gate.
+def command_listener(swarming, meta, host, port):
+    """Receive GUI command datagrams (Start/Stop, gimbal slider, heading
+    mode + point-inwards toggles) over UDP.
 
-    This thread ONLY mutates the shared `swarming` Event — it never touches
-    ds_wrapper. The main loop detects the edge and performs the actual VS
-    arm/disarm, so every hardware poke stays on the control-loop thread.
+    This thread NEVER touches ds_wrapper — it only mutates the shared `swarming`
+    Event and the shared `meta` dict. The control loop (run) detects the edge /
+    reads meta and performs the actual VS arm/disarm and gimbal set, so every
+    hardware poke stays on the control-loop thread.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, port))
-    print(f"  UDP command listener on {host}:{port} (GUI Start/Stop)")
+    print(f"  UDP command listener on {host}:{port} (GUI Start/Stop + gimbal)")
     while True:
         try:
             data, _ = sock.recvfrom(65535)
-            action = (json.loads(data.decode("utf-8")).get("action") or "").lower()
+            msg = json.loads(data.decode("utf-8"))
+            action = (msg.get("action") or "").lower()
             if action == "start":
                 swarming.set()
                 print("[gui] START swarming")
@@ -294,6 +314,30 @@ def command_listener(swarming, host, port):
             elif action == "toggle":
                 (swarming.clear if swarming.is_set() else swarming.set)()
                 print(f"[gui] TOGGLE swarming -> {'ON' if swarming.is_set() else 'off'}")
+            elif action == "gimbal":
+                # GUI slider: update the shared gimbal pitch target (deg). run()
+                # applies it to every drone on its next tick.
+                try:
+                    v = float(msg.get("value"))
+                except (TypeError, ValueError):
+                    continue
+                v = max(GIMBAL_PITCH_MIN, min(GIMBAL_PITCH_MAX, v))
+                if meta is not None:
+                    meta["gimbal_pitch"] = v
+                print(f"[gui] gimbal pitch -> {v:+.1f}°")
+            elif action == "heading":
+                # GUI heading-mode selector. run() reads meta["heading_mode"]
+                # each tick and handles the manual↔convexhull transition.
+                v = (str(msg.get("value") or "")).lower()
+                if v in ("manual", "convexhull") and meta is not None:
+                    meta["heading_mode"] = v
+                    print(f"[gui] heading mode -> {v}")
+            elif action == "point_inwards":
+                # GUI toggle: boundary drones face the centroid instead of
+                # outward. run() forwards it to the hull controller.
+                if meta is not None:
+                    meta["point_inwards"] = bool(msg.get("value"))
+                    print(f"[gui] point inwards -> {meta['point_inwards']}")
         except Exception:
             continue  # ignore malformed packets, keep listening
 
@@ -301,10 +345,15 @@ def command_listener(swarming, host, port):
 # ---------- main loop ----------
 
 def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
-        logger=None, speed_scale=1.0, meta=None):
+        logger=None, speed_scale=1.0, meta=None, heading_ctrl=None):
     print("\n--- Olfati-Saber Swarm Mode ---")
     print(f"  Drones: {sorted(swarm.drones.keys())}")
     print(f"  c_vm={olfati.c_vm}  r0_coh={olfati.r0_coh}  scale={olfati.scale}")
+    mode0 = (meta or {}).get("heading_mode", "manual")
+    print(f"  Heading: {mode0} — switchable live from the GUI. "
+          f"manual = stick yaw steers a shared target heading; "
+          f"convexhull = GLOBAL_CONVEXHULL (boundary drones face outward, "
+          f"interior drones hold heading, stick yaw ignored)")
     print(f"  Telemetry velocity frame: {vel_frame}  "
           f"(switch via --vel-frame if consensus oscillates)")
     if speed_scale != 1.0:
@@ -316,7 +365,9 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
     target_yaw = 0.0
     target_alt = INITIAL_ALT_M
     vs_on = False
+    last_heading_mode = mode0           # detect GUI mode switches (below)
     last_swarming = swarming.is_set()   # starts cleared = held (do nothing)
+    last_gimbal = None                  # last gimbal pitch applied to the drones
     last_s1 = 0
     last_s2 = 0
     last_t = time.time()
@@ -405,6 +456,46 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         if meta is not None:
             meta["swarming"] = sw
 
+        # GUI gimbal slider: apply the shared pitch target to every drone
+        # whenever it changes. set_gimbal only updates the send-loop's cached
+        # value (no ds_wrapper poke here); the 20 Hz send loop relays it and the
+        # gimbal actually moves once VS is enabled.
+        if meta is not None:
+            gp = meta.get("gimbal_pitch")
+            if gp is not None and gp != last_gimbal:
+                for d in swarm.drones.values():
+                    d.set_gimbal(gp, 0.0)
+                last_gimbal = gp
+
+        # Heading mode + point-inwards are runtime-switchable from the GUI
+        # (command_listener writes meta["heading_mode"]/meta["point_inwards"];
+        # --heading/--point-inwards just seed them). Applied here, outside the
+        # swarming gate, so the operator can preselect the mode while held.
+        hull_mode = False
+        if meta is not None and heading_ctrl is not None:
+            hull_mode = meta.get("heading_mode") == "convexhull"
+            mode = "convexhull" if hull_mode else "manual"
+            if mode != last_heading_mode:
+                if hull_mode:
+                    # Fresh activation: stale debounce timers / held targets
+                    # from a previous stint must not leak in.
+                    heading_ctrl.reset()
+                else:
+                    # Back to manual: re-seed the shared target from a live
+                    # heading so drones don't all snap to a stale target_yaw.
+                    for d in swarm.drones.values():
+                        t = d.telemetry
+                        if t and t.get('heading') is not None:
+                            target_yaw = _normalize_heading_180(t['heading'])
+                            break
+                    meta["hull_boundary"] = []   # nothing is hull-steered now
+                print(f"[heading] mode -> {mode}")
+                last_heading_mode = mode
+            pin = bool(meta.get("point_inwards"))
+            if pin != heading_ctrl.point_inwards:
+                heading_ctrl.set_point_inwards(pin)
+                print(f"[heading] point inwards -> {pin}")
+
         # Held → do nothing: VS is off and the drones hover autonomously until
         # Start is pressed again.
         if not sw:
@@ -426,8 +517,12 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         # ff_yaw_rate is the shared stick feed-forward; each drone then gets a
         # yaw RATE = ff + heading-hold P term on its own heading (below), so all
         # drones smoothly servo their nose to the shared target_yaw.
+        # In convex-hull heading mode the hull owns every drone's heading
+        # (mirrors the Unity AttitudeAlgorithm suppressing the input yaw rate),
+        # so the stick doesn't integrate the shared target.
         ff_yaw_rate = ang_z * YAW_RATE_DEG_S * speed_scale
-        target_yaw = _normalize_heading_180(target_yaw + ff_yaw_rate * dt)
+        if not hull_mode:
+            target_yaw = _normalize_heading_180(target_yaw + ff_yaw_rate * dt)
         target_alt = max(MIN_ALT_M, min(MAX_ALT_M,
                                         target_alt + lin_z * VERT_RATE_MPS * speed_scale * dt))
         d_ref = d_ref_from_ax(js.angular_x, scale=olfati.scale)
@@ -486,6 +581,16 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 vel_ne = (t['vx'], t['vy'])
             snap[did] = (pos_ne, vel_ne, t['heading'])
 
+        # Convex-hull heading control: derive a per-drone target heading from
+        # the swarm's hull (boundary drones face outward along their vertex
+        # bisector; interior drones get None → hold current heading).
+        hull_targets = None
+        if hull_mode:
+            hull_targets = heading_ctrl.update(
+                {did: pos for did, (pos, _, _) in snap.items()}, dt)
+            if meta is not None:
+                meta["hull_boundary"] = heading_ctrl.boundary_ids()
+
         # Per-drone flocking command. The joystick's desired velocity goes
         # straight through (DJI VS already runs a velocity tracker); the swarm
         # algorithm only contributes a correction (neighbour-velocity consensus
@@ -495,9 +600,22 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 continue  # no fix → DroneController holds last set_velocity
             try:
                 self_pos, self_vel, hdg = snap[did]
-                # Smooth yaw RATE for this drone: shared stick feed-forward plus
-                # a P term holding its own heading on the shared target_yaw.
-                cmd_yaw_rate = heading_hold_rate(target_yaw, hdg, ff_yaw_rate)
+                if hull_targets is not None:
+                    # Hull mode: servo boundary drones onto their hull-derived
+                    # heading (no stick feed-forward); interior drones hold
+                    # their current heading (rate 0).
+                    drone_target = hull_targets.get(did)
+                    if drone_target is None:
+                        cmd_yaw_rate = 0.0
+                        drone_target = hdg  # for the dry-run printout
+                    else:
+                        cmd_yaw_rate = heading_hold_rate(drone_target, hdg)
+                else:
+                    # Smooth yaw RATE for this drone: shared stick feed-forward
+                    # plus a P term holding its own heading on the shared
+                    # target_yaw.
+                    drone_target = target_yaw
+                    cmd_yaw_rate = heading_hold_rate(target_yaw, hdg, ff_yaw_rate)
                 neighbours = [(snap[j][0], snap[j][1]) for j in snap if j != did]
                 # Swarm correction (consensus + cohesion) in world frame
                 v_n_corr, v_e_corr = olfati.compute(
@@ -524,7 +642,7 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                           f"v_des=({v_n_des:+.2f}N,{v_e_des:+.2f}E)  "
                           f"corr=({v_n_corr:+.2f},{v_e_corr:+.2f})  "
                           f"cmd=({v_n_total:+.2f}N,{v_e_total:+.2f}E)  "
-                          f"hdg={hdg:+6.1f}°→{target_yaw:+.1f}° "
+                          f"hdg={hdg:+6.1f}°→{drone_target:+.1f}° "
                           f"yawrate={cmd_yaw_rate:+5.1f}°/s  "
                           f"alt={target_alt:.1f}m  "
                           f"d_ref={d_ref:.3f} (~{d_ref*olfati.scale:.1f}m)")
@@ -534,8 +652,13 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 print(f"[drone {did}] flocking error: {e}")
 
         if now - last_print > 1.0:
+            if hull_mode:
+                yaw_desc = ("hull-boundary=" +
+                            (",".join(map(str, heading_ctrl.boundary_ids())) or "none"))
+            else:
+                yaw_desc = f"yaw={target_yaw:+6.1f}°"
             print(f"  v_des=({v_n_des:+5.2f}N,{v_e_des:+5.2f}E) world  "
-                  f"yaw={target_yaw:+6.1f}°  alt={target_alt:5.1f}m  "
+                  f"{yaw_desc}  alt={target_alt:5.1f}m  "
                   f"d_ref={d_ref:.3f} (~{d_ref*olfati.scale:.1f}m)  "
                   f"fixes={len(snap)}/{len(swarm.drones)}  "
                   f"SWARM={'ON' if sw else 'off'}  VS={'ON' if vs_on else 'off'}")
@@ -576,6 +699,24 @@ def main():
                     help="Cohesion neighbour radius r0_coh (default 150.0)")
     ap.add_argument("--scale", type=float, default=10.0,
                     help="Distance scale factor (default 10.0, matches Unity sim)")
+    ap.add_argument("--gimbal-pitch", type=float, default=DEFAULT_GIMBAL_PITCH,
+                    metavar="DEG",
+                    help=f"Initial gimbal pitch (tilt) in degrees for all drones "
+                         f"and the GUI slider's starting position; used on Start. "
+                         f"Range [{GIMBAL_PITCH_MIN:.0f}, {GIMBAL_PITCH_MAX:.0f}] "
+                         f"(DJI Mini 3 Pro). Default {DEFAULT_GIMBAL_PITCH:.0f}.")
+    ap.add_argument("--heading", choices=["manual", "convexhull"], default="manual",
+                    help="Initial heading-control mode (live-switchable from the "
+                         "GUI afterwards): 'manual' (default) integrates a shared "
+                         "target heading from the stick's angular.z; 'convexhull' "
+                         "ports the Unity sim's GLOBAL_CONVEXHULL attitude "
+                         "algorithm — drones on the swarm's convex hull face "
+                         "outward along their vertex bisector, interior drones "
+                         "hold heading, stick yaw is ignored.")
+    ap.add_argument("--point-inwards", action="store_true",
+                    help="Seed the point-inwards toggle (live-switchable from "
+                         "the GUI): in convexhull mode, boundary drones face "
+                         "the swarm centroid instead of outward.")
     ap.add_argument("--vel-frame", choices=["ned", "body"], default="ned",
                     help="Frame of telemetry vx/vy. Default 'ned' assumes DJI "
                          "reports ground-frame velocity; switch to 'body' if "
@@ -612,6 +753,9 @@ def main():
         ap.error("--drones must be >= 1")
     if args.slow <= 0:
         ap.error("--slow SCALE must be > 0")
+    if not (GIMBAL_PITCH_MIN <= args.gimbal_pitch <= GIMBAL_PITCH_MAX):
+        ap.error(f"--gimbal-pitch must be in "
+                 f"[{GIMBAL_PITCH_MIN:.0f}, {GIMBAL_PITCH_MAX:.0f}] (DJI Mini 3 Pro)")
 
     print("LIS_Swarm Flocking Controller (Olfati-Saber)")
     print(f"  ds_wrapper HW Decoder: "
@@ -629,7 +773,7 @@ def main():
             "drones": args.drones, "port": args.port,
             "c_vm": args.c_vm, "r0": args.r0, "scale": args.scale,
             "vel_frame": args.vel_frame, "dry_run": args.dry_run,
-            "slow": args.slow,
+            "slow": args.slow, "gimbal_pitch": args.gimbal_pitch,
         })
         swarm.attach_logger(logger)
         print(f"  Flight logging -> {logger.session_dir} (disable with --no-log)")
@@ -657,13 +801,20 @@ def main():
     print(f"  Started: 20 Hz commands, 10 Hz telemetry")
 
     # angular.x is repurposed for d_ref in swarm mode, so the gimbal would
-    # otherwise stay at the DroneController default (-90°). Park it at -10°
-    # as soon as the send threads are running.
+    # otherwise stay at the DroneController default (-90°). Park it at the
+    # launch value (--gimbal-pitch) as soon as the send threads are running; the
+    # GUI slider seeds to the same value and can retarget it live afterwards
+    # (see command_listener / run).
     for d in swarm.drones.values():
-        d.set_gimbal(-10.0, 0.0)
-    print("  Gimbal pitch set to -10° (yaw 0°) for all drones")
+        d.set_gimbal(args.gimbal_pitch, 0.0)
+    print(f"  Gimbal pitch set to {args.gimbal_pitch:+.0f}° (yaw 0°) for all drones")
 
     olfati = OlfatiSaber(r0_coh=args.r0, c_vm=args.c_vm, scale=args.scale)
+
+    # Always instantiated: the GUI can switch heading modes at runtime, so the
+    # hull controller must exist even when starting in manual mode. run() only
+    # consults it while meta["heading_mode"] == "convexhull".
+    heading_ctrl = ConvexHullHeading(point_inwards=args.point_inwards)
 
     receiver = JoystickReceiver(port=args.port, logger=logger)
     receiver.start()
@@ -680,6 +831,17 @@ def main():
     swarm_meta = {
         "d_ref_m": None,
         "swarming": False,
+        # Heading-control settings, seeded from the CLI and then owned by the
+        # GUI (command_listener overwrites them; run() applies changes each
+        # tick). hull_boundary is the live list of boundary drone ids in
+        # convexhull mode so the GUI can mark which drones the hull steers.
+        "heading_mode": args.heading,
+        "point_inwards": args.point_inwards,
+        "hull_boundary": [],
+        # Live gimbal pitch target (deg): seeded from --gimbal-pitch, then driven
+        # by the GUI slider via command_listener. Published so the slider can
+        # seed its starting position.
+        "gimbal_pitch": args.gimbal_pitch,
         "olfati": {
             "c_vm": olfati.c_vm,
             "r0_coh": olfati.r0_coh,
@@ -693,7 +855,7 @@ def main():
 
     swarming = threading.Event()   # cleared = held (do nothing); set = flocking
     threading.Thread(target=command_listener,
-                     args=(swarming, args.cmd_host, args.cmd_port),
+                     args=(swarming, swarm_meta, args.cmd_host, args.cmd_port),
                      daemon=True, name="GuiCommandListener").start()
 
     gui_feed = None
@@ -711,7 +873,7 @@ def main():
     try:
         run(swarm, receiver, olfati, swarming,
             dry_run=args.dry_run, vel_frame=args.vel_frame, logger=logger,
-            speed_scale=args.slow, meta=swarm_meta)
+            speed_scale=args.slow, meta=swarm_meta, heading_ctrl=heading_ctrl)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:

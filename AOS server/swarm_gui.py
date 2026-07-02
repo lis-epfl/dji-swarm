@@ -142,9 +142,11 @@ def make_handler(state, cmd_sock=None, cmd_addr=None):
                 self._send(200, f.read(), ctype)
 
         def do_POST(self):
-            # The only POST route: the Start/Stop swarming buttons. We forward the
-            # action to the flight controller (swarm_flocking.py) as a local UDP
-            # datagram on the command port. This server never touches ds_wrapper.
+            # The only POST route: swarm controls (Start/Stop buttons, gimbal
+            # pitch slider, heading mode + point-inwards toggles). We forward
+            # the action to the flight controller
+            # (swarm_flocking.py) as a local UDP datagram on the command port.
+            # This server never touches ds_wrapper.
             path = self.path.split("?", 1)[0]
             if path != "/command":
                 self._send(404, b"not found", "text/plain")
@@ -152,17 +154,37 @@ def make_handler(state, cmd_sock=None, cmd_addr=None):
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b""
-                action = (json.loads(body.decode("utf-8")).get("action") or "").lower()
+                msg = json.loads(body.decode("utf-8"))
+                action = (msg.get("action") or "").lower()
             except Exception:
                 self._send(400, b'{"ok":false,"error":"bad json"}', "application/json")
                 return
-            if action not in ("start", "stop", "toggle"):
+            if action in ("start", "stop", "toggle"):
+                out = {"action": action}
+            elif action == "gimbal":
+                # Gimbal pitch slider: forward the numeric target (deg). The
+                # controller clamps it to the drone's tilt range.
+                try:
+                    out = {"action": "gimbal", "value": float(msg.get("value"))}
+                except (TypeError, ValueError):
+                    self._send(400, b'{"ok":false,"error":"bad value"}', "application/json")
+                    return
+            elif action == "heading":
+                # Heading-mode selector (manual | convexhull).
+                value = (str(msg.get("value") or "")).lower()
+                if value not in ("manual", "convexhull"):
+                    self._send(400, b'{"ok":false,"error":"bad value"}', "application/json")
+                    return
+                out = {"action": "heading", "value": value}
+            elif action == "point_inwards":
+                # Convex-hull facing toggle: boundary drones face the centroid.
+                out = {"action": "point_inwards", "value": bool(msg.get("value"))}
+            else:
                 self._send(400, b'{"ok":false,"error":"bad action"}', "application/json")
                 return
             if cmd_sock is not None:
                 try:
-                    cmd_sock.sendto(json.dumps({"action": action}).encode("utf-8"),
-                                    cmd_addr)
+                    cmd_sock.sendto(json.dumps(out).encode("utf-8"), cmd_addr)
                 except Exception:
                     pass  # controller not up yet; button is best-effort
             self._send(200, b'{"ok":true}', "application/json")

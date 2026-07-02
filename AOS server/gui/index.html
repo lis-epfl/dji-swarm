@@ -66,6 +66,7 @@
   .card .name { font-weight: 600; font-size: 13px; }
   .card .pill { margin-left: auto; font-size: 11px; padding: 1px 8px; border-radius: 10px;
                 font-weight: 600; }
+  .pill.hull { background: rgba(63,192,255,.18); color: #3fc0ff; }
   .pill.fix  { background: rgba(63,185,80,.18);  color: var(--ok); }
   .pill.weak { background: rgba(210,153,34,.18);  color: var(--warn); }
   .pill.nofix{ background: rgba(248,81,73,.18);   color: var(--bad); }
@@ -85,6 +86,19 @@
     box-shadow: 0 2px 8px rgba(0,0,0,.4); display: inline-flex; align-items: center; gap: 6px;
   }
   #controls button:not(.swarm-btn):hover { border-color: #3d4856; }
+
+  /* Heading mode selector (manual / convex hull) + point-inwards toggle. */
+  #controls #heading-ctl { cursor: default; }
+  #controls select {
+    background: #21262d; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 6px; font-size: 12px; cursor: pointer;
+  }
+
+  /* Gimbal pitch slider: retargets every drone's gimbal tilt. */
+  #controls #gimbal-ctl { cursor: default; }
+  #controls #gimbal-slider { width: 110px; cursor: pointer; accent-color: #3fc0ff; }
+  #controls #gimbal-val { min-width: 36px; text-align: right;
+                          font-variant-numeric: tabular-nums; color: var(--muted); }
 
   /* Start/Stop swarming: chunky 3D pills — green = start, red = stop. The
      button for the state you're already in greys out (can't press it again). */
@@ -145,6 +159,7 @@
     <span class="dot"></span><span id="banner-text">Connecting…</span>
     <span class="sub" id="banner-sub"></span>
     <span class="chip" id="dref-chip" style="display:none"></span>
+    <span class="chip" id="heading-chip" style="display:none"></span>
     <span class="chip" id="swarm-chip" style="display:none"></span>
   </div>
 
@@ -162,6 +177,22 @@
             title="Start sending swarming commands (arms Virtual Stick)">&#9654; Start swarming</button>
     <button id="btn-stop" class="swarm-btn" disabled
             title="Stop swarming — drones hold position (disarms Virtual Stick)">&#9632; Stop swarming</button>
+    <label id="heading-ctl"
+           title="Heading control: Manual = joystick yaw steers a shared target heading; Convex hull = drones on the swarm's outer ring face outward (GLOBAL_CONVEXHULL), interior drones hold heading, stick yaw is ignored">
+      Heading
+      <select id="heading-select">
+        <option value="manual">Manual</option>
+        <option value="convexhull">Convex hull</option>
+      </select>
+    </label>
+    <label id="inwards-ctl" style="display:none"
+           title="Boundary drones face the swarm centroid instead of outward">
+      <input type="checkbox" id="chk-inwards" /> Point inwards
+    </label>
+    <label id="gimbal-ctl" title="Gimbal pitch (tilt) for all drones — DJI Mini 3 Pro range -90° to +60°">
+      Gimbal <input type="range" id="gimbal-slider" min="-90" max="60" step="1" value="-10" />
+      <span id="gimbal-val">-10&deg;</span>
+    </label>
     <button id="btn-recenter" title="Fit the map to all drones">Recenter on swarm</button>
     <button id="btn-epfl" title="Jump back to EPFL Lausanne">EPFL</button>
     <label><input type="checkbox" id="chk-follow" /> Follow swarm</label>
@@ -260,7 +291,7 @@ function hzCell(v, target) {
 }
 
 // ---- status cards ----
-function renderCard(id, rec, status) {
+function renderCard(id, rec, status, onHull) {
   const t = rec.telem || {};
   const age = rec.age;
   const color = colorFor(id);
@@ -280,7 +311,8 @@ function renderCard(id, rec, status) {
     <div class="hdr">
       <span class="badge" style="background:${color}">${id}</span>
       <span class="name">Drone ${id}</span>
-      <span class="pill ${pill[0]}">${pill[1]}</span>
+      ${onHull ? '<span class="pill hull" style="margin-left:auto" title="On the swarm\'s convex hull — hull heading control is steering this drone">HULL</span>' : ''}
+      <span class="pill ${pill[0]}" ${onHull ? 'style="margin-left:0"' : ''}>${pill[1]}</span>
     </div>
     <div class="grid">
       <span class="k">Alt</span>     <span class="v">${fmt(t.alt, 1, ' m')}</span>
@@ -361,6 +393,38 @@ function render(data) {
   // ----- Olfati-Saber parameters actually used for the command -----
   renderParams(data.meta && data.meta.olfati, dref);
 
+  // ----- heading mode + point-inwards -----
+  // Reflect the controller's live setting (meta.heading_mode/point_inwards)
+  // except in the short window after the operator changed a control, so the
+  // 200 ms poll doesn't flip it back before the controller echoes the change.
+  const meta = data.meta || {};
+  if (Date.now() > headingPendingUntil) {
+    if (meta.heading_mode === 'manual' || meta.heading_mode === 'convexhull') {
+      headingSelect.value = meta.heading_mode;
+    }
+    if ('point_inwards' in meta) chkInwards.checked = !!meta.point_inwards;
+  }
+  const hullMode = headingSelect.value === 'convexhull';
+  inwardsCtl.style.display = hullMode ? '' : 'none';
+  const headingChip = document.getElementById('heading-chip');
+  if (hullMode) {
+    headingChip.style.display = '';
+    headingChip.textContent = 'Hull heading' + (chkInwards.checked ? ' (inwards)' : '');
+  } else {
+    headingChip.style.display = 'none';
+  }
+  // Boundary drones (hull vertices) currently being steered by the hull.
+  const hullSet = new Set(hullMode && Array.isArray(meta.hull_boundary)
+                          ? meta.hull_boundary.map(String) : []);
+
+  // ----- gimbal slider seeding -----
+  // Reflect the controller's live gimbal pitch until the operator drags the
+  // slider, after which the slider is authoritative (don't fight their input).
+  if (!gimbalTouched && data.meta && Number.isFinite(data.meta.gimbal_pitch)) {
+    gimbalSlider.value = data.meta.gimbal_pitch;
+    showGimbal(gimbalSlider.value);
+  }
+
   // ----- swarming state (Start/Stop) -----
   // The controller publishes meta.swarming; light up whichever button matches
   // the live state so the GUI reflects s1 toggles and button presses alike.
@@ -421,7 +485,7 @@ function render(data) {
     }
 
     // Status card for everything the controller still knows about.
-    if (age <= DRONE_STALE_S) cards.appendChild(renderCard(id, rec, status));
+    if (age <= DRONE_STALE_S) cards.appendChild(renderCard(id, rec, status, hullSet.has(id)));
   }
 
   document.getElementById('drone-count').textContent =
@@ -469,20 +533,51 @@ function fitToSwarm(placed) {
 }
 
 // ---- controls ----
-// Start/Stop swarming: POST to the GUI server, which forwards the action to the
+// All controls POST to the GUI server, which forwards the payload to the
 // flight controller over UDP. Best-effort; the live state comes back via
-// meta.swarming on the next /telemetry poll, so we don't optimistically flip.
-async function sendSwarmCommand(action) {
+// meta.* on the next /telemetry poll, so we don't optimistically flip state.
+async function postCommand(payload) {
   try {
     await fetch('/command', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action }),
+      body: JSON.stringify(payload),
     });
   } catch (e) { /* controller/GUI down — banner already shows feed health */ }
 }
-document.getElementById('btn-start').addEventListener('click', () => sendSwarmCommand('start'));
-document.getElementById('btn-stop').addEventListener('click', () => sendSwarmCommand('stop'));
+document.getElementById('btn-start').addEventListener('click', () => postCommand({ action: 'start' }));
+document.getElementById('btn-stop').addEventListener('click', () => postCommand({ action: 'stop' }));
+
+// Heading mode (manual / convex hull) + point-inwards. The controller owns the
+// live value (meta.heading_mode / meta.point_inwards); render() reflects it
+// back into these controls except during a short post-change window.
+const headingSelect = document.getElementById('heading-select');
+const inwardsCtl    = document.getElementById('inwards-ctl');
+const chkInwards    = document.getElementById('chk-inwards');
+let headingPendingUntil = 0;
+headingSelect.addEventListener('change', () => {
+  headingPendingUntil = Date.now() + 1500;
+  inwardsCtl.style.display = headingSelect.value === 'convexhull' ? '' : 'none';
+  postCommand({ action: 'heading', value: headingSelect.value });
+});
+chkInwards.addEventListener('change', () => {
+  headingPendingUntil = Date.now() + 1500;
+  postCommand({ action: 'point_inwards', value: chkInwards.checked });
+});
+
+// Gimbal pitch slider: retargets every drone's gimbal tilt. Forwarded to the
+// controller, which folds the new value into the command it already streams at
+// 20 Hz (no special command needed). Bounded to the DJI Mini 3 Pro tilt range.
+const gimbalSlider = document.getElementById('gimbal-slider');
+const gimbalVal    = document.getElementById('gimbal-val');
+let gimbalTouched  = false;   // once the user drags, stop seeding from telemetry
+function showGimbal(v) { gimbalVal.textContent = Math.round(v) + '°'; }
+gimbalSlider.addEventListener('input', () => {
+  gimbalTouched = true;
+  showGimbal(gimbalSlider.value);
+  postCommand({ action: 'gimbal', value: Number(gimbalSlider.value) });
+});
+showGimbal(gimbalSlider.value);
 
 document.getElementById('btn-recenter').addEventListener('click', () => {
   const placed = Object.entries(markers).map(([id, m]) =>
