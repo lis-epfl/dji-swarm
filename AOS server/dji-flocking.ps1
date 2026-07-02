@@ -1,10 +1,12 @@
-# Launch swarm_flocking.py, readController.py, and the browser GUI in Windows
-# Terminal. Runs the multi-drone Olfati-Saber flocking controller (vs.
-# dji-joystick.ps1 which runs the single-drone direct-stick controller).
+# Launch swarm_flocking.py, readController.py, image_stream.py, and the browser
+# GUI in Windows Terminal. Runs the multi-drone Olfati-Saber flocking controller
+# (vs. dji-joystick.ps1 which runs the single-drone direct-stick controller).
 #
-# Layout: flocking (left) | controller (right top) / swarm-gui (right bottom).
-# The flocking controller pushes telemetry to the GUI by default; swarm_gui.py
-# serves the map and (with --open) opens it in the browser automatically.
+# Layout: flocking (top left) / image-stream (bottom left) | controller (right
+# top) / swarm-gui (right bottom). The flocking controller pushes telemetry to
+# the GUI by default; swarm_gui.py serves the map and (with --open) opens it in
+# the browser automatically. image_stream.py reads the video/telemetry shared
+# memory (needs ds_wrapper, so it runs elevated from AOS server/ like flocking).
 #
 # Usage:
 #   .\dji-flocking.ps1                # default 3 drones, GUI on http://127.0.0.1:8000
@@ -72,7 +74,11 @@ if ($NoGui) {
         PowerShell -NoExit -Command "python swarm_flocking.py --drones $Drones$SlowArg$GimbalArg$HeadingArg --no-gui" `
       `; split-pane -V --size 0.25 --title "controller" `
         -d "$CtrlDir" `
-        PowerShell -NoExit -Command "& '$CondaHook' \; conda activate $EnvName \; python readController.py"
+        PowerShell -NoExit -Command "& '$CondaHook' \; conda activate $EnvName \; python readController.py" `
+      `; move-focus left `
+      `; split-pane -H --size 0.4 --title "image-stream" `
+        -d "$AosDir" `
+        PowerShell -NoExit -Command "python image_stream.py"
 }
 else {
     wt.exe --size 240,60 `
@@ -84,5 +90,9 @@ else {
         PowerShell -NoExit -Command "& '$CondaHook' \; conda activate $EnvName \; python readController.py" `
       `; split-pane -H --size 0.45 --title "swarm-gui" `
         -d "$AosDir" `
-        PowerShell -NoExit -Command "python swarm_gui.py --http-port $HttpPort --open"
+        PowerShell -NoExit -Command "python swarm_gui.py --http-port $HttpPort --open" `
+      `; move-focus left `
+      `; split-pane -H --size 0.4 --title "image-stream" `
+        -d "$AosDir" `
+        PowerShell -NoExit -Command "python image_stream.py"
 }
