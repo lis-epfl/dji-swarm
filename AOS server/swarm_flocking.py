@@ -80,8 +80,8 @@ from joystick_controller import (
     DroneController,
     SwarmController,
     _deadzone,
-    _normalize_heading_180,
     heading_hold_rate,
+    integrate_target_heading,
     MAX_PITCH_MPS,
     MAX_ROLL_MPS,
     YAW_RATE_DEG_S,
@@ -147,6 +147,27 @@ def body_to_world(v_forward, v_right, heading_deg):
     v_n = v_forward * cos_t - v_right * sin_t
     v_e = v_forward * sin_t + v_right * cos_t
     return v_n, v_e
+
+
+def swarm_mean_heading(swarm):
+    """Circular mean (deg, [-180, 180]) of the connected drones' headings, or
+    None when no drone has telemetry yet. Used as the reference the shared
+    target heading is seeded from and lead-clamped against
+    (integrate_target_heading) — with one shared target for several drones,
+    the mean nose direction is the natural 'where the swarm points now'."""
+    sum_sin = 0.0
+    sum_cos = 0.0
+    count = 0
+    for d in swarm.drones.values():
+        t = d.telemetry
+        if t and t.get('heading') is not None:
+            h = math.radians(t['heading'])
+            sum_sin += math.sin(h)
+            sum_cos += math.cos(h)
+            count += 1
+    if count == 0:
+        return None
+    return math.degrees(math.atan2(sum_sin, sum_cos))
 
 
 def d_ref_from_ax(ax, scale=10.0):
@@ -429,8 +450,9 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             # those 2), floored at START_ALT_FLOOR_M.
             fixes = [d.telemetry for d in swarm.drones.values() if d.telemetry]
             alts = [t['alt'] for t in fixes if t.get('alt') is not None]
-            if fixes:
-                target_yaw = _normalize_heading_180(fixes[0].get('heading', 0.0))
+            mh = swarm_mean_heading(swarm)
+            if mh is not None:
+                target_yaw = mh
             if alts:
                 target_alt = max(sum(alts) / len(alts), START_ALT_FLOOR_M)
             else:
@@ -481,13 +503,11 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                     # from a previous stint must not leak in.
                     heading_ctrl.reset()
                 else:
-                    # Back to manual: re-seed the shared target from a live
-                    # heading so drones don't all snap to a stale target_yaw.
-                    for d in swarm.drones.values():
-                        t = d.telemetry
-                        if t and t.get('heading') is not None:
-                            target_yaw = _normalize_heading_180(t['heading'])
-                            break
+                    # Back to manual: re-seed the shared target from the live
+                    # mean heading so drones don't snap to a stale target_yaw.
+                    mh = swarm_mean_heading(swarm)
+                    if mh is not None:
+                        target_yaw = mh
                     meta["hull_boundary"] = []   # nothing is hull-steered now
                 print(f"[heading] mode -> {mode}")
                 last_heading_mode = mode
@@ -519,10 +539,14 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         # drones smoothly servo their nose to the shared target_yaw.
         # In convex-hull heading mode the hull owns every drone's heading
         # (mirrors the Unity AttitudeAlgorithm suppressing the input yaw rate),
-        # so the stick doesn't integrate the shared target.
+        # so the stick doesn't integrate the shared target. In manual mode the
+        # integration is lead-clamped against the swarm's mean heading
+        # (anti-windup — see integrate_target_heading) so releasing the stick
+        # leaves at most MAX_TARGET_LEAD_DEG of catch-up turn.
         ff_yaw_rate = ang_z * YAW_RATE_DEG_S * speed_scale
         if not hull_mode:
-            target_yaw = _normalize_heading_180(target_yaw + ff_yaw_rate * dt)
+            target_yaw = integrate_target_heading(
+                target_yaw, ff_yaw_rate, dt, swarm_mean_heading(swarm))
         target_alt = max(MIN_ALT_M, min(MAX_ALT_M,
                                         target_alt + lin_z * VERT_RATE_MPS * speed_scale * dt))
         d_ref = d_ref_from_ax(js.angular_x, scale=olfati.scale)

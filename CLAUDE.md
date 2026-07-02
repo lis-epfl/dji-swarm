@@ -124,9 +124,13 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   now lives on the PC: `joystick_controller.heading_hold_rate(target_yaw, current_heading,
   ff_rate)` = stick feed-forward + `KP_YAW`×heading-error, clamped to `±MAX_YAW_RATE_DEG_S`.
   `joystick_controller` and `swarm_flocking` both keep integrating an absolute `target_yaw`
-  and convert it through this helper per send. `KP_YAW` is the only tuning knob (too high +
-  laggy telemetry → oscillation). If you revert the app to `ANGLE`, also send absolute
-  heading again and drop the heading-hold helper.
+  and convert it through this helper per send. `KP_YAW` is the main tuning knob (too high +
+  laggy telemetry → oscillation). Two structural guards protect the loop: the integration
+  goes through `integrate_target_heading`, which clamps the target to ±`MAX_TARGET_LEAD_DEG`
+  of the measured heading (anti-windup — without it a sustained turn banks up 40°+ of error
+  and the drone wags for seconds after stick release), and `heading_hold_rate` has a
+  ±`YAW_ERR_DEADBAND_DEG` deadband so heading noise doesn't keep the nose dithering. If you
+  revert the app to `ANGLE`, also send absolute heading again and drop the heading-hold helper.
 - **Gimbal needs VS enabled.** The app only sends gimbal commands inside the 20 Hz VS
   timer (`startVsSendLoop`). Gimbal moves do nothing unless VS is ENABLED.
 - **Multi-drone = 1-based `drone_id`** everywhere, mapping to `DroneSwarmServer` shared-memory slots.

@@ -83,11 +83,33 @@ STICK_SMOOTHING_ALPHA = 0.25
 # heading and convert it into a smooth yaw RATE: stick feed-forward turns the
 # drone while a P term servos the measured heading back onto the target. ANGLE
 # mode (absolute heading straight to the FC) was the source of the old choppy,
-# stepwise yaw. KP_YAW is the only tuning knob: too high + laggy telemetry
+# stepwise yaw. KP_YAW is the main tuning knob: too high + laggy telemetry
 # oscillates, too low feels sluggish returning to heading. The loop response
-# time-constant is ~1/KP_YAW seconds.
-KP_YAW             = 1.5     # heading error (deg) -> yaw rate (deg/s)
+# time-constant is ~1/KP_YAW seconds. Two structural guards keep the P loop
+# well-behaved regardless of KP_YAW (see integrate_target_heading and
+# heading_hold_rate): MAX_TARGET_LEAD_DEG and YAW_ERR_DEADBAND_DEG.
+# 0.8 (was 1.5): closed-loop sims with the command+telemetry transport delay
+# modelled at 0.15-0.5 s each way showed 1.5 sitting near the stability margin
+# — after a turn the drone wagged for 4-12 s (the reported behaviour), while
+# 0.8 settles in ~0.5-3 s with at most one small correction swing across the
+# whole delay range. Raise it back only if the telemetry path gets faster.
+KP_YAW             = 0.8     # heading error (deg) -> yaw rate (deg/s)
 MAX_YAW_RATE_DEG_S = 100.0   # clamp on the commanded yaw rate (deg/s)
+
+# Anti-windup on the stick-integrated target heading: the target may lead the
+# MEASURED heading by at most this many degrees (integrate_target_heading).
+# Without it a sustained turn lets the target run 40°+ ahead of the aircraft
+# (P-tracking lag = ff/KP_YAW, plus telemetry latency, plus any FC rate
+# shortfall), so on stick release the drone keeps turning to burn off that
+# debt, overshoots on stale telemetry, and wags for several seconds — and past
+# 180° of lag the wrapped error flips sign and the turn reverses outright.
+MAX_TARGET_LEAD_DEG = 25.0
+
+# Heading errors inside this band contribute no P correction (subtracted, not
+# hard-cut, so the response stays continuous). The compass heading jitters
+# ~1-2°; chasing that noise keeps the nose twitching indefinitely after every
+# turn instead of coming to a visible stop.
+YAW_ERR_DEADBAND_DEG = 1.5
 
 # Velocity scale applied by the --slow test flag when given with no value.
 # The flag multiplies all commanded motion (pitch/roll velocity, yaw rate, climb
@@ -115,14 +137,52 @@ def heading_hold_rate(target_heading, current_heading, ff_rate=0.0):
     centred FF=0 and the P term smoothly holds/returns to target_heading.
 
     current_heading may be None (no telemetry/GPS yet) → feed-forward only.
+    Errors within ±YAW_ERR_DEADBAND_DEG produce no correction (heading noise
+    would otherwise keep the nose dithering around the setpoint forever).
     Result is clamped to ±MAX_YAW_RATE_DEG_S.
     """
     if current_heading is None:
         rate = ff_rate
     else:
         err = _normalize_heading_180(target_heading - current_heading)
+        if abs(err) <= YAW_ERR_DEADBAND_DEG:
+            err = 0.0
+        elif err > 0:
+            err -= YAW_ERR_DEADBAND_DEG
+        else:
+            err += YAW_ERR_DEADBAND_DEG
         rate = ff_rate + KP_YAW * err
     return max(-MAX_YAW_RATE_DEG_S, min(MAX_YAW_RATE_DEG_S, rate))
+
+
+def integrate_target_heading(target_yaw, ff_rate, dt, current_heading):
+    """Advance the stick-integrated target heading by ff_rate*dt, with
+    anti-windup: the result is clamped to within ±MAX_TARGET_LEAD_DEG of the
+    measured heading.
+
+    Naive integration (target += rate*dt) lets the setpoint run arbitrarily
+    far ahead of the aircraft during a sustained turn. All that accumulated
+    error is still owed when the stick is centred: the drone keeps turning
+    long after release, then overshoots (its heading measurement is stale)
+    and oscillates while the debt decays. Clamping the lead makes the
+    setpoint track the aircraft, so at most MAX_TARGET_LEAD_DEG of catch-up
+    remains on release.
+
+    The clamp only acts while the stick is deflected (ff_rate != 0): windup
+    can only accumulate while integrating, and skipping the clamp at centre
+    stick preserves the hold's full authority — an external disturbance
+    (wind, a bump) never drags the setpoint along with the drone.
+
+    current_heading None (no telemetry/GPS yet) → integrate unclamped.
+    """
+    target_yaw = _normalize_heading_180(target_yaw + ff_rate * dt)
+    if ff_rate != 0.0 and current_heading is not None:
+        err = _normalize_heading_180(target_yaw - current_heading)
+        if err > MAX_TARGET_LEAD_DEG:
+            target_yaw = _normalize_heading_180(current_heading + MAX_TARGET_LEAD_DEG)
+        elif err < -MAX_TARGET_LEAD_DEG:
+            target_yaw = _normalize_heading_180(current_heading - MAX_TARGET_LEAD_DEG)
+    return target_yaw
 
 
 def parse_telemetry(raw_data):
@@ -525,8 +585,8 @@ def udp_joystick_mode(controller, receiver, speed_scale=1.0):
         # setpoint), then command a smooth yaw RATE toward it — stick feed-forward
         # leads the turn, the P term holds heading when the stick is centred.
         ff_yaw_rate = ang_z * YAW_RATE_DEG_S * speed_scale
-        target_yaw = _normalize_heading_180(target_yaw + ff_yaw_rate * dt)
         cur_heading = controller.telemetry.get('heading') if controller.telemetry else None
+        target_yaw = integrate_target_heading(target_yaw, ff_yaw_rate, dt, cur_heading)
         cmd_yaw_rate = heading_hold_rate(target_yaw, cur_heading, ff_yaw_rate)
         target_alt = max(MIN_ALT_M, min(MAX_ALT_M, target_alt + lin_z * VERT_RATE_MPS * speed_scale * dt))
 
