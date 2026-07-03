@@ -12,7 +12,17 @@
 
 @{
     # Number of drones in the swarm (creates IDs 1..N). CLI: -Drones
-    Drones = 1
+    Drones = 3
+
+    # RC/broker IP addresses in DRONE-ID ORDER (index 1 = drone 1, ...). When
+    # set, swarm_flocking.py publishes commands DIRECTLY to each RC's MQTT
+    # broker over a persistent connection (20 Hz capable). The IPs are fixed
+    # per switch port; whichever RC is plugged into a port gets that port's IP
+    # and therefore that drone ID. List at least as many IPs as Drones (only
+    # the first N are used, so keep all ports listed and just lower Drones).
+    # Empty array @() = legacy path via DroneSwarmServer (~4.5 Hz commands).
+    # CLI: -DroneIPs 192.168.100.173,192.168.100.176
+    DroneIPs = @('192.168.100.173', '192.168.100.176', '192.168.100.211')
 
     # Browser GUI (swarm_gui.py) HTTP port. CLI: -HttpPort
     HttpPort = 8000
@@ -45,7 +55,7 @@
     # INSIDE swarm_flocking.py (--image-stream). Runs off the telemetry
     # threads' existing image fetches, so it cannot slow the cmd/telem rates
     # (unlike the old standalone image_stream.py process). CLI: -ImageStream
-    ImageStream = $false
+    ImageStream = $true
 
     # --- Olfati-Saber flocking tuning (seed values; the GUI can retune live) ---
     # Velocity-matching gain, swarm_flocking.py --c-vm (default 0.0).

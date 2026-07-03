@@ -285,22 +285,39 @@ class DroneController:
         # memory. None = telemetry-only (default).
         self.frame_sink = None
 
+        # Optional MqttCommandSender (set by the launch script): when set,
+        # commands publish straight to the RC's broker over its persistent
+        # connection instead of via ds_wrapper -> DroneSwarmServer, whose
+        # per-command MQTT reconnect cycle caps sends at ~4.5 Hz. None =
+        # legacy wrapper path (default).
+        self.command_sender = None
+
         # Background threads
         self._running = False
         self._send_thread = None
         self._telem_thread = None
 
     def send_command(self, command):
-        """Send a raw command string to the drone."""
-        w.sendWayPointData(command, self.drone_id)
+        """Send a raw command string to the drone.
+
+        One-shot commands (ENABLE_VS/TAKEOFF/...) use QoS 1 on the direct
+        MQTT path: queued while disconnected, guaranteed once connected.
+        """
+        if self.command_sender is not None:
+            self.command_sender.send(self.drone_id, command, qos=1)
+        else:
+            w.sendWayPointData(command, self.drone_id)
         if self.logger:
             self.logger.log_drone_command(self.drone_id, "EVENT", cmd=command)
 
     def send_vs(self):
-        """Send the current virtual stick state."""
+        """Send the current virtual stick state (QoS 0: latest-wins stream)."""
         cmd = (f"VS:{self.pitch:.2f}:{self.roll:.2f}:{self.yaw:.2f}:"
                f"{self.throttle:.2f}:{self.gimbal_pitch:.2f}:{self.gimbal_yaw:.2f}")
-        w.sendWayPointData(cmd, self.drone_id)
+        if self.command_sender is not None:
+            self.command_sender.send(self.drone_id, cmd, qos=0)
+        else:
+            w.sendWayPointData(cmd, self.drone_id)
         if self.logger:
             self.logger.log_drone_command(
                 self.drone_id, "VS", self.pitch, self.roll, self.yaw,

@@ -26,6 +26,9 @@
 #                                     # drones face outward); -PointInwards faces the centroid.
 #                                     # Both are just seeds — switchable live from the GUI.
 #   .\dji-flocking.ps1 -ImageStream   # stream frames to the stitcher (in-process)
+#   .\dji-flocking.ps1 -DroneIPs 192.168.100.173,192.168.100.176   # direct-MQTT command
+#                                     # path to these RC brokers (order = drone id);
+#                                     # normally set via DroneIPs in flocking.config.psd1
 #   .\dji-flocking.ps1 -Config .\my-other.psd1   # use a different config file
 #
 # If PowerShell blocks the script, either run once with:
@@ -45,6 +48,7 @@ param(
     [switch]$PointInwards,
     [switch]$NoGui,
     [switch]$ImageStream,
+    [string[]]$DroneIPs,
     [string]$Config = "$PSScriptRoot\flocking.config.psd1"
 )
 
@@ -56,6 +60,7 @@ $settings = @{
     Heading = 'manual'; PointInwards = $false; NoGui = $false
     ImageStream = $false
     Cvm = 0.0; R0 = 150.0; Scale = 10.0
+    DroneIPs = @()
 }
 
 if (-not (Test-Path $Config)) {
@@ -77,6 +82,7 @@ if ($PSBoundParameters.ContainsKey('Scale'))        { $settings.Scale = $Scale }
 if ($PSBoundParameters.ContainsKey('NoGui'))        { $settings.NoGui = [bool]$NoGui }
 if ($PSBoundParameters.ContainsKey('ImageStream'))  { $settings.ImageStream = [bool]$ImageStream }
 if ($PSBoundParameters.ContainsKey('PointInwards')) { $settings.PointInwards = [bool]$PointInwards }
+if ($PSBoundParameters.ContainsKey('DroneIPs'))     { $settings.DroneIPs = $DroneIPs }
 # -ConvexHull is a convenience alias that forces convexhull heading mode.
 if ($ConvexHull)                                    { $settings.Heading = 'convexhull' }
 
@@ -91,6 +97,7 @@ $NoGui        = [bool]$settings.NoGui
 $ImageStream  = [bool]$settings.ImageStream
 $PointInwards = [bool]$settings.PointInwards
 $Heading      = ("$($settings.Heading)").ToLower()
+$DroneIPs     = @($settings.DroneIPs | Where-Object { "$_".Trim() -ne '' })
 
 # --- Validate resolved settings ----------------------------------------------
 if ($Drones -lt 1) { throw "Drones must be >= 1 (got $Drones)" }
@@ -101,10 +108,16 @@ if ($GimbalPitch -lt -90.0 -or $GimbalPitch -gt 60.0) {
 if ($Heading -ne 'manual' -and $Heading -ne 'convexhull') {
     throw "Heading must be 'manual' or 'convexhull' (got '$Heading')"
 }
+if ($DroneIPs.Count -gt 0 -and $DroneIPs.Count -lt $Drones) {
+    throw ("DroneIPs lists only $($DroneIPs.Count) address(es) but Drones is $Drones " +
+           "(order = drone id; extras beyond Drones are fine)")
+}
 
+$CmdPathDesc = if ($DroneIPs.Count -gt 0) { "direct MQTT [$($DroneIPs -join ', ')]" }
+               else { "via DroneSwarmServer (legacy, ~4.5 Hz)" }
 Write-Host ("[dji-flocking] config $Config -> drones=$Drones slow=$Slow gimbal=$GimbalPitch " +
             "heading=$Heading pointInwards=$PointInwards noGui=$NoGui imageStream=$ImageStream " +
-            "c_vm=$Cvm r0=$R0 scale=$Scale httpPort=$HttpPort")
+            "c_vm=$Cvm r0=$R0 scale=$Scale httpPort=$HttpPort cmdPath=$CmdPathDesc")
 
 # --- Build the swarm_flocking.py CLI -----------------------------------------
 # Format doubles invariantly so the decimal point survives locales that use a
@@ -130,7 +143,11 @@ if ($PointInwards)             { $HeadingArg += " --point-inwards" }
 # access and collapsed the cmd/telem rates).
 $ImageStreamArg = if ($ImageStream) { " --image-stream" } else { "" }
 
-$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg"
+# Direct MQTT command path: persistent per-drone connections to the RC brokers
+# (20 Hz capable) instead of DroneSwarmServer's per-command reconnect cycle.
+$DroneIPsArg = if ($DroneIPs.Count -gt 0) { " --drone-ips " + ($DroneIPs -join ',') } else { "" }
+
+$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg"
 
 # The readController pane sources the conda hook and activates this env
 # before launching the script. Edit if your miniconda lives elsewhere.

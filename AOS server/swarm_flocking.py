@@ -77,6 +77,7 @@ from swarm_telemetry_feed import (
 )
 from heading_convexhull import ConvexHullHeading
 from image_stream_feed import ImageStreamPublisher
+from mqtt_command_sender import MqttCommandSender
 from joystick_controller import (
     DroneController,
     SwarmController,
@@ -716,6 +717,14 @@ def main():
     ap = argparse.ArgumentParser(description="LIS_Swarm Olfati-Saber flocking controller")
     ap.add_argument("--drones", type=int, default=1,
                     help="Number of drones (creates IDs 1..N)")
+    ap.add_argument("--drone-ips", default="",
+                    help="Comma-separated RC/broker IPs ordered by drone id "
+                         "(e.g. 192.168.100.173,192.168.100.176). When set, "
+                         "commands publish DIRECTLY to each RC's MQTT broker "
+                         "over a persistent connection (20 Hz capable) instead "
+                         "of via DroneSwarmServer, whose per-command reconnect "
+                         "caps sends at ~4.5 Hz. Needs at least --drones "
+                         "addresses (extras ignored). Empty = legacy server path.")
     ap.add_argument("--port", type=int, default=5055,
                     help="UDP port for joystick (default 5055)")
     ap.add_argument("--c-vm", type=float, default=0.0,
@@ -787,6 +796,12 @@ def main():
     if not (GIMBAL_PITCH_MIN <= args.gimbal_pitch <= GIMBAL_PITCH_MAX):
         ap.error(f"--gimbal-pitch must be in "
                  f"[{GIMBAL_PITCH_MIN:.0f}, {GIMBAL_PITCH_MAX:.0f}] (DJI Mini 3 Pro)")
+    drone_ips = [ip.strip() for ip in args.drone_ips.split(",") if ip.strip()]
+    if drone_ips and len(drone_ips) < args.drones:
+        ap.error(f"--drone-ips has only {len(drone_ips)} address(es) but "
+                 f"--drones is {args.drones} (order = drone id)")
+    # Extras are fine: the config lists every switch port; only the first
+    # --drones entries are used.
 
     print("LIS_Swarm Flocking Controller (Olfati-Saber)")
     hw_decode = w.isHWDecoderEnabled()
@@ -798,6 +813,30 @@ def main():
         swarm.add_drone(did)
         print(f"  Added drone {did}")
 
+    # Direct MQTT command path: one persistent connection per RC broker.
+    # Telemetry/video still flow through DroneSwarmServer either way.
+    cmd_sender = None
+    if drone_ips:
+        cmd_sender = MqttCommandSender(
+            {did: drone_ips[did - 1] for did in swarm.drones})
+        for ctrl in swarm.drones.values():
+            ctrl.command_sender = cmd_sender
+        # Give the background network threads a moment to connect so the
+        # status print below is meaningful; auto-reconnect keeps trying
+        # regardless, so an offline RC does not block launch.
+        deadline = time.monotonic() + 3.0
+        while (time.monotonic() < deadline and
+               not all(cmd_sender.connected(did) for did in swarm.drones)):
+            time.sleep(0.1)
+        for did in sorted(swarm.drones):
+            state = ("connected" if cmd_sender.connected(did)
+                     else "NOT connected yet (auto-reconnect active)")
+            print(f"  Command path: direct MQTT -> drone {did} "
+                  f"@ {drone_ips[did - 1]} [{state}]")
+    else:
+        print("  Command path: via DroneSwarmServer (~4.5 Hz max; set "
+              "DroneIPs in flocking.config.psd1 / --drone-ips for 20 Hz)")
+
     logger = None
     if not args.no_log:
         logger = FlightLogger(base_dir=args.log_dir, meta={
@@ -807,6 +846,7 @@ def main():
             "vel_frame": args.vel_frame, "dry_run": args.dry_run,
             "slow": args.slow, "gimbal_pitch": args.gimbal_pitch,
             "image_stream": args.image_stream,
+            "drone_ips": drone_ips,
         })
         swarm.attach_logger(logger)
         print(f"  Flight logging -> {logger.session_dir} (disable with --no-log)")
@@ -814,14 +854,17 @@ def main():
     # Synchronous probe: call sendWayPointData once per drone from the main
     # thread BEFORE starting any background threads. If a slot is missing in
     # DroneSwarmServer.exe the C extension may block here without releasing
-    # the GIL, which would otherwise starve the main thread silently.
-    for did, drone in sorted(swarm.drones.items()):
-        print(f"  Probing drone {did} (sendWayPointData)... ", end="", flush=True)
-        try:
-            drone.send_vs()
-            print("OK", flush=True)
-        except Exception as e:
-            print(f"FAIL: {e}", flush=True)
+    # the GIL, which would otherwise starve the main thread silently. Only
+    # meaningful on the server send path — the direct MQTT path never touches
+    # the wrapper for commands (its connect status was printed above).
+    if cmd_sender is None:
+        for did, drone in sorted(swarm.drones.items()):
+            print(f"  Probing drone {did} (sendWayPointData)... ", end="", flush=True)
+            try:
+                drone.send_vs()
+                print("OK", flush=True)
+            except Exception as e:
+                print(f"FAIL: {e}", flush=True)
 
     # Start background threads one drone at a time, with a brief sleep so each
     # thread can do its first iteration and surface any error before we move on.
@@ -926,6 +969,10 @@ def main():
             img_stream.stop()
         receiver.stop()
         swarm.stop_all()
+        if cmd_sender is not None:
+            # After stop_all(): its final DISABLE_VS must still go out
+            # through the MQTT connections.
+            cmd_sender.stop()
         if logger is not None:
             logger.close()
         print("Stopped.")

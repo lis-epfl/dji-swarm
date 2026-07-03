@@ -28,6 +28,17 @@ joystick → Python script ──ds_wrapper.sendWayPointData()──► [shared 
    Python ◄──ds_wrapper.getImageAndTelemetryData()────────────────┘
 ```
 
+**Command-path exception:** when `DroneIPs` is configured (flocking.config.psd1 /
+`--drone-ips`), `swarm_flocking.py` skips the whole top row for commands and publishes
+them **directly** to each RC's MQTT broker over a persistent paho-mqtt connection
+(`mqtt_command_sender.py`). The server row above remains the fallback, but it reconnects
+per command (~220 ms each, ~4.5 Hz max — worse with more drones), so the direct path is
+the normal one. Video + telemetry always flow through `DroneSwarmServer.exe`: telemetry
+is **not** sent over MQTT — it rides inside each drone's RTSP session as a non-video data
+stream that the server's decode thread splits out. So the server is **required even when
+commands bypass it**; without it the controllers have no GPS/heading/altitude, not just
+no video.
+
 ## Components
 
 ### 1. `AOS server/` — PC side
@@ -36,10 +47,12 @@ joystick → Python script ──ds_wrapper.sendWayPointData()──► [shared 
   file-mapping (`dllmemfilemap`), `PostMessage`s the `DroneSwarmServer` window, and
   busy-waits on a status byte. See `DroneSwarm_Wrapper.cpp` for the exact byte layout
   (per-drone slots of `SHMEMSLOTSIZE`; drone N uses offset `(N-1)*SHMEMSLOTSIZE`).
-- **`DroneSwarmServer/`** — MFC C++ Windows app (`DroneSwarmServer.exe`). Owns the MQTT
-  client to the drones, the RTSP video ingest, and the shared-memory protocol the
-  wrapper talks to. The wrapper's `PostMessage` calls target this app's `WM_PYWRAPPER_*`
-  message handlers (`DroneSwarmServerDlg.cpp`).
+- **`DroneSwarmServer/`** — MFC C++ Windows app (`DroneSwarmServer.exe`). Owns the RTSP
+  video ingest **and the telemetry embedded in it** (per-drone decode thread in
+  `Dialog1Dlg.cpp`: non-video RTSP packets ARE the telemetry), the per-drone session
+  setup (IP entry / Connect), and the shared-memory protocol the wrapper talks to; its
+  MQTT client to the drones is now only the fallback command path. The wrapper's
+  `PostMessage` calls target this app's `WM_PYWRAPPER_*` message handlers.
 - **Python control scripts** (run against the built `ds_wrapper.*.pyd`):
   - `joystick_controller.py` — primary single-drone joystick driver (UDP joystick or `--cli`).
   - `swarm_flocking.py` — multi-drone Olfati-Saber flocking from one joystick.
@@ -72,6 +85,12 @@ joystick → Python script ──ds_wrapper.sendWayPointData()──► [shared 
     mailbox, and does the convert/resize/handshake on per-drone worker threads so it
     can never slow the cmd/telem rates. (In real-drone mode the Unity component's
     `enableImageWriting` must be off — its writer would fight this one.)
+  - `mqtt_command_sender.py` — `MqttCommandSender`, used by `swarm_flocking.py` when
+    `DroneIPs`/`--drone-ips` is set: one **persistent** paho-mqtt connection per RC broker
+    (`tcp://<rc-ip>:1883`), publishing the command strings directly (the app's Moquette
+    intercept fires on any publish, topic irrelevant). Auto-reconnects; QoS 0 for the
+    20 Hz `VS:` stream, QoS 1 for one-shots. Exists because the server's send path
+    reconnects per command (~220 ms → 1.5 Hz/drone at 3 drones). No `ds_wrapper` import.
   - `image_stream.py` — **standalone debug tool only; never run alongside a live
     controller.** It polls the wrapper from its own process, and the shared-memory
     protocol (one status byte per drone slot, no mutex) lets a second process starve a
@@ -100,7 +119,10 @@ Runs on the DJI RC (RC Pro). Package `com.lisswarm`, DJI SDK v5 (`5.3.0`), arm64
 
 ## Two protocols you will touch constantly
 
-**Command string** (Python → app, via `sendWayPointData` → MQTT payload):
+**Command string** (Python → app; MQTT payload to the RC's broker, published either
+directly by `mqtt_command_sender.py` (normal, persistent connection, QoS 0 for the `VS:`
+stream / QoS 1 for one-shots) or via `sendWayPointData` → `DroneSwarmServer` (fallback,
+~4.5 Hz — its Paho client reconnects per command)):
 ```
 VS:pitch:roll:yaw:throttle:gimbal_pitch:gimbal_yaw
 ENABLE_VS | DISABLE_VS | TAKEOFF | LAND
@@ -111,8 +133,9 @@ Parsed in `SwarmActivity.onCommandReceived`. Fields: `pitch`/`roll` = velocity m
 target heading and runs a heading-hold P controller (`joystick_controller.heading_hold_rate`)
 that emits this rate — see the [yaw gotcha](#critical-gotchas).
 
-**Telemetry string** (app → Python), appended after the image bytes in the shared-memory
-array. Colon-separated, 17 fields, produced by `DroneSwarmStreamData.setTelemetryData(...)`
+**Telemetry string** (app → Python; travels inside the drone's RTSP session as a
+non-video data stream — NOT over MQTT — then lands in shared memory appended after the
+image bytes). Colon-separated, 17 fields, produced by `DroneSwarmStreamData.setTelemetryData(...)`
 and parsed by `joystick_controller.parse_telemetry`:
 ```
 lat:lon:alt:heading:gimbal_pitch:gimbal_roll:gimbal_yaw:sat_count:
@@ -194,7 +217,7 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 | Launcher | Starts | Params → script flags |
 | --- | --- | --- |
 | `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
-| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
+| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (direct-MQTT command path; RC IPs in drone-id order, needs ≥ Drones entries, extras ignored), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
 | `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
 
 `dji-flocking.ps1`'s launch settings live in **`AOS server/flocking.config.psd1`** (a
