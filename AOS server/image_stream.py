@@ -1,16 +1,33 @@
+"""STANDALONE DEBUG TOOL — do NOT run alongside a live controller.
+
+This polls ds_wrapper.getImageAndTelemetryData from its own process. The
+wrapper's shared-memory protocol has one status byte per drone slot and no
+mutex, so a second process polling it starves a running controller's
+command/telemetry loops (they collapse to ~1 Hz). The normal path is now
+in-process streaming: swarm_flocking.py --image-stream (image_stream_feed.py),
+enabled via the ImageStream key in flocking.config.psd1.
+
+Use this script only for debugging the video path with NO controller running.
+"""
+
 import time
 import cv2
-import base64
 import ds_wrapper as w
 import threading
-from queue import Queue
 
 # Imports for image sharing to memory mapped files
-import struct
 import mmap
 import utils.imageSharingUtil as imageSharingUtil
 
+# Ceiling on the wrapper poll rate so this tool never spins the shared-memory
+# protocol flat-out.
+POLL_INTERVAL_S = 0.05
+
 print("Starting Image test...")
+print("WARNING: standalone debug tool - do not run while a controller "
+      "(joystick_controller.py / swarm_flocking.py) is flying; it contends "
+      "for the ds_wrapper protocol. Use swarm_flocking.py --image-stream "
+      "instead.")
 
 num_drones = 1
 decode = w.isHWDecoderEnabled()
@@ -44,6 +61,7 @@ def process_drone(drone_id):
     
     try:
         while True:
+            time.sleep(POLL_INTERVAL_S)
             print(f"[Drone {drone_id}] Fetching telemetry data...")
 
             # get the current telemetry data
@@ -71,11 +89,7 @@ def process_drone(drone_id):
                 Image = cv2.cvtColor(image_telemetry_data[0:3110400].reshape(1080*3//2, 1920), cv2.COLOR_YUV420p2RGB)
             elif decoding == 'hardware':
                 Image = cv2.cvtColor(image_telemetry_data[0:3110400].reshape(1080*3//2, 1920), cv2.COLOR_YUV2BGR_NV12)
-                            
-            # Convert the image to base64
-            retval, buffer = cv2.imencode('.jpg', Image)
-            imgBase64 = base64.b64encode(buffer).decode('utf-8')
-            
+
             ######################################### Image Sharing to Memory Mapped Files ############################################
 
             # Resize the image

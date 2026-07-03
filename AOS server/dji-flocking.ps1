@@ -1,12 +1,14 @@
-# Launch swarm_flocking.py, readController.py, image_stream.py, and the browser
-# GUI in Windows Terminal. Runs the multi-drone Olfati-Saber flocking controller
-# (vs. dji-joystick.ps1 which runs the single-drone direct-stick controller).
+# Launch swarm_flocking.py, readController.py, and the browser GUI in Windows
+# Terminal. Runs the multi-drone Olfati-Saber flocking controller (vs.
+# dji-joystick.ps1 which runs the single-drone direct-stick controller).
 #
-# Layout: flocking (top left) / image-stream (bottom left) | controller (right
-# top) / swarm-gui (right bottom). The flocking controller pushes telemetry to
-# the GUI by default; swarm_gui.py serves the map and (with --open) opens it in
-# the browser automatically. image_stream.py reads the video/telemetry shared
-# memory (needs ds_wrapper, so it runs elevated from AOS server/ like flocking).
+# Layout: flocking (left) | controller (right top) / swarm-gui (right bottom).
+# The flocking controller pushes telemetry to the GUI by default; swarm_gui.py
+# serves the map and (with --open) opens it in the browser automatically.
+# Image streaming to the stitcher pipeline (BlockSharedMemory) is no longer a
+# separate image_stream.py pane — it runs INSIDE swarm_flocking.py when
+# ImageStream is enabled (config key / -ImageStream -> --image-stream), so it
+# cannot contend with the controller for the ds_wrapper protocol.
 #
 # SETTINGS COME FROM flocking.config.psd1 (same folder). Edit that file to change
 # the swarm's default launch settings. Any CLI flag you pass here OVERRIDES the
@@ -23,6 +25,7 @@
 #   .\dji-flocking.ps1 -ConvexHull    # start in GLOBAL_CONVEXHULL heading mode (boundary
 #                                     # drones face outward); -PointInwards faces the centroid.
 #                                     # Both are just seeds — switchable live from the GUI.
+#   .\dji-flocking.ps1 -ImageStream   # stream frames to the stitcher (in-process)
 #   .\dji-flocking.ps1 -Config .\my-other.psd1   # use a different config file
 #
 # If PowerShell blocks the script, either run once with:
@@ -41,6 +44,7 @@ param(
     [switch]$ConvexHull,
     [switch]$PointInwards,
     [switch]$NoGui,
+    [switch]$ImageStream,
     [string]$Config = "$PSScriptRoot\flocking.config.psd1"
 )
 
@@ -50,6 +54,7 @@ param(
 $settings = @{
     Drones = 3; HttpPort = 8000; Slow = 1.0; GimbalPitch = -10.0
     Heading = 'manual'; PointInwards = $false; NoGui = $false
+    ImageStream = $false
     Cvm = 0.0; R0 = 150.0; Scale = 10.0
 }
 
@@ -70,6 +75,7 @@ if ($PSBoundParameters.ContainsKey('Cvm'))          { $settings.Cvm = $Cvm }
 if ($PSBoundParameters.ContainsKey('R0'))           { $settings.R0 = $R0 }
 if ($PSBoundParameters.ContainsKey('Scale'))        { $settings.Scale = $Scale }
 if ($PSBoundParameters.ContainsKey('NoGui'))        { $settings.NoGui = [bool]$NoGui }
+if ($PSBoundParameters.ContainsKey('ImageStream'))  { $settings.ImageStream = [bool]$ImageStream }
 if ($PSBoundParameters.ContainsKey('PointInwards')) { $settings.PointInwards = [bool]$PointInwards }
 # -ConvexHull is a convenience alias that forces convexhull heading mode.
 if ($ConvexHull)                                    { $settings.Heading = 'convexhull' }
@@ -82,6 +88,7 @@ $Cvm          = [double]$settings.Cvm
 $R0           = [double]$settings.R0
 $Scale        = [double]$settings.Scale
 $NoGui        = [bool]$settings.NoGui
+$ImageStream  = [bool]$settings.ImageStream
 $PointInwards = [bool]$settings.PointInwards
 $Heading      = ("$($settings.Heading)").ToLower()
 
@@ -96,7 +103,7 @@ if ($Heading -ne 'manual' -and $Heading -ne 'convexhull') {
 }
 
 Write-Host ("[dji-flocking] config $Config -> drones=$Drones slow=$Slow gimbal=$GimbalPitch " +
-            "heading=$Heading pointInwards=$PointInwards noGui=$NoGui " +
+            "heading=$Heading pointInwards=$PointInwards noGui=$NoGui imageStream=$ImageStream " +
             "c_vm=$Cvm r0=$R0 scale=$Scale httpPort=$HttpPort")
 
 # --- Build the swarm_flocking.py CLI -----------------------------------------
@@ -118,7 +125,12 @@ $HeadingArg = ""
 if ($Heading -eq 'convexhull') { $HeadingArg += " --heading convexhull" }
 if ($PointInwards)             { $HeadingArg += " --point-inwards" }
 
-$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$CvmArg$R0Arg$ScaleArg"
+# In-process image streaming to the stitcher pipeline (replaces the old
+# standalone image_stream.py pane, which starved the controller's ds_wrapper
+# access and collapsed the cmd/telem rates).
+$ImageStreamArg = if ($ImageStream) { " --image-stream" } else { "" }
+
+$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg"
 
 # The readController pane sources the conda hook and activates this env
 # before launching the script. Edit if your miniconda lives elsewhere.
@@ -134,11 +146,7 @@ if ($NoGui) {
         PowerShell -NoExit -Command "python swarm_flocking.py --drones $Drones$FlockArgs --no-gui" `
       `; split-pane -V --size 0.25 --title "controller" `
         -d "$CtrlDir" `
-        PowerShell -NoExit -Command "& '$CondaHook' \; conda activate $EnvName \; python readController.py" `
-      `; move-focus left `
-      `; split-pane -H --size 0.4 --title "image-stream" `
-        -d "$AosDir" `
-        PowerShell -NoExit -Command "python image_stream.py"
+        PowerShell -NoExit -Command "& '$CondaHook' \; conda activate $EnvName \; python readController.py"
 }
 else {
     wt.exe --size 240,60 `
@@ -150,9 +158,5 @@ else {
         PowerShell -NoExit -Command "& '$CondaHook' \; conda activate $EnvName \; python readController.py" `
       `; split-pane -H --size 0.45 --title "swarm-gui" `
         -d "$AosDir" `
-        PowerShell -NoExit -Command "python swarm_gui.py --http-port $HttpPort --open" `
-      `; move-focus left `
-      `; split-pane -H --size 0.4 --title "image-stream" `
-        -d "$AosDir" `
-        PowerShell -NoExit -Command "python image_stream.py"
+        PowerShell -NoExit -Command "python swarm_gui.py --http-port $HttpPort --open"
 }

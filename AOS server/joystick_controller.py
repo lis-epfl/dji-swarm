@@ -278,6 +278,13 @@ class DroneController:
         self._send_meter = _RateMeter()
         self._recv_meter = _RateMeter()
 
+        # Optional frame consumer (set by ImageStreamPublisher): called from
+        # the telemetry thread as frame_sink(data, telem) with the raw wrapper
+        # array so the image bytes it already carries aren't thrown away. The
+        # sink must copy immediately — `data` aliases the wrapper's shared
+        # memory. None = telemetry-only (default).
+        self.frame_sink = None
+
         # Background threads
         self._running = False
         self._send_thread = None
@@ -352,6 +359,14 @@ class DroneController:
             self.telemetry = t
             if self.logger:
                 self.logger.log_telemetry(self.drone_id, t)
+            sink = self.frame_sink
+            if sink is not None:
+                try:
+                    sink(data, t)
+                except Exception:
+                    # Frame publishing is non-critical; never let it break
+                    # the telemetry loop.
+                    pass
         return t
 
     def start(self, send_rate_hz=20, telemetry_rate_hz=10):

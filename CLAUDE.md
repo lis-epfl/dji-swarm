@@ -63,7 +63,21 @@ joystick → Python script ──ds_wrapper.sendWayPointData()──► [shared 
     and `swarm_flocking.py`; UDP-pushes a JSON telemetry snapshot to `swarm_gui.py` at 5 Hz
     (on by default; `--no-gui` to disable, `--gui-host/--gui-port` to redirect). Best-effort
     and fire-and-forget so it can never stall the control loop.
-  - `image_stream.py` / `image_save.py` / `image_replay.py` — video/image shared-memory pipeline + utils in `utils/imageSharingUtil.py`.
+  - `image_stream_feed.py` — `ImageStreamPublisher`, embedded by `swarm_flocking.py`
+    (`--image-stream`, seeded by the `ImageStream` config key): publishes each drone's
+    live frame (640×360 BGR + heading) into the `BlockSharedMemory` mapping read by the
+    stitcher pipeline / Unity VR sim (`PyUniSharingFast.cs`). **No `ds_wrapper` import
+    and zero extra wrapper calls** — it consumes the image bytes the telemetry threads
+    already fetch (via `DroneController.frame_sink`), copies them into a latest-wins
+    mailbox, and does the convert/resize/handshake on per-drone worker threads so it
+    can never slow the cmd/telem rates. (In real-drone mode the Unity component's
+    `enableImageWriting` must be off — its writer would fight this one.)
+  - `image_stream.py` — **standalone debug tool only; never run alongside a live
+    controller.** It polls the wrapper from its own process, and the shared-memory
+    protocol (one status byte per drone slot, no mutex) lets a second process starve a
+    running controller's cmd/telem loops down to ~1 Hz — the bug that motivated
+    `image_stream_feed.py`. `image_save.py` / `image_replay.py` + utils in
+    `utils/imageSharingUtil.py` complete the video/image shared-memory pipeline.
   - Standalone manual tests (no test framework): `receive_test.py` (read-only, safe),
     `test_telem.py`, `gimbal_test.py`, `altitude_test.py`, `altitude_iterator.py`.
 - **`*.ps1` launchers (`dji-joystick.ps1`, `dji-flocking.ps1`, `dji-gui.ps1`)** — these are
@@ -168,7 +182,7 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 | Launcher | Starts | Params → script flags |
 | --- | --- | --- |
 | `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
-| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
+| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
 | `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
 
 `dji-flocking.ps1`'s launch settings live in **`AOS server/flocking.config.psd1`** (a

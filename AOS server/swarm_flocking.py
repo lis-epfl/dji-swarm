@@ -76,6 +76,7 @@ from swarm_telemetry_feed import (
     DEFAULT_GUI_PORT,
 )
 from heading_convexhull import ConvexHullHeading
+from image_stream_feed import ImageStreamPublisher
 from joystick_controller import (
     DroneController,
     SwarmController,
@@ -757,6 +758,12 @@ def main():
                     help="Print VS commands but do not send to drones")
     ap.add_argument("--no-gui", action="store_true",
                     help="Do not push telemetry to the browser GUI (swarm_gui.py)")
+    ap.add_argument("--image-stream", action="store_true",
+                    help="Publish 640x360 frames to the BlockSharedMemory "
+                         "stitcher pipeline in-process, reusing the telemetry "
+                         "threads' image fetches (replaces running the "
+                         "standalone image_stream.py, which contends with this "
+                         "controller for the ds_wrapper protocol)")
     ap.add_argument("--gui-host", default=DEFAULT_GUI_HOST,
                     help=f"GUI telemetry UDP host (default {DEFAULT_GUI_HOST})")
     ap.add_argument("--gui-port", type=int, default=DEFAULT_GUI_PORT,
@@ -782,8 +789,9 @@ def main():
                  f"[{GIMBAL_PITCH_MIN:.0f}, {GIMBAL_PITCH_MAX:.0f}] (DJI Mini 3 Pro)")
 
     print("LIS_Swarm Flocking Controller (Olfati-Saber)")
+    hw_decode = w.isHWDecoderEnabled()
     print(f"  ds_wrapper HW Decoder: "
-          f"{'enabled' if w.isHWDecoderEnabled() == 1 else 'disabled (SW)'}")
+          f"{'enabled' if hw_decode == 1 else 'disabled (SW)'}")
 
     swarm = SwarmController()
     for did in range(1, args.drones + 1):
@@ -798,6 +806,7 @@ def main():
             "c_vm": args.c_vm, "r0": args.r0, "scale": args.scale,
             "vel_frame": args.vel_frame, "dry_run": args.dry_run,
             "slow": args.slow, "gimbal_pitch": args.gimbal_pitch,
+            "image_stream": args.image_stream,
         })
         swarm.attach_logger(logger)
         print(f"  Flight logging -> {logger.session_dir} (disable with --no-log)")
@@ -823,6 +832,16 @@ def main():
         time.sleep(0.3)
         print("done", flush=True)
     print(f"  Started: 20 Hz commands, 10 Hz telemetry")
+
+    # Optional in-process image streaming to the stitcher pipeline. Fed by the
+    # telemetry threads' existing fetches (via DroneController.frame_sink), so
+    # it adds no ds_wrapper calls and cannot slow the cmd/telem rates.
+    img_stream = None
+    if args.image_stream:
+        img_stream = ImageStreamPublisher(swarm.drones, hw_decode)
+        img_stream.start()
+        print(f"  Image stream -> BlockSharedMemory "
+              f"({args.drones} x 640x360, <=10 Hz per drone)")
 
     # angular.x is repurposed for d_ref in swarm mode, so the gimbal would
     # otherwise stay at the DroneController default (-90°). Park it at the
@@ -903,6 +922,8 @@ def main():
     finally:
         if gui_feed is not None:
             gui_feed.stop()
+        if img_stream is not None:
+            img_stream.stop()
         receiver.stop()
         swarm.stop_all()
         if logger is not None:
