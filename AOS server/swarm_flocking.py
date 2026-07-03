@@ -479,6 +479,13 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
 
         if meta is not None:
             meta["swarming"] = sw
+            # Publish the live target spacing to the GUI even while held (before
+            # the swarming gate below), so the operator can see what d_ref the
+            # joystick angular.x currently maps to *before* pressing Start. When
+            # swarming this is recomputed identically in the control block.
+            if js is not None:
+                meta["d_ref_m"] = round(
+                    d_ref_from_ax(js.angular_x, scale=olfati.scale) * olfati.scale, 2)
 
         # GUI gimbal slider: apply the shared pitch target to every drone
         # whenever it changes. set_gimbal only updates the send-loop's cached
@@ -551,12 +558,9 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 target_yaw, ff_yaw_rate, dt, swarm_mean_heading(swarm))
         target_alt = max(MIN_ALT_M, min(MAX_ALT_M,
                                         target_alt + lin_z * VERT_RATE_MPS * speed_scale * dt))
+        # d_ref (scaled units); physical spacing = d_ref * scale. Already
+        # published to the GUI as meta["d_ref_m"] every loop above (pre-gate).
         d_ref = d_ref_from_ax(js.angular_x, scale=olfati.scale)
-        # Publish the physical target spacing (metres) for the GUI. d_ref is in
-        # scaled units, so physical spacing = d_ref * scale (matches the "~Xm"
-        # the per-second status line prints).
-        if meta is not None:
-            meta["d_ref_m"] = round(d_ref * olfati.scale, 2)
 
         # World-frame group desired velocity, shared across the swarm: every
         # drone tries to move in the same compass direction regardless of its
