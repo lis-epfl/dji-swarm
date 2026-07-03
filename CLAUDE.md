@@ -155,8 +155,20 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   (VSCode/terminal running the Python scripts) must also run **elevated**, or the shared
   memory / window messaging won't connect.
 - **`ds_wrapper.*.pyd` and `DroneSwarmServer.exe` must sit in the same folder** (currently `AOS server/`).
+- **The wrapper MUST release the GIL while it busy-waits.** Every `ds_wrapper` call spins
+  on a shared-memory status byte until `DroneSwarmServer` acks: a telemetry/image fetch
+  blocks ~30 ms (the decode thread only services it on its next `av_read_frame`
+  iteration), and a `sendWayPointData` blocks for a full server-side MQTT
+  connect→publish→disconnect. `DroneSwarm_Wrapper.cpp` wraps these waits in
+  `py::gil_scoped_release` (+ `YieldProcessor()` in the spin). Removing that reintroduces
+  the starvation where the 20 Hz send thread froze every other Python thread and the
+  telemetry/image rate collapsed to ~3.5 Hz. The Python loops in
+  `joystick_controller.DroneController.start` are drift-compensated for the same reason —
+  a naive `sleep(interval)` after a ~30 ms blocking fetch can't hold 20 Hz.
 - The `joystick_controller.py` "VS_Send" thread relays at 20 Hz; the app re-sends to DJI
-  at its own 20 Hz. Stale-command handling matters — see the UDP staleness window in `udp_joystick_receiver.py`.
+  at its own 20 Hz. Telemetry/image fetches run at 20 Hz per drone (video arrives at
+  ~30 Hz, so that's comfortably under the ceiling). Stale-command handling matters — see
+  the UDP staleness window in `udp_joystick_receiver.py`.
 - **The `.ps1` launchers are the real entry points — keep them in sync.** The operator does
   not run `python …` by hand; they run `.\dji-joystick.ps1` / `.\dji-flocking.ps1` /
   `.\dji-gui.ps1` (all in `AOS server/`). Each launcher hard-codes the `python` command line

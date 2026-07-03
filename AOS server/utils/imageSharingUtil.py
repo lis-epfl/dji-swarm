@@ -2,7 +2,7 @@ import struct
 import mmap
 import time
 
-def write_memory(processedMMF, blockOffset, processedImageSize, image_data, droneId, heading, enable_debug=False):
+def write_memory(processedMMF, blockOffset, processedImageSize, image_data, droneId, heading, enable_debug=False, pace_s=0.06):
     """
     Write an image block to shared memory with Unity.
 
@@ -20,6 +20,9 @@ def write_memory(processedMMF, blockOffset, processedImageSize, image_data, dron
         droneId: Drone ID (int)
         heading: Heading angle (float)
         enable_debug: Enable debug logging (default: False)
+        pace_s: Post-write sleep giving the consumer time to read before the
+            next overwrite; caps the write rate at ~1/pace_s (default 0.06,
+            slightly longer than Unity's 0.05 s readInterval)
     """
     if enable_debug:
         print(f"[DEBUG] write_memory called: blockOffset={blockOffset}, droneId={droneId}, heading={heading:.2f}, imageSize={processedImageSize}")
@@ -80,7 +83,7 @@ def write_memory(processedMMF, blockOffset, processedImageSize, image_data, dron
                 print(f"[DEBUG] Write complete for droneId {droneId}")
             
             # Give Unity time to read before next write
-            time.sleep(0.06)  # Slightly longer than Unity's readInterval (0.05s)
+            time.sleep(pace_s)
             break
         else:
             # Flag is busy, wait a bit before retrying

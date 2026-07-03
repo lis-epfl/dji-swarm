@@ -828,10 +828,10 @@ def main():
     print(f"  Starting send + telemetry threads...")
     for did, drone in sorted(swarm.drones.items()):
         print(f"    starting drone {did}... ", end="", flush=True)
-        drone.start(send_rate_hz=20, telemetry_rate_hz=10)
+        drone.start(send_rate_hz=20, telemetry_rate_hz=20)
         time.sleep(0.3)
         print("done", flush=True)
-    print(f"  Started: 20 Hz commands, 10 Hz telemetry")
+    print(f"  Started: 20 Hz commands, 20 Hz telemetry")
 
     # Optional in-process image streaming to the stitcher pipeline. Fed by the
     # telemetry threads' existing fetches (via DroneController.frame_sink), so
@@ -841,7 +841,7 @@ def main():
         img_stream = ImageStreamPublisher(swarm.drones, hw_decode)
         img_stream.start()
         print(f"  Image stream -> BlockSharedMemory "
-              f"({args.drones} x 640x360, <=10 Hz per drone)")
+              f"({args.drones} x 640x360, <=20 Hz per drone)")
 
     # angular.x is repurposed for d_ref in swarm mode, so the gimbal would
     # otherwise stay at the DroneController default (-90°). Park it at the

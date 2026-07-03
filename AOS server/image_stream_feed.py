@@ -12,16 +12,15 @@ the flight controller's command/telemetry loops (they collapsed to ~1 Hz).
 
 Instead, this publisher is EMBEDDED in the controller (swarm_flocking.py
 --image-stream) and adds ZERO ds_wrapper calls: the controller's telemetry
-threads already fetch the full image+telemetry array at 10 Hz and discard the
+threads already fetch the full image+telemetry array at 20 Hz and discard the
 pixels. Each DroneController exposes a `frame_sink` hook; ours copies the raw
 YUV slice out of the (aliased, soon-overwritten) wrapper buffer into a
 latest-wins mailbox, and a per-drone worker thread does the heavy lifting
 (YUV->BGR convert, resize, shared-memory handshake) off the control path.
 The cv2 calls release the GIL, and imageSharingUtil.write_memory's consumer
-handshake (flag polling + 0.06 s pacing) can block for up to ~1 s, which is
-exactly why it must live on its own thread. Frame rate therefore tops out at
-the telemetry rate (10 Hz per drone); the consumer paces itself to ~16 Hz max
-anyway.
+handshake (flag polling + pacing, 0.04 s here) can block for up to ~1 s,
+which is exactly why it must live on its own thread. Frame rate therefore
+tops out at the telemetry rate (20 Hz per drone).
 
 Block layout (must match PyUniSharingFast.cs / imageSharingUtil.write_memory):
     int32 flag | int32 droneId (ZERO-based) | float32 heading | 640x360x3 BGR
@@ -120,7 +119,8 @@ class ImageStreamPublisher:
                 img = cv2.resize(img, self._size)
                 imageSharingUtil.write_memory(
                     self._mmf, (drone_id - 1) * self._block_bytes,
-                    self._image_bytes, img, drone_id - 1, heading)
+                    self._image_bytes, img, drone_id - 1, heading,
+                    pace_s=0.04)
             except Exception as e:
                 print("[image-stream {}] frame error: {}".format(drone_id, e),
                       flush=True)

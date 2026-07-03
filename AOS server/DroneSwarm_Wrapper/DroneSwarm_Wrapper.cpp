@@ -181,12 +181,19 @@ int isHWDecoderEnabled()
 
     v_uint8_t st = (v_uint8_t)lpvMem + 1 + MEMOFFSETHWD;
 
-    PostMessage((HWND)intp, WM_PYWRAPPER_ISHWDECODERENABLED, (WPARAM)nullptr, (LPARAM)nullptr);
-
-    while (status)
     {
-        if (!st[0])
-            break;
+        // Busy-wait on the server's ack: must not hold the GIL, or every other
+        // Python thread in the process freezes for the duration.
+        py::gil_scoped_release release;
+
+        PostMessage((HWND)intp, WM_PYWRAPPER_ISHWDECODERENABLED, (WPARAM)nullptr, (LPARAM)nullptr);
+
+        while (status)
+        {
+            if (!st[0])
+                break;
+            YieldProcessor();
+        }
     }
     return (int)((uint8_t*)lpvMem + MEMOFFSETHWD)[0];
 }
@@ -216,12 +223,21 @@ int sendWayPointData(const char* data, int DroneNumber)
     v_uint8_t st = (v_uint8_t)lpvMem + 17 + slot_offset;
 
     memcpy((uint8_t*)lpvMem + 18 + slot_offset, data, len);
-    ret = PostMessage((HWND)intp, WM_PYWRAPPER_WAYPOINTS, (WPARAM)nullptr, (LPARAM)DroneNumber);
 
-    while (status)
     {
-        if (!st[0])
-            break;
+        // The server only clears the status byte after the full MQTT
+        // connect/publish/disconnect to the drone (tens of ms). Spinning with
+        // the GIL held starves the telemetry/image threads.
+        py::gil_scoped_release release;
+
+        ret = PostMessage((HWND)intp, WM_PYWRAPPER_WAYPOINTS, (WPARAM)nullptr, (LPARAM)DroneNumber);
+
+        while (status)
+        {
+            if (!st[0])
+                break;
+            YieldProcessor();
+        }
     }
     return ret;
 }
@@ -239,12 +255,21 @@ py::array getImageAndTelemetryData(int DroneNumber)
 
     v_uint8_t st = (v_uint8_t)lpvMem + 1033 + slot_offset;
 
-    PostMessage((HWND)intp, WM_PYWRAPPER_IMAGEANDTELEMETRYDATA, (WPARAM)nullptr, (LPARAM)DroneNumber);
-
-    while (status)
     {
-        if (!st[0])
-            break;
+        // The decode thread only services this request on its next
+        // av_read_frame iteration (~one video-packet interval), so this blocks
+        // ~30 ms; the GIL must be dropped for the wait. Reacquired at scope
+        // end — the py::array construction below needs it.
+        py::gil_scoped_release release;
+
+        PostMessage((HWND)intp, WM_PYWRAPPER_IMAGEANDTELEMETRYDATA, (WPARAM)nullptr, (LPARAM)DroneNumber);
+
+        while (status)
+        {
+            if (!st[0])
+                break;
+            YieldProcessor();
+        }
     }
 
     memcpy(&temp, (uint8_t*)lpvMem + 1025 + slot_offset, sizeof(uint64_t));
@@ -279,12 +304,18 @@ py::array getEncodedImageData(const char* data, int DroneNumber)
 
     memcpy((uint8_t*)lpvMem + 18 + slot_offset + MEMOFFSETIMG, data, len);
 
-    PostMessage((HWND)intp, WM_PYWRAPPER_ENCODEDIMAGEDATA, (WPARAM)nullptr, (LPARAM)DroneNumber);
-
-    while (status)
     {
-        if (!st[0])
-            break;
+        // Same GIL rule as getImageAndTelemetryData: never spin with it held.
+        py::gil_scoped_release release;
+
+        PostMessage((HWND)intp, WM_PYWRAPPER_ENCODEDIMAGEDATA, (WPARAM)nullptr, (LPARAM)DroneNumber);
+
+        while (status)
+        {
+            if (!st[0])
+                break;
+            YieldProcessor();
+        }
     }
 
     memcpy(&temp, (uint8_t*)lpvMem + 9 + slot_offset + MEMOFFSETIMG, sizeof(uint64_t));

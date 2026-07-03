@@ -369,29 +369,43 @@ class DroneController:
                     pass
         return t
 
-    def start(self, send_rate_hz=20, telemetry_rate_hz=10):
-        """Start background threads for sending commands and reading telemetry."""
+    def start(self, send_rate_hz=20, telemetry_rate_hz=20):
+        """Start background threads for sending commands and reading telemetry.
+
+        Both loops use drift-compensated scheduling: each ds_wrapper call
+        blocks on a server round-trip (a telemetry fetch waits ~30 ms for the
+        next video packet), so a naive sleep(interval) after the call would
+        cap the loop well below its target rate.
+        """
         self._running = True
 
-        def _send_loop():
-            interval = 1.0 / send_rate_hz
+        def _paced_loop(interval, body, label):
+            next_t = time.monotonic() + interval
             while self._running:
                 try:
-                    self.send_vs()
-                    self._send_meter.tick()
+                    body()
                 except Exception as e:
-                    print(f"[drone {self.drone_id}] send_vs error: {e}", flush=True)
-                time.sleep(interval)
+                    print(f"[drone {self.drone_id}] {label} error: {e}", flush=True)
+                now = time.monotonic()
+                if next_t > now:
+                    time.sleep(next_t - now)
+                    next_t += interval
+                else:
+                    # Fell behind (slow wrapper call); resync instead of
+                    # bursting to catch up.
+                    next_t = now + interval
+
+        def _send_loop():
+            def body():
+                self.send_vs()
+                self._send_meter.tick()
+            _paced_loop(1.0 / send_rate_hz, body, "send_vs")
 
         def _telem_loop():
-            interval = 1.0 / telemetry_rate_hz
-            while self._running:
-                try:
-                    self.update_telemetry()
-                    self._recv_meter.tick()
-                except Exception as e:
-                    print(f"[drone {self.drone_id}] update_telemetry error: {e}", flush=True)
-                time.sleep(interval)
+            def body():
+                self.update_telemetry()
+                self._recv_meter.tick()
+            _paced_loop(1.0 / telemetry_rate_hz, body, "update_telemetry")
 
         self._send_thread = threading.Thread(target=_send_loop, daemon=True, name=f"VS_Send_{self.drone_id}")
         self._telem_thread = threading.Thread(target=_telem_loop, daemon=True, name=f"Telem_{self.drone_id}")
@@ -424,7 +438,7 @@ class SwarmController:
         for d in self.drones.values():
             d.logger = logger
 
-    def start_all(self, send_rate_hz=20, telemetry_rate_hz=10):
+    def start_all(self, send_rate_hz=20, telemetry_rate_hz=20):
         for d in self.drones.values():
             d.start(send_rate_hz, telemetry_rate_hz)
 
@@ -672,8 +686,8 @@ def main():
 
     drone = DroneController(drone_id=args.drone)
     drone.logger = logger
-    drone.start(send_rate_hz=20, telemetry_rate_hz=10)
-    print(f"Background threads started (drone {args.drone}, 20Hz commands, 10Hz telemetry)")
+    drone.start(send_rate_hz=20, telemetry_rate_hz=20)
+    print(f"Background threads started (drone {args.drone}, 20Hz commands, 20Hz telemetry)")
 
     receiver = None
     if not args.cli:
