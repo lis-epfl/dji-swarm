@@ -168,8 +168,15 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 | Launcher | Starts | Params → script flags |
 | --- | --- | --- |
 | `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
-| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | `-Drones`→`--drones`, `-Slow`→`--slow`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-HttpPort`→`swarm_gui.py --http-port` |
+| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
 | `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
+
+`dji-flocking.ps1`'s launch settings live in **`AOS server/flocking.config.psd1`** (a
+code-free PowerShell data file read with `Import-PowerShellDataFile`). Precedence is
+baked-in launcher defaults < `flocking.config.psd1` < an explicitly-passed CLI flag (resolved
+via `$PSBoundParameters`). Only the launcher reads the config — `swarm_flocking.py` itself is
+unchanged, so running `python swarm_flocking.py …` directly ignores the config. Keep the
+config keys and the launcher's arg-forwarding in sync with `swarm_flocking.py`'s flags.
 
 **If you change a script's CLI flags, defaults, filename, or how it's invoked, update the
 matching launcher in the same change** (see the [critical gotcha](#critical-gotchas)). Note

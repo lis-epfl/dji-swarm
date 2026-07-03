@@ -1,0 +1,51 @@
+# flocking.config.psd1 — default settings for .\dji-flocking.ps1
+#
+# This is a PowerShell data file (a restricted, code-free hashtable literal that
+# dji-flocking.ps1 reads with Import-PowerShellDataFile). Edit the values here to
+# change how the flocking swarm launches without touching the launcher.
+#
+# Precedence: baked-in launcher defaults  <  this file  <  a CLI flag.
+# So any flag you pass explicitly (e.g. .\dji-flocking.ps1 -Drones 2) OVERRIDES
+# the matching value below for that one run; everything you don't pass falls
+# back to this file. Comment out or delete a key to fall back to the launcher's
+# baked-in default for it.
+
+@{
+    # Number of drones in the swarm (creates IDs 1..N). CLI: -Drones
+    Drones = 3
+
+    # Browser GUI (swarm_gui.py) HTTP port. CLI: -HttpPort
+    HttpPort = 8000
+
+    # Slow test mode: uniformly scale ALL commanded velocities + the yaw/climb
+    # rates for slow, controlled tuning. 1.0 = full speed; e.g. 0.3 = 30%.
+    # CLI: -Slow
+    Slow = 1.0
+
+    # Initial gimbal pitch/tilt (deg) for every drone and the GUI slider's start
+    # position. DJI Mini 3 Pro range [-90 (down), 60 (up)]. CLI: -GimbalPitch
+    GimbalPitch = -10.0
+
+    # Heading-control mode seed (live-switchable from the GUI afterwards):
+    #   'manual'     - stick angular.z steers one shared target heading
+    #   'convexhull' - GLOBAL_CONVEXHULL: hull drones face outward, interior
+    #                  drones hold heading, stick yaw ignored
+    # CLI: -ConvexHull forces 'convexhull' for that run.
+    Heading = 'manual'
+
+    # convexhull mode only: boundary drones face the swarm centroid instead of
+    # outward. Ignored in manual mode. CLI: -PointInwards
+    PointInwards = $false
+
+    # Skip the browser-GUI map pane and pass --no-gui to the controller so it
+    # does not push telemetry. CLI: -NoGui
+    NoGui = $false
+
+    # --- Olfati-Saber flocking tuning (seed values; the GUI can retune live) ---
+    # Velocity-matching gain, swarm_flocking.py --c-vm (default 0.0).
+    Cvm = 0.0
+    # Cohesion neighbour radius r0_coh, --r0 (default 150.0).
+    R0 = 150.0
+    # Distance scale factor, --scale (default 10.0, matches the Unity sim).
+    Scale = 10.0
+}
