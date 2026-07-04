@@ -44,8 +44,8 @@ else:
     print('Invalid decoding method')
 
 # Shared memory configuration
-width = 640
-height = 360
+width = 800
+height = 450
 depth = 3
 processedImageSize = width * height * depth
 metadataSize = 12

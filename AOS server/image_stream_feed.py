@@ -1,9 +1,10 @@
 """
 LIS_Swarm image stream publisher
 ================================
-Publishes each drone's live camera frame into the "BlockSharedMemory" mapping
-consumed by the stitcher pipeline (StitcherThreading.py / the Unity VR sim's
-PyUniSharingFast.cs / ImageSharing.cs).
+Publishes each drone's live camera frame into the "DroneFeedSharedMemory"
+mapping consumed by the Unity VR sim's ImageSharing.cs, which displays the
+feeds and re-publishes the 3 body-yaw-selected views into the stitcher's
+separate 3-slot "BlockSharedMemory" (StitcherThreading.py).
 
 This replaces running image_stream.py as a separate process. That was never
 safe: the ds_wrapper shared-memory protocol busy-waits on a single status byte
@@ -22,14 +23,17 @@ handshake (flag polling + pacing, 0.04 s here) can block for up to ~1 s,
 which is exactly why it must live on its own thread. Frame rate therefore
 tops out at the telemetry rate (20 Hz per drone).
 
-Block layout (must match PyUniSharingFast.cs / imageSharingUtil.write_memory):
-    int32 flag | int32 droneId (ZERO-based) | float32 heading | 640x360x3 BGR
-    block = 12 + 691200 bytes; mapping = num_drones * block, indexed by
-    (drone_id - 1). Whoever creates the named mapping first fixes its size.
+Block layout (must match ImageSharing.cs / imageSharingUtil.write_memory):
+    int32 flag | int32 droneId (ZERO-based) | float32 heading | 800x450x3 BGR
+    block = 12 + 1080000 bytes; mapping = MAX_DRONES * block (fixed capacity so
+    the size never depends on fleet size or creation order), indexed by
+    (drone_id - 1). ImageSharing.cs marks blocks it has consumed (and blocks
+    never written) with droneId = -1 and skips them; every write here restores
+    droneId, which is how Unity detects a genuinely new frame.
 
-Real-drone mode note: the Unity sim's PyUniSharingFast component must have
-enableImageWriting DISABLED, otherwise its writer fights this one for the same
-blocks.
+Real-drone mode note: keep the Unity scene's PyUniSharingFast component with
+enableImageWriting DISABLED — in the DJI scene ImageSharing.cs is the sole
+producer of the stitcher's BlockSharedMemory.
 
 No ds_wrapper import — decode mode and frames are passed in by the controller.
 """
@@ -48,14 +52,15 @@ RAW_IMAGE_BYTES = 3110400
 RAW_ROWS = 1080 * 3 // 2   # 1620 (YUV420 planar / NV12)
 RAW_COLS = 1920
 
-BLOCK_MAP_NAME = "BlockSharedMemory"
+BLOCK_MAP_NAME = "DroneFeedSharedMemory"
 BLOCK_HEADER_BYTES = 12    # int32 flag + int32 droneId + float32 heading
+MAX_DRONES = 10            # fixed mapping capacity (must match ImageSharing.cs)
 
 
 class ImageStreamPublisher:
-    """Per-drone worker threads that push frames to BlockSharedMemory."""
+    """Per-drone worker threads that push frames to DroneFeedSharedMemory."""
 
-    def __init__(self, drones, hw_decode, width=640, height=360):
+    def __init__(self, drones, hw_decode, width=800, height=450):
         """
         Args:
             drones: {drone_id (1-based int): DroneController} — each controller
@@ -64,16 +69,25 @@ class ImageStreamPublisher:
             hw_decode: ds_wrapper.isHWDecoderEnabled() result — 1 selects the
                     NV12 (hardware) colour conversion, anything else the
                     planar YUV420 (software) one, matching image_stream.py.
-            width/height: output frame size; 640x360 is the fixed size the
-                    stitcher/Unity consumers read.
+            width/height: output frame size; 800x450 is the fixed size the
+                    Unity consumer reads (ImageSharing.cs ImageWidth/Height
+                    consts must match).
         """
         self._drones = dict(drones)
+        bad_ids = [did for did in self._drones if not 1 <= did <= MAX_DRONES]
+        if bad_ids:
+            raise ValueError(
+                "drone ids {} outside mapping capacity 1..{}".format(
+                    bad_ids, MAX_DRONES))
         self._cvt = (cv2.COLOR_YUV2BGR_NV12 if hw_decode == 1
                      else cv2.COLOR_YUV420p2RGB)
         self._size = (int(width), int(height))
         self._image_bytes = self._size[0] * self._size[1] * 3
         self._block_bytes = BLOCK_HEADER_BYTES + self._image_bytes
-        self._mmf = mmap.mmap(-1, len(self._drones) * self._block_bytes,
+        # Fixed capacity: the mapping is always MAX_DRONES blocks so its size
+        # matches what ImageSharing.cs creates regardless of fleet size or of
+        # which process creates the named mapping first.
+        self._mmf = mmap.mmap(-1, MAX_DRONES * self._block_bytes,
                               BLOCK_MAP_NAME)
         # Per-drone latest-wins mailbox: {id: (yuv_copy, heading)} + an event
         # the worker sleeps on. A slow worker just drops frames, never queues.

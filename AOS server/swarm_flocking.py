@@ -772,8 +772,9 @@ def main():
     ap.add_argument("--no-gui", action="store_true",
                     help="Do not push telemetry to the browser GUI (swarm_gui.py)")
     ap.add_argument("--image-stream", action="store_true",
-                    help="Publish 640x360 frames to the BlockSharedMemory "
-                         "stitcher pipeline in-process, reusing the telemetry "
+                    help="Publish 800x450 frames to the DroneFeedSharedMemory "
+                         "feed (Unity ImageSharing.cs -> stitcher) in-process, "
+                         "reusing the telemetry "
                          "threads' image fetches (replaces running the "
                          "standalone image_stream.py, which contends with this "
                          "controller for the ds_wrapper protocol)")
@@ -887,8 +888,8 @@ def main():
     if args.image_stream:
         img_stream = ImageStreamPublisher(swarm.drones, hw_decode)
         img_stream.start()
-        print(f"  Image stream -> BlockSharedMemory "
-              f"({args.drones} x 640x360, <=20 Hz per drone)")
+        print(f"  Image stream -> DroneFeedSharedMemory "
+              f"({args.drones} x 800x450, <=20 Hz per drone)")
 
     # angular.x is repurposed for d_ref in swarm mode, so the gimbal would
     # otherwise stay at the DroneController default (-90°). Park it at the

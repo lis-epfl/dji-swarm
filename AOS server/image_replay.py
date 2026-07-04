@@ -8,8 +8,8 @@ import utils.imageSharingUtil as imageSharingUtil
 
 # --- Configuration (Matching image_stream.py and image_save.py) ---
 num_drones = 3  
-width = 640
-height = 360
+width = 800
+height = 450
 depth = 3
 processedImageSize = width * height * depth
 metadataSize = 12

@@ -78,8 +78,8 @@ no video.
     and fire-and-forget so it can never stall the control loop.
   - `image_stream_feed.py` — `ImageStreamPublisher`, embedded by `swarm_flocking.py`
     (`--image-stream`, seeded by the `ImageStream` config key): publishes each drone's
-    live frame (640×360 BGR + heading) into the `BlockSharedMemory` mapping read by the
-    stitcher pipeline / Unity VR sim (`PyUniSharingFast.cs`). **No `ds_wrapper` import
+    live frame (800×450 BGR + heading) into the `DroneFeedSharedMemory` mapping read by
+    the Unity DJI scene (`ImageSharing.cs`, which feeds the stitcher). **No `ds_wrapper` import
     and zero extra wrapper calls** — it consumes the image bytes the telemetry threads
     already fetch (via `DroneController.frame_sink`), copies them into a latest-wins
     mailbox, and does the convert/resize/handshake on per-drone worker threads so it

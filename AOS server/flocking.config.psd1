@@ -12,7 +12,7 @@
 
 @{
     # Number of drones in the swarm (creates IDs 1..N). CLI: -Drones
-    Drones = 3
+    Drones = 4
 
     # RC/broker IP addresses in DRONE-ID ORDER (index 1 = drone 1, ...). When
     # set, swarm_flocking.py publishes commands DIRECTLY to each RC's MQTT
@@ -22,7 +22,8 @@
     # the first N are used, so keep all ports listed and just lower Drones).
     # Empty array @() = legacy path via DroneSwarmServer (~4.5 Hz commands).
     # CLI: -DroneIPs 192.168.100.173,192.168.100.176
-    DroneIPs = @('192.168.100.173', '192.168.100.176', '192.168.100.211')
+    DroneIPs = @('192.168.100.173', '192.168.100.176', '192.168.100.247', '192.168.100.211')
+    # '192.168.100.150'
 
     # Browser GUI (swarm_gui.py) HTTP port. CLI: -HttpPort
     HttpPort = 8000
@@ -30,7 +31,7 @@
     # Slow test mode: uniformly scale ALL commanded velocities + the yaw/climb
     # rates for slow, controlled tuning. 1.0 = full speed; e.g. 0.3 = 30%.
     # CLI: -Slow
-    Slow = 0.25
+    Slow = 0.2
 
     # Initial gimbal pitch/tilt (deg) for every drone and the GUI slider's start
     # position. DJI Mini 3 Pro range [-90 (down), 60 (up)]. CLI: -GimbalPitch
@@ -51,11 +52,11 @@
     # does not push telemetry. CLI: -NoGui
     NoGui = $false
 
-    # Publish 640x360 frames to the BlockSharedMemory stitcher pipeline from
+    # Publish 800x450 frames to the DroneFeedSharedMemory feed pipeline from
     # INSIDE swarm_flocking.py (--image-stream). Runs off the telemetry
     # threads' existing image fetches, so it cannot slow the cmd/telem rates
     # (unlike the old standalone image_stream.py process). CLI: -ImageStream
-    ImageStream = $true
+    ImageStream = $false
 
     # --- Olfati-Saber flocking tuning (seed values; the GUI can retune live) ---
     # Velocity-matching gain, swarm_flocking.py --c-vm (default 0.0).
