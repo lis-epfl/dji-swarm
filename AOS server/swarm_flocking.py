@@ -26,8 +26,8 @@ Joystick → swarm mapping:
                  heading comes from the swarm's convex hull instead (boundary
                  drones face outward, interior drones hold heading — port of
                  the Unity sim's GLOBAL_CONVEXHULL, see heading_convexhull.py)
-    angular.x  → d_ref, linear map [0.6, 1.4] → scaled [0.3, 0.8]
-                 (≈ physical [3, 8] m at ScaleFactor = 10)
+    angular.x  → d_ref, linear map [0.6, 1.4] → scaled [0.5, 1.0]
+                 (≈ physical [5, 10] m at ScaleFactor = 10)
     switch s1  → toggle ENABLE_VS / DISABLE_VS for all drones (rising edge)
     switch s2  → LAND all drones (rising edge)
     PC key 'q' → zero velocities, hold current position, disable VS, exit
@@ -38,7 +38,7 @@ Note on ScaleFactor: the OlfatiSaber math uses the Unity-sim tuning verbatim
 (ScaleFactor = 10.0). To keep the cohesion potential in the same regime, the
 `d_ref` we feed it is in *scaled* units (Unity's convention) — physical
 spacing ≈ d_ref * ScaleFactor. The joystick angular.x is mapped to scaled
-d_ref ∈ [0.3, 0.8], which corresponds to a physical d_ref ∈ [3, 8] m at
+d_ref ∈ [0.5, 1.0], which corresponds to a physical d_ref ∈ [5, 10] m at
 ScaleFactor = 10.
 
 Usage:
@@ -173,14 +173,14 @@ def swarm_mean_heading(swarm):
 
 
 def d_ref_from_ax(ax, scale=10.0):
-    """Map angular.x ∈ [0.6, 1.4] → scaled d_ref ∈ [0.3, 0.8].
+    """Map angular.x ∈ [0.6, 1.4] → scaled d_ref ∈ [0.5, 1.0].
 
     The OlfatiSaber math operates in scaled units (ScaleFactor=10 by default),
     so the returned d_ref is divided by `scale` to match. Physical spacing
     sits roughly at `d_ref * scale + 2.58 m` (the cohesion well's equilibrium
     is offset slightly from d_ref by the (a-b)/2 term in ψ')."""
     ax = max(0.6, min(1.4, ax))
-    physical = 3.0 + (ax - 0.6) * 6.25     # 3 .. 8 m physical
+    physical = 5.0 + (ax - 0.6) * 6.25     # 5 .. 10 m physical
     return physical / scale
 
 
