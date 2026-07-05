@@ -54,7 +54,9 @@ import argparse
 import json
 import math
 import msvcrt    # Windows console: non-blocking keyboard read for the 'q' stop
+import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -125,6 +127,18 @@ MIN_SAT_COUNT = 6
 # average is below this (e.g. drones still on the ground) we climb to this instead.
 START_ALT_FLOOR_M = 3.0
 
+# Minimum-separation failsafe: if any pair of drones with a fix gets closer
+# than this (physical metres), swarming auto-STOPs (zero velocities, brake,
+# disable VS — the same path as the GUI Stop button). Added after the
+# 2026-07-04 flight where a command/telemetry channel permutation drove pair
+# 2-3 to 2.9 m with nothing reacting. <= 0 disables the check.
+DEFAULT_MIN_SEPARATION_M = 3.0
+
+# Identity probe: how long to wait for one slot's marker to come back through
+# an RC broker. The server's fallback send path takes ~220 ms per command
+# (connect -> publish -> disconnect); 2 s absorbs a slow broker comfortably.
+IDCHECK_TIMEOUT_S = 2.0
+
 
 # ---------- helpers ----------
 
@@ -191,6 +205,219 @@ def clamp_mag2(vx, vy, max_mag):
         s = max_mag / mag
         return vx * s, vy * s
     return vx, vy
+
+
+# ---------- command<->telemetry identity check ----------
+
+def _probe_slot_receivers(slots, sender, timeout=IDCHECK_TIMEOUT_S):
+    """Send one inert IDCHECK marker through each DroneSwarmServer slot and
+    record which of `sender`'s per-IP connections it arrives on.
+
+    The server publishes ``sendWayPointData(marker, slot)`` to slot's RC broker
+    on topic MQTTWayPoints; `sender`'s connections subscribe to that topic for
+    the duration. Markers are inert on the app side (SwarmActivity ignores
+    unknown command strings).
+
+    Returns ({slot: receiver_id}, problems): receiver_id is the sender key
+    (drone id / provisional index) whose broker got the marker; `problems` is
+    a list of human-readable strings (empty = every slot resolved uniquely).
+    """
+    nonce = "{}_{}".format(os.getpid(), int(time.time()))
+    received = {}
+    problems = []
+
+    offline = sender.probe_start()
+    try:
+        if offline:
+            problems.append("no MQTT connection to broker(s) {} ({}) — "
+                            "invisible to the probe".format(
+                                offline,
+                                ", ".join(sender.ip_of(d) or "?" for d in offline)))
+        for slot in slots:
+            marker = "IDCHECK:{}:{}".format(slot, nonce)
+            try:
+                # Blocks ~220 ms for the server's connect->publish->disconnect;
+                # returns fast if the slot isn't connected in the server.
+                w.sendWayPointData(marker, slot)
+            except Exception as e:
+                problems.append("server slot {}: sendWayPointData failed ({})"
+                                .format(slot, e))
+                continue
+            hits = sender.probe_wait_for(marker, timeout=timeout)
+            if len(hits) == 1:
+                received[slot] = hits[0]
+            elif not hits:
+                problems.append("server slot {}: marker never arrived on any "
+                                "known broker (slot not connected in the "
+                                "server, or its RC is not among the command "
+                                "IPs)".format(slot))
+            else:
+                problems.append("server slot {}: marker arrived on multiple "
+                                "command connections {} — duplicate IP?"
+                                .format(slot, hits))
+    finally:
+        sender.probe_stop()
+
+    # Each receiver may answer for at most one slot (bijection).
+    seen = list(received.values())
+    for rid in sorted(set(seen)):
+        if seen.count(rid) > 1:
+            problems.append("RC {} answered for {} server slots"
+                            .format(sender.ip_of(rid), seen.count(rid)))
+    return received, problems
+
+
+def discover_rc_ips(rtsp_port=8554):
+    """Enumerate connected RC IPs by inspecting DroneSwarmServer's established
+    RTSP control connections (TCP to <rc-ip>:8554 — rtsp_transport=udp only
+    moves the media; the control socket stays open per connected slot).
+
+    Uses Get-NetTCPConnection so the output is structured and locale-proof
+    (netstat's state column is localized). Returns a sorted list of unique
+    IPv4 addresses; empty when the server isn't running or no slot is
+    connected.
+    """
+    # try/catch keeps the exit code 0 when there are simply no matches —
+    # PowerShell 5.1 reports a failed (empty) Get-NetTCPConnection as exit 1
+    # even under -ErrorAction SilentlyContinue.
+    ps = ("$c = @(try {{ Get-NetTCPConnection -RemotePort {} "
+          "-State Established -ErrorAction Stop }} catch {{}}); "
+          "$c | Where-Object {{ "
+          "(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue)"
+          ".ProcessName -eq 'DroneSwarmServer' }} | "
+          "Select-Object -ExpandProperty RemoteAddress").format(rtsp_port)
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", ps],
+            universal_newlines=True, stderr=subprocess.DEVNULL, timeout=15)
+    except Exception as e:
+        print("[discover] Get-NetTCPConnection failed: {}".format(e))
+        return []
+    ips = []
+    for line in out.splitlines():
+        ip = line.strip()
+        # IPv4 only; the RCs live on the drone LAN.
+        if ip and ip.count(".") == 3 and ip not in ips:
+            ips.append(ip)
+    return sorted(ips)
+
+
+def auto_bind_command_channels(swarm, candidate_ips, timeout=IDCHECK_TIMEOUT_S):
+    """Auto-discovery mode: bind each DroneSwarmServer slot to its RC broker.
+
+    Given the set of RC IPs the server is streaming from (discover_rc_ips),
+    connect a provisional MqttCommandSender to all of them and use the marker
+    probe to learn which IP each server slot reaches. Drone ID = server slot,
+    so commands and telemetry share ONE identity source (the server) and a
+    mismatch is impossible by construction — the same property the original
+    AOS broker had.
+
+    Returns a connected MqttCommandSender keyed by drone id (= slot), or None
+    when the binding could not be resolved (caller falls back to the legacy
+    server command path).
+    """
+    ids = sorted(swarm.drones)
+    if len(candidate_ips) < len(ids):
+        print("[autobind] only {} RC(s) discovered for --drones {} — connect "
+              "the missing slot(s) in DroneSwarmServer or lower the drone "
+              "count".format(len(candidate_ips), len(ids)))
+
+    provisional = MqttCommandSender(
+        {i + 1: ip for i, ip in enumerate(candidate_ips)})
+    try:
+        deadline = time.monotonic() + 3.0
+        while (time.monotonic() < deadline and
+               not all(provisional.connected(i + 1)
+                       for i in range(len(candidate_ips)))):
+            time.sleep(0.1)
+        slot_map, problems = _probe_slot_receivers(ids, provisional, timeout)
+    finally:
+        provisional.stop()   # ip_of() stays valid after stop
+
+    if problems or len(slot_map) != len(ids):
+        print("[autobind] FAILED — could not bind every server slot to an RC "
+              "broker:")
+        for p in problems:
+            print("[autobind]   - " + p)
+        return None
+
+    final = MqttCommandSender(
+        {slot: provisional.ip_of(rid) for slot, rid in slot_map.items()})
+    deadline = time.monotonic() + 3.0
+    while (time.monotonic() < deadline and
+           not all(final.connected(d) for d in ids)):
+        time.sleep(0.1)
+    for slot in ids:
+        state = ("connected" if final.connected(slot)
+                 else "NOT connected yet (auto-reconnect active)")
+        print("[autobind] drone {} (= server slot {}) -> RC {} [{}]"
+              .format(slot, slot, final.ip_of(slot), state))
+    return final
+
+
+def run_identity_check(swarm, cmd_sender, logger=None, timeout=IDCHECK_TIMEOUT_S):
+    """Verify — and auto-fix — the command↔telemetry channel mapping.
+
+    Two independent things call a drone "N": commands go to the N-th IP in
+    DroneIPs (the canonical identity: RC/switch-port), while telemetry comes
+    from DroneSwarmServer slot N (whatever IP the operator/scanner put in that
+    slot). On 2026-07-04 those disagreed by a 3-cycle and the heading-hold and
+    flocking loops closed across the wrong aircraft.
+
+    The server's slot→IP table isn't queryable, but its fallback send path IS
+    an oracle for it: ``sendWayPointData(marker, slot)`` publishes the marker
+    to slot's RC broker on topic MQTTWayPoints. Our persistent per-IP command
+    connections subscribe to that topic and watch which IP each slot's marker
+    lands on. The markers are inert on the app side (SwarmActivity ignores
+    unknown command strings — just a verbose log line on the RC), so this is
+    safe to run mid-session, drones hovering or flying.
+
+    On a resolvable mismatch the fix is applied by pointing each
+    DroneController's ``telemetry_slot`` at the slot whose RC its commands go
+    to; telemetry, logs, the GUI map and the flocking loop all follow.
+
+    Returns True when the mapping is verified (after any remap), False when it
+    could not be resolved (offline RC, slot not connected in the server, an IP
+    outside DroneIPs, or two slots on one RC).
+    """
+    ids = sorted(swarm.drones)
+    slot_to_cmd, problems = _probe_slot_receivers(ids, cmd_sender, timeout)
+
+    if problems or len(slot_to_cmd) != len(ids):
+        print("[idcheck] FAILED — command<->telemetry identity could not be "
+              "verified:")
+        for p in problems:
+            print("[idcheck]   - " + p)
+        if logger:
+            logger.log_drone_command(0, "EVENT",
+                                     cmd="IDCHECK_FAIL:" + "; ".join(problems))
+        return False
+
+    # slot_to_cmd[s] = drone id whose RC the server reaches from slot s, i.e.
+    # slot s's telemetry belongs to that drone.
+    remapped = []
+    for slot, did in sorted(slot_to_cmd.items()):
+        ctrl = swarm.drones[did]
+        if ctrl.telemetry_slot != slot:
+            ctrl.telemetry_slot = slot
+            remapped.append((did, slot))
+
+    if remapped:
+        print("[idcheck] MISMATCH DETECTED and corrected — server slot order "
+              "differs from DroneIPs:")
+        for did, slot in remapped:
+            print("[idcheck]   drone {} (RC {}) telemetry <- server slot {}"
+                  .format(did, cmd_sender.ip_of(did), slot))
+        if logger:
+            for did, slot in remapped:
+                logger.log_drone_command(
+                    did, "EVENT", cmd="IDCHECK_REMAP:telemetry_slot={}".format(slot))
+    else:
+        print("[idcheck] OK — server slots match DroneIPs order "
+              f"({len(slot_to_cmd)} drones verified)")
+        if logger:
+            logger.log_drone_command(0, "EVENT", cmd="IDCHECK_OK")
+    return True
 
 
 # ---------- Olfati-Saber math (mirrors OlfatiSaber.cs) ----------
@@ -368,10 +595,16 @@ def command_listener(swarming, meta, host, port):
 # ---------- main loop ----------
 
 def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
-        logger=None, speed_scale=1.0, meta=None, heading_ctrl=None):
+        logger=None, speed_scale=1.0, meta=None, heading_ctrl=None,
+        cmd_sender=None, identity_check=True,
+        min_separation=DEFAULT_MIN_SEPARATION_M):
     print("\n--- Olfati-Saber Swarm Mode ---")
     print(f"  Drones: {sorted(swarm.drones.keys())}")
     print(f"  c_vm={olfati.c_vm}  r0_coh={olfati.r0_coh}  scale={olfati.scale}")
+    if min_separation > 0:
+        print(f"  Min-separation failsafe: auto-STOP below {min_separation:.1f} m")
+    else:
+        print(f"  Min-separation failsafe: DISABLED")
     mode0 = (meta or {}).get("heading_mode", "manual")
     print(f"  Heading: {mode0} — switchable live from the GUI. "
           f"manual = stick yaw steers a shared target heading; "
@@ -446,7 +679,20 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         # thread, and so the GUI can Start/Stop even with no joystick connected.
         sw = swarming.is_set()
         if sw and not last_swarming:
-            # Rising: arm VS. Seed heading from a drone with a fix, and the shared
+            # Rising: re-verify the command<->telemetry identity before arming.
+            # The probe is inert (marker strings the app ignores) and takes
+            # ~0.5 s per drone, so it runs on every Start — an RC re-plugged or
+            # a server slot reconnected mid-session gets caught here.
+            if identity_check and cmd_sender is not None and not dry_run:
+                print("[swarm] verifying command<->telemetry identity...")
+                if not run_identity_check(swarm, cmd_sender, logger):
+                    print("[swarm] REFUSING TO ARM: fix the DroneIPs order / "
+                          "server slots (or relaunch with --no-identity-check "
+                          "to override) and press Start again")
+                    swarming.clear()
+                    time.sleep(0.02)
+                    continue
+            # Arm VS. Seed heading from a drone with a fix, and the shared
             # altitude target from the AVERAGE altitude of all drones we actually
             # have telemetry from (e.g. with --drones 3 but only 2 connected, just
             # those 2), floored at START_ALT_FLOOR_M.
@@ -496,6 +742,11 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             if gp is not None and gp != last_gimbal:
                 for d in swarm.drones.values():
                     d.set_gimbal(gp, 0.0)
+                if logger and last_gimbal is not None:
+                    # Skip the startup application (== --gimbal-pitch, already
+                    # in session.json); log only live GUI retargets.
+                    logger.log_drone_command(
+                        0, "EVENT", cmd=f"GIMBAL_PITCH:{gp:+.1f}")
                 last_gimbal = gp
 
         # Heading mode + point-inwards are runtime-switchable from the GUI
@@ -519,11 +770,15 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                         target_yaw = mh
                     meta["hull_boundary"] = []   # nothing is hull-steered now
                 print(f"[heading] mode -> {mode}")
+                if logger:
+                    logger.log_drone_command(0, "EVENT", cmd=f"HEADING_MODE:{mode}")
                 last_heading_mode = mode
             pin = bool(meta.get("point_inwards"))
             if pin != heading_ctrl.point_inwards:
                 heading_ctrl.set_point_inwards(pin)
                 print(f"[heading] point inwards -> {pin}")
+                if logger:
+                    logger.log_drone_command(0, "EVENT", cmd=f"POINT_INWARDS:{pin}")
 
         # Held → do nothing: VS is off and the drones hover autonomously until
         # Start is pressed again.
@@ -611,6 +866,33 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 vel_ne = (t['vx'], t['vy'])
             snap[did] = (pos_ne, vel_ne, t['heading'])
 
+        # Minimum-separation failsafe: any pair too close -> auto-STOP swarming
+        # (the falling edge above then zeroes velocities, brakes, and disables
+        # VS, exactly like the GUI Stop button; the drones GPS-hover apart).
+        if min_separation > 0 and len(snap) >= 2:
+            ids_ = sorted(snap.keys())
+            tripped = None
+            for i, a in enumerate(ids_):
+                for b in ids_[i+1:]:
+                    (na, ea), _, _ = snap[a]
+                    (nb, eb), _, _ = snap[b]
+                    d = math.hypot(na - nb, ea - eb)
+                    if d < min_separation:
+                        tripped = (a, b, d)
+                        break
+                if tripped:
+                    break
+            if tripped:
+                a, b, d = tripped
+                print(f"[FAILSAFE] drones {a}-{b} at {d:.2f} m "
+                      f"(< {min_separation:.1f} m) — STOPPING swarm")
+                if logger:
+                    logger.log_drone_command(
+                        0, "EVENT", cmd=f"MINSEP_STOP:{a}-{b}:{d:.2f}m")
+                swarming.clear()
+                time.sleep(0.02)
+                continue
+
         # Convex-hull heading control: derive a per-drone target heading from
         # the swarm's hull (boundary drones face outward along their vertex
         # bisector; interior drones get None → hold current heading).
@@ -639,13 +921,18 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                         cmd_yaw_rate = 0.0
                         drone_target = hdg  # for the dry-run printout
                     else:
-                        cmd_yaw_rate = heading_hold_rate(drone_target, hdg)
+                        # p_scale: --slow must slow the hull servo too, not
+                        # just translation (historically it didn't, so a 20%
+                        # flight still yawed at the full clamp).
+                        cmd_yaw_rate = heading_hold_rate(
+                            drone_target, hdg, p_scale=speed_scale)
                 else:
                     # Smooth yaw RATE for this drone: shared stick feed-forward
                     # plus a P term holding its own heading on the shared
-                    # target_yaw.
+                    # target_yaw (both scaled by --slow via speed_scale).
                     drone_target = target_yaw
-                    cmd_yaw_rate = heading_hold_rate(target_yaw, hdg, ff_yaw_rate)
+                    cmd_yaw_rate = heading_hold_rate(
+                        target_yaw, hdg, ff_yaw_rate, p_scale=speed_scale)
                 neighbours = [(snap[j][0], snap[j][1]) for j in snap if j != did]
                 # Swarm correction (consensus + cohesion) in world frame
                 v_n_corr, v_e_corr = olfati.compute(
@@ -722,13 +1009,18 @@ def main():
     ap.add_argument("--drones", type=int, default=1,
                     help="Number of drones (creates IDs 1..N)")
     ap.add_argument("--drone-ips", default="",
-                    help="Comma-separated RC/broker IPs ordered by drone id "
-                         "(e.g. 192.168.100.173,192.168.100.176). When set, "
-                         "commands publish DIRECTLY to each RC's MQTT broker "
-                         "over a persistent connection (20 Hz capable) instead "
-                         "of via DroneSwarmServer, whose per-command reconnect "
-                         "caps sends at ~4.5 Hz. Needs at least --drones "
-                         "addresses (extras ignored). Empty = legacy server path.")
+                    help="Command-path selector. A comma-separated RC/broker "
+                         "IP list ordered by drone id (e.g. "
+                         "192.168.100.173,192.168.100.176) pins drone ids to "
+                         "those RCs and publishes commands DIRECTLY to each "
+                         "RC's MQTT broker (20 Hz capable; needs at least "
+                         "--drones addresses, extras ignored). Empty or "
+                         "'auto' (default) AUTO-DISCOVERS the RC IPs from "
+                         "DroneSwarmServer's established RTSP connections and "
+                         "binds them to server slots with the marker probe — "
+                         "drone id = server slot, no config needed. 'server' "
+                         "forces the legacy path via DroneSwarmServer "
+                         "(~4.5 Hz per-command reconnect).")
     ap.add_argument("--port", type=int, default=5055,
                     help="UDP port for joystick (default 5055)")
     ap.add_argument("--c-vm", type=float, default=0.0,
@@ -767,6 +1059,19 @@ def main():
                          f"slow, controlled tuning. Bare --slow uses {SLOW_DEFAULT_SCALE}; "
                          "pass a value (e.g. --slow 0.5) to override. Default 1.0 "
                          "(full speed).")
+    ap.add_argument("--no-identity-check", action="store_true",
+                    help="Skip the command<->telemetry identity probe run at "
+                         "startup and on every swarming Start. The probe sends "
+                         "an inert marker through DroneSwarmServer's per-slot "
+                         "MQTT path and watches which DroneIPs broker it lands "
+                         "on, catching a server-slot/DroneIPs order mismatch "
+                         "(cross-wired control loops) before arming. Only "
+                         "meaningful on the direct-MQTT path.")
+    ap.add_argument("--min-separation", type=float,
+                    default=DEFAULT_MIN_SEPARATION_M, metavar="M",
+                    help="Failsafe: auto-STOP swarming when any drone pair "
+                         f"gets closer than this many metres (default "
+                         f"{DEFAULT_MIN_SEPARATION_M:.1f}; 0 disables)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print VS commands but do not send to drones")
     ap.add_argument("--no-gui", action="store_true",
@@ -798,15 +1103,29 @@ def main():
         ap.error("--drones must be >= 1")
     if args.slow <= 0:
         ap.error("--slow SCALE must be > 0")
+    if args.min_separation < 0:
+        ap.error("--min-separation must be >= 0 (0 disables the failsafe)")
     if not (GIMBAL_PITCH_MIN <= args.gimbal_pitch <= GIMBAL_PITCH_MAX):
         ap.error(f"--gimbal-pitch must be in "
                  f"[{GIMBAL_PITCH_MIN:.0f}, {GIMBAL_PITCH_MAX:.0f}] (DJI Mini 3 Pro)")
-    drone_ips = [ip.strip() for ip in args.drone_ips.split(",") if ip.strip()]
-    if drone_ips and len(drone_ips) < args.drones:
-        ap.error(f"--drone-ips has only {len(drone_ips)} address(es) but "
-                 f"--drones is {args.drones} (order = drone id)")
-    # Extras are fine: the config lists every switch port; only the first
-    # --drones entries are used.
+    # Command-path mode: 'explicit' (IP list = canonical drone ids),
+    # 'auto' (discover IPs from the server, drone id = slot), or
+    # 'server' (legacy path through DroneSwarmServer).
+    raw_ips = args.drone_ips.strip()
+    if raw_ips.lower() in ("", "auto"):
+        cmd_mode = "auto"
+        drone_ips = []
+    elif raw_ips.lower() in ("server", "legacy"):
+        cmd_mode = "server"
+        drone_ips = []
+    else:
+        cmd_mode = "explicit"
+        drone_ips = [ip.strip() for ip in raw_ips.split(",") if ip.strip()]
+        if len(drone_ips) < args.drones:
+            ap.error(f"--drone-ips has only {len(drone_ips)} address(es) but "
+                     f"--drones is {args.drones} (order = drone id)")
+        # Extras are fine: the config lists every switch port; only the first
+        # --drones entries are used.
 
     print("LIS_Swarm Flocking Controller (Olfati-Saber)")
     hw_decode = w.isHWDecoderEnabled()
@@ -821,11 +1140,9 @@ def main():
     # Direct MQTT command path: one persistent connection per RC broker.
     # Telemetry/video still flow through DroneSwarmServer either way.
     cmd_sender = None
-    if drone_ips:
+    if cmd_mode == "explicit":
         cmd_sender = MqttCommandSender(
             {did: drone_ips[did - 1] for did in swarm.drones})
-        for ctrl in swarm.drones.values():
-            ctrl.command_sender = cmd_sender
         # Give the background network threads a moment to connect so the
         # status print below is meaningful; auto-reconnect keeps trying
         # regardless, so an offline RC does not block launch.
@@ -838,9 +1155,32 @@ def main():
                      else "NOT connected yet (auto-reconnect active)")
             print(f"  Command path: direct MQTT -> drone {did} "
                   f"@ {drone_ips[did - 1]} [{state}]")
+    elif cmd_mode == "auto":
+        # Discover the connected RCs from the server itself (its per-slot RTSP
+        # control connections), then bind slots to brokers with the marker
+        # probe. Drone id = server slot: one identity source, no possible
+        # command<->telemetry mismatch.
+        print("  Discovering RC IPs from DroneSwarmServer's RTSP connections...")
+        candidates = discover_rc_ips()
+        if not candidates:
+            print("  WARNING: no RC streams found — is DroneSwarmServer "
+                  "running with drones connected? Falling back to the server "
+                  "command path (~4.5 Hz).")
+        else:
+            print(f"  Found {len(candidates)} RC(s): {', '.join(candidates)}")
+            cmd_sender = auto_bind_command_channels(swarm, candidates)
+            if cmd_sender is None:
+                print("  WARNING: slot->RC binding failed — falling back to "
+                      "the server command path (~4.5 Hz). Fix the brokers/"
+                      "server slots and relaunch for 20 Hz commands.")
     else:
-        print("  Command path: via DroneSwarmServer (~4.5 Hz max; set "
-              "DroneIPs in flocking.config.psd1 / --drone-ips for 20 Hz)")
+        print("  Command path: via DroneSwarmServer (~4.5 Hz max; forced "
+              "by --drone-ips server)")
+    if cmd_sender is not None:
+        for ctrl in swarm.drones.values():
+            ctrl.command_sender = cmd_sender
+    resolved_ips = ([cmd_sender.ip_of(did) for did in sorted(swarm.drones)]
+                    if cmd_sender is not None else [])
 
     logger = None
     if not args.no_log:
@@ -851,7 +1191,10 @@ def main():
             "vel_frame": args.vel_frame, "dry_run": args.dry_run,
             "slow": args.slow, "gimbal_pitch": args.gimbal_pitch,
             "image_stream": args.image_stream,
-            "drone_ips": drone_ips,
+            "cmd_mode": cmd_mode,
+            "drone_ips": resolved_ips,
+            "identity_check": not args.no_identity_check,
+            "min_separation": args.min_separation,
         })
         swarm.attach_logger(logger)
         print(f"  Flight logging -> {logger.session_dir} (disable with --no-log)")
@@ -880,6 +1223,32 @@ def main():
         time.sleep(0.3)
         print("done", flush=True)
     print(f"  Started: 20 Hz commands, 20 Hz telemetry")
+
+    # Startup identity probe: verify DroneIPs order matches the server's slot
+    # order before anything flies (re-verified on every swarming Start in
+    # run()). Failure here is a warning only — arming is where it hard-blocks,
+    # so the operator can still fix server slots and press Start. In auto
+    # mode the startup probe is redundant (the slot->RC binding above IS the
+    # probe), but the Start-edge re-check still runs — it catches an RC or
+    # server slot swapped mid-session.
+    identity_check = (not args.no_identity_check) and not args.dry_run
+    if cmd_sender is not None:
+        if not identity_check:
+            print("  Identity check DISABLED — trusting the command<->"
+                  "telemetry mapping as-is")
+        elif cmd_mode == "auto":
+            print("  Identity bound by discovery (drone id = server slot); "
+                  "re-verified on every swarming Start")
+        else:
+            print("  Verifying command<->telemetry identity (inert MQTT "
+                  "marker probe)...")
+            if not run_identity_check(swarm, cmd_sender, logger):
+                print("  WARNING: identity unverified — swarming Start will "
+                      "re-probe and refuse to arm until it passes "
+                      "(--no-identity-check to override)")
+    else:
+        print("  Identity check n/a: server command path uses one identity "
+              "(slot) for commands and telemetry by construction")
 
     # Optional in-process image streaming to the stitcher pipeline. Fed by the
     # telemetry threads' existing fetches (via DroneController.frame_sink), so
@@ -964,7 +1333,9 @@ def main():
     try:
         run(swarm, receiver, olfati, swarming,
             dry_run=args.dry_run, vel_frame=args.vel_frame, logger=logger,
-            speed_scale=args.slow, meta=swarm_meta, heading_ctrl=heading_ctrl)
+            speed_scale=args.slow, meta=swarm_meta, heading_ctrl=heading_ctrl,
+            cmd_sender=cmd_sender, identity_check=identity_check,
+            min_separation=args.min_separation)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:

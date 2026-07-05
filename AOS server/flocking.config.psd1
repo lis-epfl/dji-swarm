@@ -12,17 +12,26 @@
 
 @{
     # Number of drones in the swarm (creates IDs 1..N). CLI: -Drones
-    Drones = 4
+    Drones = 1
 
     # RC/broker IP addresses in DRONE-ID ORDER (index 1 = drone 1, ...). When
-    # set, swarm_flocking.py publishes commands DIRECTLY to each RC's MQTT
+    # listed, swarm_flocking.py publishes commands DIRECTLY to each RC's MQTT
     # broker over a persistent connection (20 Hz capable). The IPs are fixed
     # per switch port; whichever RC is plugged into a port gets that port's IP
-    # and therefore that drone ID. List at least as many IPs as Drones (only
-    # the first N are used, so keep all ports listed and just lower Drones).
-    # Empty array @() = legacy path via DroneSwarmServer (~4.5 Hz commands).
-    # CLI: -DroneIPs 192.168.100.173,192.168.100.176
-    DroneIPs = @('192.168.100.173', '192.168.100.176', '192.168.100.247', '192.168.100.211')
+    # and therefore that drone ID — stable numbering across sessions, verified
+    # against the server's slot order by the identity probe (see IdentityCheck).
+    # List at least as many IPs as Drones (only the first N are used, so keep
+    # all ports listed and just lower Drones).
+    #
+    # Empty array @() = AUTO-DISCOVER: the controller reads the connected RC
+    # IPs off the running DroneSwarmServer (its per-slot RTSP connections) and
+    # binds them to slots with the marker probe. Zero maintenance and immune
+    # to ordering mistakes by construction, but drone numbering then follows
+    # the server's slot order for that session instead of the switch ports.
+    # @('server') = force the legacy command path via DroneSwarmServer (~4.5 Hz).
+    # CLI: -DroneIPs 192.168.100.173,192.168.100.176  /  -DroneIPs server
+    # DroneIPs = @('192.168.100.173', '192.168.100.176', '192.168.100.247', '192.168.100.211')
+    DroneIPs = @()
     # '192.168.100.150'
 
     # Browser GUI (swarm_gui.py) HTTP port. CLI: -HttpPort
@@ -47,6 +56,17 @@
     # convexhull mode only: boundary drones face the swarm centroid instead of
     # outward. Ignored in manual mode. CLI: -PointInwards
     PointInwards = $false
+
+    # Verify at startup and on every swarming Start that the DroneIPs order
+    # matches DroneSwarmServer's slot order (an inert MQTT marker probe;
+    # mismatch = cross-wired control loops, auto-corrected when resolvable).
+    # $false skips it and trusts the order. CLI: -NoIdentityCheck disables for
+    # one run.
+    IdentityCheck = $true
+
+    # Minimum-separation failsafe (physical metres): swarming auto-STOPs if
+    # any drone pair gets closer than this. 0 disables. CLI: -MinSeparation
+    MinSeparation = 3.0
 
     # Skip the browser-GUI map pane and pass --no-gui to the controller so it
     # does not push telemetry. CLI: -NoGui

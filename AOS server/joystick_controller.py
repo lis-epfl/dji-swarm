@@ -94,7 +94,14 @@ STICK_SMOOTHING_ALPHA = 0.25
 # 0.8 settles in ~0.5-3 s with at most one small correction swing across the
 # whole delay range. Raise it back only if the telemetry path gets faster.
 KP_YAW             = 0.8     # heading error (deg) -> yaw rate (deg/s)
-MAX_YAW_RATE_DEG_S = 100.0   # clamp on the commanded yaw rate (deg/s)
+# Clamp on the commanded yaw rate. 40 (was 100): fresh telemetry arrives at
+# only ~5 Hz (the 20 Hz fetch loop mostly re-reads the same sample), so at
+# 100 °/s the aircraft turns 20°+ per heading update — the P loop is flying
+# blind between samples. 40 °/s keeps it to <=8°/update. The 100 °/s clamp is
+# also what made the 2026-07-04 cross-wired flight so violent: with the loop
+# closed on the wrong aircraft the error never shrank and every mis-mapped
+# drone spun at the full clamp.
+MAX_YAW_RATE_DEG_S = 40.0    # clamp on the commanded yaw rate (deg/s)
 
 # Anti-windup on the stick-integrated target heading: the target may lead the
 # MEASURED heading by at most this many degrees (integrate_target_heading).
@@ -127,7 +134,7 @@ def _normalize_heading_180(h):
     return ((h + 180.0) % 360.0) - 180.0
 
 
-def heading_hold_rate(target_heading, current_heading, ff_rate=0.0):
+def heading_hold_rate(target_heading, current_heading, ff_rate=0.0, p_scale=1.0):
     """Yaw RATE (deg/s) that drives current_heading toward target_heading.
 
     The DJI VS yaw channel is angular-velocity mode, so instead of sending an
@@ -135,6 +142,12 @@ def heading_hold_rate(target_heading, current_heading, ff_rate=0.0):
     proportional correction on the wrapped heading error. During a sustained
     turn the error settles small (the FF carries the turn); when the stick is
     centred FF=0 and the P term smoothly holds/returns to target_heading.
+
+    ``p_scale`` multiplies the P correction (callers pass the --slow
+    speed_scale). Historically --slow only scaled the feed-forward, so a
+    "20% speed" test flight still commanded full-clamp yaw the moment the
+    heading error grew — pass the same scale here so slow flights are slow
+    in yaw too.
 
     current_heading may be None (no telemetry/GPS yet) → feed-forward only.
     Errors within ±YAW_ERR_DEADBAND_DEG produce no correction (heading noise
@@ -151,7 +164,7 @@ def heading_hold_rate(target_heading, current_heading, ff_rate=0.0):
             err -= YAW_ERR_DEADBAND_DEG
         else:
             err += YAW_ERR_DEADBAND_DEG
-        rate = ff_rate + KP_YAW * err
+        rate = ff_rate + KP_YAW * err * p_scale
     return max(-MAX_YAW_RATE_DEG_S, min(MAX_YAW_RATE_DEG_S, rate))
 
 
@@ -255,9 +268,21 @@ class DroneController:
     def __init__(self, drone_id=1):
         """
         Args:
-            drone_id: Drone number (1-based, matching DroneSwarmServer slots)
+            drone_id: Drone number (1-based). On the direct-MQTT path this is
+                the drone's canonical identity: index into the DroneIPs list
+                (= RC/switch-port). On the legacy server path it is also the
+                DroneSwarmServer slot.
         """
         self.drone_id = drone_id
+
+        # DroneSwarmServer slot this drone's telemetry/video is fetched from.
+        # Defaults to drone_id (slots entered in DroneIPs order). The identity
+        # check (swarm_flocking.run_identity_check) rewrites it when the
+        # server's slot order turns out not to match DroneIPs, so telemetry,
+        # logs, the GUI and the flocking loop all keep referring to the same
+        # physical aircraft the commands go to. Plain int, safe to reassign
+        # while the telemetry thread runs.
+        self.telemetry_slot = drone_id
 
         # Current joystick state
         self.pitch = 0.0       # forward/back velocity m/s (-15 to 15)
@@ -366,7 +391,7 @@ class DroneController:
         Image: data[0:3110400] (YUV 1920x1080)
         Telemetry: data[3110408:] (colon-separated string)
         """
-        return w.getImageAndTelemetryData(self.drone_id)
+        return w.getImageAndTelemetryData(self.telemetry_slot)
 
     def update_telemetry(self):
         """Fetch and parse the latest telemetry."""
@@ -633,7 +658,8 @@ def udp_joystick_mode(controller, receiver, speed_scale=1.0):
         ff_yaw_rate = ang_z * YAW_RATE_DEG_S * speed_scale
         cur_heading = controller.telemetry.get('heading') if controller.telemetry else None
         target_yaw = integrate_target_heading(target_yaw, ff_yaw_rate, dt, cur_heading)
-        cmd_yaw_rate = heading_hold_rate(target_yaw, cur_heading, ff_yaw_rate)
+        cmd_yaw_rate = heading_hold_rate(target_yaw, cur_heading, ff_yaw_rate,
+                                         p_scale=speed_scale)
         target_alt = max(MIN_ALT_M, min(MAX_ALT_M, target_alt + lin_z * VERT_RATE_MPS * speed_scale * dt))
 
         # Gimbal pitch from angular.x (centered 1.0, swing ±0.4 → [0.6, 1.4])

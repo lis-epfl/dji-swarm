@@ -28,12 +28,18 @@ joystick → Python script ──ds_wrapper.sendWayPointData()──► [shared 
    Python ◄──ds_wrapper.getImageAndTelemetryData()────────────────┘
 ```
 
-**Command-path exception:** when `DroneIPs` is configured (flocking.config.psd1 /
-`--drone-ips`), `swarm_flocking.py` skips the whole top row for commands and publishes
-them **directly** to each RC's MQTT broker over a persistent paho-mqtt connection
-(`mqtt_command_sender.py`). The server row above remains the fallback, but it reconnects
-per command (~220 ms each, ~4.5 Hz max — worse with more drones), so the direct path is
-the normal one. Video + telemetry always flow through `DroneSwarmServer.exe`: telemetry
+**Command-path exception:** `swarm_flocking.py` normally skips the whole top row for
+commands and publishes them **directly** to each RC's MQTT broker over a persistent
+paho-mqtt connection (`mqtt_command_sender.py`). Three modes via `DroneIPs`
+(flocking.config.psd1) / `--drone-ips`: an **explicit IP list** pins drone ids to switch
+ports (stable numbering, verified/remapped by the identity probe); **empty/`auto`**
+(default) auto-discovers the RC IPs from the running server's per-slot RTSP control
+connections (`discover_rc_ips`, `Get-NetTCPConnection` to :8554) and binds them to slots
+with the marker probe (`auto_bind_command_channels`) — drone id = server slot, one
+identity source, mismatch impossible; **`server`** forces the legacy path through
+DroneSwarmServer, which reconnects per command (~220 ms each, ~4.5 Hz max — worse with
+more drones). Auto mode falls back to the server path with a loud warning when discovery
+or binding fails. Video + telemetry always flow through `DroneSwarmServer.exe`: telemetry
 is **not** sent over MQTT — it rides inside each drone's RTSP session as a non-video data
 stream that the server's decode thread splits out. So the server is **required even when
 commands bypass it**; without it the controllers have no GPS/heading/altitude, not just
@@ -91,6 +97,10 @@ no video.
     intercept fires on any publish, topic irrelevant). Auto-reconnects; QoS 0 for the
     20 Hz `VS:` stream, QoS 1 for one-shots. Exists because the server's send path
     reconnects per command (~220 ms → 1.5 Hz/drone at 3 drones). No `ds_wrapper` import.
+    Also hosts the identity-probe capture (`probe_start`/`probe_wait_for`/`probe_stop`):
+    the per-IP connections subscribe to `MQTTWayPoints` so
+    `swarm_flocking.run_identity_check` can see which RC each server slot's marker lands
+    on (see the [drone-identity gotcha](#critical-gotchas)).
   - `image_stream.py` — **standalone debug tool only; never run alongside a live
     controller.** It polls the wrapper from its own process, and the shared-memory
     protocol (one status byte per drone slot, no mutex) lets a second process starve a
@@ -166,11 +176,40 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   goes through `integrate_target_heading`, which clamps the target to ±`MAX_TARGET_LEAD_DEG`
   of the measured heading (anti-windup — without it a sustained turn banks up 40°+ of error
   and the drone wags for seconds after stick release), and `heading_hold_rate` has a
-  ±`YAW_ERR_DEADBAND_DEG` deadband so heading noise doesn't keep the nose dithering. If you
+  ±`YAW_ERR_DEADBAND_DEG` deadband so heading noise doesn't keep the nose dithering.
+  `--slow` scales the P term too (callers pass `p_scale=speed_scale`) — before 2026-07 it
+  only scaled the stick feed-forward, so "slow" flights still yawed at the full clamp; keep
+  the scale threaded through if you add a caller. If you
   revert the app to `ANGLE`, also send absolute heading again and drop the heading-hold helper.
 - **Gimbal needs VS enabled.** The app only sends gimbal commands inside the 20 Hz VS
   timer (`startVsSendLoop`). Gimbal moves do nothing unless VS is ENABLED.
 - **Multi-drone = 1-based `drone_id`** everywhere, mapping to `DroneSwarmServer` shared-memory slots.
+- **Drone identity has TWO independent sources when `DroneIPs` is an explicit list — keep
+  them reconciled.** Commands go to the N-th `DroneIPs` entry (RC/switch-port = the
+  canonical drone N); telemetry comes from DroneSwarmServer slot N (whatever IP was
+  entered/scanned into that slot). If the orders disagree, every control loop closes
+  across the WRONG aircraft — the 2026-07-04 4-drone flight had a 3-cycle mismatch and
+  three drones spun at the yaw-rate clamp while pair spacing collapsed to 2.9 m.
+  `swarm_flocking.py` probes this at startup and on every swarming Start
+  (`run_identity_check`: an inert `IDCHECK:` marker is sent through the server's per-slot
+  MQTT path while the per-IP command connections subscribe to `MQTTWayPoints` and watch
+  where it lands), auto-remaps by pointing `DroneController.telemetry_slot` at the right
+  server slot (GUI/logs/flocking all follow), and refuses to arm when unresolvable
+  (`--no-identity-check` / `IdentityCheck` config key to override). **Auto-discovery mode
+  (empty `DroneIPs`, the script default) sidesteps the dual source entirely**: RC IPs are
+  read off the running server and bound to slots by the same probe, so drone id = server
+  slot and a mismatch cannot exist (numbering then follows the server's slot order for
+  that session, not the switch ports). The legacy `server` path has a single identity by
+  construction. The old AOS broker was immune for the same reason — it used the slot for
+  both directions.
+- **Fresh telemetry is only ~5 Hz per drone** even though the fetch loop runs at 20 Hz —
+  ~75% of fetches return the same sample (app-side update rate; not yet investigated).
+  Budget control gains accordingly: at the current 40 °/s yaw-rate clamp a drone turns up
+  to 8° between fresh heading samples. Don't raise `MAX_YAW_RATE_DEG_S`/`KP_YAW` without
+  checking this rate first.
+- **Min-separation failsafe:** `swarm_flocking.py` auto-STOPs swarming (zero velocities →
+  brake → DISABLE_VS, same as GUI Stop) when any pair with a GPS fix gets closer than
+  `--min-separation` (default 3 m, `MinSeparation` config key, 0 disables).
 - **Python must be 3.7.** The wrapper is built as `ds_wrapper.cp37-win_amd64.pyd`; a
   different Python won't load it. Run scripts from `AOS server/` so the `.pyd` and
   `python37.dll` resolve.
@@ -217,7 +256,7 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 | Launcher | Starts | Params → script flags |
 | --- | --- | --- |
 | `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
-| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (direct-MQTT command path; RC IPs in drone-id order, needs ≥ Drones entries, extras ignored), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
+| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
 | `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
 
 `dji-flocking.ps1`'s launch settings live in **`AOS server/flocking.config.psd1`** (a
