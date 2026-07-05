@@ -67,6 +67,7 @@
   .card .pill { margin-left: auto; font-size: 11px; padding: 1px 8px; border-radius: 10px;
                 font-weight: 600; }
   .pill.hull { background: rgba(63,192,255,.18); color: #3fc0ff; }
+  .pill.fenced { background: rgba(248,81,73,.25); color: var(--bad); }
   .pill.fix  { background: rgba(63,185,80,.18);  color: var(--ok); }
   .pill.weak { background: rgba(210,153,34,.18);  color: var(--warn); }
   .pill.nofix{ background: rgba(248,81,73,.18);   color: var(--bad); }
@@ -86,6 +87,17 @@
     box-shadow: 0 2px 8px rgba(0,0,0,.4); display: inline-flex; align-items: center; gap: 6px;
   }
   #controls button:not(.swarm-btn):hover { border-color: #3d4856; }
+
+  /* Shape-drawing buttons: .armed = the drawing mode is active. */
+  #controls button.armed { border-color: #3fc0ff; background: rgba(63,192,255,.22);
+                           color: #9fd8ff; }
+  .leaflet-container.drawing { cursor: crosshair !important; }
+  .obstacle-popup button {
+    background: #21262d; border: 1px solid var(--bad); color: var(--bad);
+    border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer;
+    margin-top: 4px;
+  }
+  .obstacle-popup button:hover { background: rgba(248,81,73,.15); }
 
   /* Heading mode selector (manual / convex hull) + point-inwards toggle. */
   #controls #heading-ctl { cursor: default; }
@@ -132,6 +144,12 @@
 
   #banner .chip.swarm-on  { background: rgba(63,185,80,.18);  color: #7ee787; border-color: rgba(63,185,80,.45); }
   #banner .chip.swarm-off { background: rgba(139,148,158,.16); color: var(--muted); }
+  #banner .chip.fence-warn { background: rgba(248,81,73,.18); color: #ff938c; border-color: rgba(248,81,73,.45); }
+
+  /* Red ✕ overlaid on a geofence-breached (VS-disabled) drone's marker. */
+  .drone-x { position: absolute; top: 0; left: 0; width: 40px; height: 40px;
+             display: grid; place-items: center; font-size: 22px; font-weight: 800;
+             color: var(--bad); text-shadow: 0 1px 3px #000; pointer-events: none; }
 
   /* ---- drone marker ---- */
   .drone-div { background: none; border: none; }
@@ -161,6 +179,7 @@
     <span class="chip" id="dref-chip" style="display:none"></span>
     <span class="chip" id="heading-chip" style="display:none"></span>
     <span class="chip" id="swarm-chip" style="display:none"></span>
+    <span class="chip" id="fence-chip" style="display:none"></span>
   </div>
 
   <div id="panel">
@@ -193,6 +212,14 @@
       Gimbal <input type="range" id="gimbal-slider" min="-90" max="60" step="1" value="-10" />
       <span id="gimbal-val">-10&deg;</span>
     </label>
+    <button id="btn-add-obstacle"
+            title="Draw a rectangular virtual obstacle: click and drag on the map (Esc cancels)">&#9635; Add obstacle</button>
+    <button id="btn-clear-obstacles" title="Delete all obstacles">Clear obstacles</button>
+    <button id="btn-add-fence"
+            title="Draw the geofence: click the polygon vertices on the map, then double-click or press Finish (Esc cancels). Drones crossing outside get VS disabled and leave the flock until Stop/Start.">&#11040; Add geofence</button>
+    <button id="btn-finish-fence" style="display:none"
+            title="Close the geofence polygon with the vertices placed so far">Finish fence</button>
+    <button id="btn-clear-fence" title="Remove the geofence">Clear fence</button>
     <button id="btn-recenter" title="Fit the map to all drones">Recenter on swarm</button>
     <button id="btn-epfl" title="Jump back to EPFL Lausanne">EPFL</button>
     <label><input type="checkbox" id="chk-follow" /> Follow swarm</label>
@@ -237,6 +264,9 @@ const labels = L.tileLayer(
 L.control.layers(null, { 'Place & road labels': labels }, { collapsed: true }).addTo(map);
 
 const linesLayer = L.layerGroup().addTo(map);
+// Obstacles + geofence as echoed back from the controller (meta.obstacles /
+// meta.geofence) — rebuilt each render outside the shapesPendingUntil window.
+const shapesLayer = L.layerGroup().addTo(map);
 const markers = {};   // id -> L.marker
 
 // ---- helpers ----
@@ -256,9 +286,9 @@ function hasValidCoords(t) {
            && Math.abs(t.lat) <= 90 && Math.abs(t.lon) <= 180;
 }
 
-function droneIcon(id, heading, color, weak) {
+function droneIcon(id, heading, color, weak, fenced) {
   const h = Number.isFinite(heading) ? heading : 0;
-  const op = weak ? 0.55 : 1.0;
+  const op = fenced ? 0.45 : (weak ? 0.55 : 1.0);
   return L.divIcon({
     className: 'drone-div',
     iconSize: [40, 52],
@@ -272,6 +302,7 @@ function droneIcon(id, heading, color, weak) {
                      stroke="#06121e" stroke-width="1.6" stroke-linejoin="round"/>
           </svg>
         </div>
+        ${fenced ? '<div class="drone-x">&#10006;</div>' : ''}
         <div class="drone-id" style="color:${color}">${id}</div>
       </div>`
   });
@@ -291,7 +322,7 @@ function hzCell(v, target) {
 }
 
 // ---- status cards ----
-function renderCard(id, rec, status, onHull) {
+function renderCard(id, rec, status, onHull, fenced) {
   const t = rec.telem || {};
   const age = rec.age;
   const color = colorFor(id);
@@ -311,8 +342,9 @@ function renderCard(id, rec, status, onHull) {
     <div class="hdr">
       <span class="badge" style="background:${color}">${id}</span>
       <span class="name">Drone ${id}</span>
-      ${onHull ? '<span class="pill hull" style="margin-left:auto" title="On the swarm\'s convex hull — hull heading control is steering this drone">HULL</span>' : ''}
-      <span class="pill ${pill[0]}" ${onHull ? 'style="margin-left:0"' : ''}>${pill[1]}</span>
+      ${fenced ? '<span class="pill fenced" style="margin-left:auto" title="Crossed outside the geofence — VS disabled, out of the flock; Stop then Start swarming to re-admit">FENCED OUT</span>' : ''}
+      ${onHull ? `<span class="pill hull" ${fenced ? '' : 'style="margin-left:auto"'} title="On the swarm\'s convex hull — hull heading control is steering this drone">HULL</span>` : ''}
+      <span class="pill ${pill[0]}" ${(onHull || fenced) ? 'style="margin-left:0"' : ''}>${pill[1]}</span>
     </div>
     <div class="grid">
       <span class="k">Alt</span>     <span class="v">${fmt(t.alt, 1, ' m')}</span>
@@ -338,7 +370,7 @@ function fmtNum(v) {
 // Show the STATIC swarm-algorithm parameters (published in meta.olfati by
 // swarm_flocking.py) plus the live d_ref, so the operator can see the exact
 // tuning being used to compute each drone's command.
-function renderParams(o, dref) {
+function renderParams(o, dref, op) {
   const box = document.getElementById('params');
   const grid = document.getElementById('params-grid');
   if (!o) { box.style.display = 'none'; return; }
@@ -354,6 +386,11 @@ function renderParams(o, dref) {
     ['ψ offset c', fmtNum(o.c), false],
     ['Bump δ', fmtNum(o.delta), false],
   ];
+  if (op) {
+    rows.push(['Obstacle cutoff d_obs', fmtNum(op.d_obs_m) + ' m', false],
+              ['Obstacle radius r0_obs', fmtNum(op.r0_obs_m) + ' m', false],
+              ['Obstacle gain c_obs', fmtNum(op.c_obs), false]);
+  }
   grid.innerHTML = rows.map(([k, v, dyn]) =>
     `<span class="pk">${k}</span><span class="pv${dyn ? ' dyn' : ''}">${v}</span>`).join('');
 }
@@ -391,7 +428,8 @@ function render(data) {
   const drefTol = dref !== null ? Math.max(1.0, 0.2 * dref) : null;
 
   // ----- Olfati-Saber parameters actually used for the command -----
-  renderParams(data.meta && data.meta.olfati, dref);
+  renderParams(data.meta && data.meta.olfati, dref,
+               data.meta && data.meta.obstacle_params);
 
   // ----- heading mode + point-inwards -----
   // Reflect the controller's live setting (meta.heading_mode/point_inwards)
@@ -416,6 +454,42 @@ function render(data) {
   // Boundary drones (hull vertices) currently being steered by the hull.
   const hullSet = new Set(hullMode && Array.isArray(meta.hull_boundary)
                           ? meta.hull_boundary.map(String) : []);
+
+  // ----- geofence-breached drones (VS disabled, out of the flock) -----
+  const fencedSet = new Set(Array.isArray(meta.removed) ? meta.removed.map(String) : []);
+  const fenceChip = document.getElementById('fence-chip');
+  if (fencedSet.size > 0) {
+    fenceChip.style.display = '';
+    fenceChip.className = 'chip fence-warn';
+    fenceChip.textContent = `${fencedSet.size} fenced out — Stop/Start to re-admit`;
+  } else {
+    fenceChip.style.display = 'none';
+  }
+
+  // ----- obstacles + geofence -----
+  // Served by the GUI server's own store (data.shapes — seeded from
+  // shapes.json, so they show with no controller running; synced from a live
+  // controller's echo otherwise). Redraw is skipped during the short window
+  // after a local edit so the 200 ms poll doesn't wipe an in-flight shape
+  // (same pattern as headingPendingUntil above).
+  const shapeSrc = data.shapes || meta;
+  if (Date.now() > shapesPendingUntil) {
+    shapesLayer.clearLayers();
+    if (tempRect && drawMode !== 'obstacle') { map.removeLayer(tempRect); tempRect = null; }
+    for (const ob of (Array.isArray(shapeSrc.obstacles) ? shapeSrc.obstacles : [])) {
+      const r = L.rectangle([[ob.lat_min, ob.lon_min], [ob.lat_max, ob.lon_max]],
+        { color: '#3fc0ff', weight: 2, fillColor: '#3fc0ff', fillOpacity: 0.18 });
+      r.bindPopup(
+        `<div class="obstacle-popup"><b>Obstacle ${ob.id}</b><br>` +
+        `<button onclick="deleteObstacle(${Number(ob.id)})">Delete</button></div>`);
+      shapesLayer.addLayer(r);
+    }
+    if (Array.isArray(shapeSrc.geofence) && shapeSrc.geofence.length >= 3) {
+      shapesLayer.addLayer(L.polygon(shapeSrc.geofence,
+        { color: '#f85149', weight: 4, dashArray: '8 5',
+          fillColor: '#f85149', fillOpacity: 0.04 }));
+    }
+  }
 
   // ----- gimbal slider seeding -----
   // Reflect the controller's live gimbal pitch until the operator drags the
@@ -472,7 +546,7 @@ function render(data) {
     if (age <= DRONE_STALE_S && hasValidCoords(t)) {
       placed.push({ id, lat: t.lat, lon: t.lon });
       const weak = status === 'weak';
-      const icon = droneIcon(id, t.heading, colorFor(id), weak);
+      const icon = droneIcon(id, t.heading, colorFor(id), weak, fencedSet.has(id));
       if (markers[id]) {
         markers[id].setLatLng([t.lat, t.lon]).setIcon(icon);
       } else {
@@ -485,7 +559,8 @@ function render(data) {
     }
 
     // Status card for everything the controller still knows about.
-    if (age <= DRONE_STALE_S) cards.appendChild(renderCard(id, rec, status, hullSet.has(id)));
+    if (age <= DRONE_STALE_S) cards.appendChild(
+      renderCard(id, rec, status, hullSet.has(id), fencedSet.has(id)));
   }
 
   document.getElementById('drone-count').textContent =
@@ -588,6 +663,126 @@ document.getElementById('btn-recenter').addEventListener('click', () => {
 document.getElementById('btn-epfl').addEventListener('click', () => {
   map.setView(EPFL, DEFAULT_ZOOM);
 });
+
+// ---- obstacle / geofence drawing ----
+// One mode at a time: 'obstacle' = click-drag a rectangle, 'fence' = click
+// polygon vertices then double-click / Finish. Map panning (and double-click
+// zoom in fence mode) is disabled while drawing; Escape cancels. Confirmed
+// shapes come back from the controller via meta.obstacles / meta.geofence and
+// are drawn in render() — the temp layers here are just live feedback.
+const btnAddObstacle    = document.getElementById('btn-add-obstacle');
+const btnClearObstacles = document.getElementById('btn-clear-obstacles');
+const btnAddFence       = document.getElementById('btn-add-fence');
+const btnFinishFence    = document.getElementById('btn-finish-fence');
+const btnClearFence     = document.getElementById('btn-clear-fence');
+
+let drawMode = null;          // null | 'obstacle' | 'fence'
+let dragStart = null, tempRect = null;
+let fenceVerts = [], tempFence = null, tempFenceDots = [];
+let shapesPendingUntil = 0;   // debounce for render()'s shape redraw
+
+function setShapesPending() { shapesPendingUntil = Date.now() + 1500; }
+
+function enterMode(mode) {
+  exitMode();
+  drawMode = mode;
+  map.dragging.disable();
+  if (mode === 'fence') map.doubleClickZoom.disable();
+  map.getContainer().classList.add('drawing');
+  (mode === 'obstacle' ? btnAddObstacle : btnAddFence).classList.add('armed');
+  if (mode === 'fence') btnFinishFence.style.display = '';
+}
+
+// keepRect: a just-submitted obstacle keeps its temp rectangle on screen
+// until the controller echoes it back (render() removes it then).
+function exitMode(keepRect) {
+  drawMode = null;
+  map.dragging.enable();
+  map.doubleClickZoom.enable();
+  map.getContainer().classList.remove('drawing');
+  btnAddObstacle.classList.remove('armed');
+  btnAddFence.classList.remove('armed');
+  btnFinishFence.style.display = 'none';
+  dragStart = null;
+  if (!keepRect && tempRect) { map.removeLayer(tempRect); tempRect = null; }
+  if (tempFence) { map.removeLayer(tempFence); tempFence = null; }
+  tempFenceDots.forEach(d => map.removeLayer(d));
+  tempFenceDots = [];
+  fenceVerts = [];
+}
+
+btnAddObstacle.addEventListener('click', () =>
+  drawMode === 'obstacle' ? exitMode() : enterMode('obstacle'));
+btnAddFence.addEventListener('click', () =>
+  drawMode === 'fence' ? exitMode() : enterMode('fence'));
+btnClearObstacles.addEventListener('click', () =>
+  postCommand({ action: 'clear_obstacles' }));
+btnClearFence.addEventListener('click', () =>
+  postCommand({ action: 'clear_geofence' }));
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && drawMode) exitMode();
+});
+
+// Obstacle: click-drag a rectangle (panning is off in this mode).
+map.on('mousedown', (e) => {
+  if (drawMode !== 'obstacle') return;
+  dragStart = e.latlng;
+  if (tempRect) map.removeLayer(tempRect);
+  tempRect = L.rectangle(L.latLngBounds(dragStart, dragStart),
+    { color: '#3fc0ff', weight: 2, dashArray: '4 3', fillOpacity: 0.12 }).addTo(map);
+});
+map.on('mousemove', (e) => {
+  if (drawMode !== 'obstacle' || !dragStart || !tempRect) return;
+  tempRect.setBounds(L.latLngBounds(dragStart, e.latlng));
+});
+map.on('mouseup', (e) => {
+  if (drawMode !== 'obstacle' || !dragStart) return;
+  const a = dragStart, b = e.latlng;
+  dragStart = null;
+  // Discard slivers/stray clicks (< 5 px on either axis).
+  const pa = map.latLngToContainerPoint(a), pb = map.latLngToContainerPoint(b);
+  if (Math.abs(pa.x - pb.x) < 5 || Math.abs(pa.y - pb.y) < 5) {
+    if (tempRect) { map.removeLayer(tempRect); tempRect = null; }
+    return;
+  }
+  postCommand({ action: 'add_obstacle',
+                lat1: a.lat, lon1: a.lng, lat2: b.lat, lon2: b.lng });
+  setShapesPending();   // temp rect stays until the meta echo replaces it
+  exitMode(true);
+});
+
+// Fence: click vertices; double-click or the Finish button closes it.
+map.on('click', (e) => {
+  if (drawMode !== 'fence') return;
+  fenceVerts.push(e.latlng);
+  if (tempFence) map.removeLayer(tempFence);
+  tempFence = L.polyline(fenceVerts,
+    { color: '#f85149', weight: 3, dashArray: '8 5' }).addTo(map);
+  tempFenceDots.push(L.circleMarker(e.latlng,
+    { radius: 4, color: '#f85149', fillColor: '#f85149', fillOpacity: 1 }).addTo(map));
+});
+map.on('dblclick', () => {
+  if (drawMode !== 'fence') return;
+  // Leaflet fires click before dblclick, so the finishing double-click has
+  // already pushed a duplicate final vertex — drop it.
+  if (fenceVerts.length > 0) fenceVerts.pop();
+  finishFence();
+});
+btnFinishFence.addEventListener('click', finishFence);
+
+function finishFence() {
+  if (drawMode !== 'fence' || fenceVerts.length < 3) return;  // need a triangle
+  postCommand({ action: 'set_geofence',
+                vertices: fenceVerts.map(p => [p.lat, p.lng]) });
+  setShapesPending();
+  exitMode();
+}
+
+// Obstacle-popup Delete button (popup HTML is a string, so this is global).
+window.deleteObstacle = function (id) {
+  postCommand({ action: 'delete_obstacle', id: id });
+  map.closePopup();   // the echo removes the rectangle on the next poll
+};
 
 // ---- poll loop ----
 async function tick() {

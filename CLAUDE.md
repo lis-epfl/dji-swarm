@@ -62,6 +62,23 @@ no video.
 - **Python control scripts** (run against the built `ds_wrapper.*.pyd`):
   - `joystick_controller.py` — primary single-drone joystick driver (UDP joystick or `--cli`).
   - `swarm_flocking.py` — multi-drone Olfati-Saber flocking from one joystick.
+  - `olfati_saber.py` — the flocking math, extracted from `swarm_flocking.py`: the
+    `OlfatiSaber` cohesion/velocity-consensus class, plus `ObstacleAvoidance` — a port of
+    the Unity sim's `GetObstacleForce` β-agent term for 2D **virtual obstacles** (axis-
+    aligned rectangles) and one **geofence polygon** whose edges repel inward. Shapes are
+    **drawn on the GUI map** ("Add obstacle" click-drag / "Add geofence" vertex clicks →
+    `/command` POST → UDP :5098 → `command_listener` → `meta["obstacles"]`/`meta["geofence"]`,
+    persisted to `AOS server/shapes.json`, gitignored). Shape validation + shapes.json
+    persistence live in this module and are shared with `swarm_gui.py`, whose own
+    `ShapesStore` also applies/saves every edit — so drawing works and shapes stay visible
+    with NO controller running (the GUI serves them as `data.shapes`; a live controller's
+    meta echo remains authoritative). `d_obs`/`r0_obs` params are PHYSICAL
+    metres (divided by `scale` internally — Unity's raw d_obs=5.0 scaled would be 50 m
+    physical). Geofence is also a hard cutoff: a drone outside it is braked, gets a
+    per-drone DISABLE_VS, and leaves the flock (not a neighbour, excluded from hull
+    heading, still covered by min-separation) until swarming is Stop→Started, which clears
+    the breach list (`meta["removed"]` shows it in the GUI). Pure Python, no `ds_wrapper`
+    import, testable standalone.
   - `heading_convexhull.py` — GLOBAL_CONVEXHULL heading control (port of the Unity VR sim's
     `AttitudeAlgorithm.cs`), used by `swarm_flocking.py`: drones on the swarm's convex hull
     face outward along their vertex bisector (point-inwards flips it), interior drones hold
@@ -76,7 +93,10 @@ no video.
     each drone's position + heading, a complete graph of inter-drone distance lines
     (metres labelled), and a per-drone status panel. **Does NOT import `ds_wrapper`** — it
     only LISTENS on UDP :5099 for telemetry pushed by a running controller (so it runs
-    unprivileged, in its own terminal, on any Python ≥3.7). Frontend assets in `gui/`
+    unprivileged, in its own terminal, on any Python ≥3.7; it does import the pure
+    `olfati_saber` module for the shared shapes helpers, and owns a `ShapesStore` that
+    loads/saves `shapes.json` so obstacle/geofence drawing works without a controller).
+    Frontend assets in `gui/`
     (Leaflet + Esri World Imagery tiles, needs internet, no API key).
   - `swarm_telemetry_feed.py` — `TelemetryFeedPublisher` embedded by `joystick_controller.py`
     and `swarm_flocking.py`; UDP-pushes a JSON telemetry snapshot to `swarm_gui.py` at 5 Hz
@@ -256,7 +276,7 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 | Launcher | Starts | Params → script flags |
 | --- | --- | --- |
 | `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
-| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
+| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-DObs`→`--d-obs` / `-R0Obs`→`--r0-obs` / `-CObs`→`--c-obs` (virtual-obstacle/geofence repulsion cutoff, detection radius [physical m] and gain; config keys `DObs`/`R0Obs`/`CObs`; the shapes themselves are drawn in the GUI and persist in `shapes.json`), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
 | `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
 
 `dji-flocking.ps1`'s launch settings live in **`AOS server/flocking.config.psd1`** (a

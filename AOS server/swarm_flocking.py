@@ -32,7 +32,12 @@ Joystick → swarm mapping:
     switch s2  → LAND all drones (rising edge)
     PC key 'q' → zero velocities, hold current position, disable VS, exit
 
-Obstacle avoidance from the C# original is intentionally omitted.
+Obstacle avoidance from the C# original is ported in olfati_saber.py
+(ObstacleAvoidance): 2D rectangular virtual obstacles plus one geofence
+polygon, both drawn on the browser GUI's map and persisted to shapes.json.
+The fence edges repel inward with the same β-agent kernel, and a drone that
+ends up OUTSIDE the fence is braked, gets DISABLE_VS, and is removed from
+the flock (not a neighbour) until swarming is stopped and started again.
 
 Note on ScaleFactor: the OlfatiSaber math uses the Unity-sim tuning verbatim
 (ScaleFactor = 10.0). To keep the cohesion potential in the same regime, the
@@ -78,6 +83,21 @@ from swarm_telemetry_feed import (
     DEFAULT_GUI_PORT,
 )
 from heading_convexhull import ConvexHullHeading
+from olfati_saber import (
+    OlfatiSaber,
+    ObstacleAvoidance,
+    gps_to_local,
+    clamp_mag2,
+    rect_to_ne,
+    polygon_to_ne,
+    point_in_polygon,
+    DEFAULT_SHAPES_FILE,
+    MAX_OBSTACLES,
+    normalize_obstacle,
+    validate_fence,
+    load_shapes,
+    save_shapes,
+)
 from image_stream_feed import ImageStreamPublisher
 from mqtt_command_sender import MqttCommandSender
 from joystick_controller import (
@@ -115,10 +135,6 @@ GIMBAL_PITCH_MIN = -90.0
 GIMBAL_PITCH_MAX = 60.0
 DEFAULT_GIMBAL_PITCH = -10.0
 
-# Equirectangular-projection constants for converting (lat, lon) deltas to
-# local meters. Valid for swarm scales (tens of meters).
-EARTH_M_PER_DEG = 111320.0
-
 # Drones with fewer satellites than this are excluded from the swarm snapshot.
 MIN_SAT_COUNT = 6
 
@@ -141,15 +157,7 @@ IDCHECK_TIMEOUT_S = 2.0
 
 
 # ---------- helpers ----------
-
-def gps_to_local(lat, lon, lat_ref, lon_ref):
-    """Convert (lat, lon) in degrees to local (north, east) meters about
-    a reference point. Equirectangular approximation — fine for small swarms."""
-    cos_lat = math.cos(math.radians(lat_ref))
-    north = (lat - lat_ref) * EARTH_M_PER_DEG
-    east  = (lon - lon_ref) * EARTH_M_PER_DEG * cos_lat
-    return north, east
-
+# (gps_to_local / clamp_mag2 / the OlfatiSaber class moved to olfati_saber.py)
 
 def body_to_world(v_forward, v_right, heading_deg):
     """Rotate body-frame (forward, right) velocity into world (north, east).
@@ -196,15 +204,6 @@ def d_ref_from_ax(ax, scale=10.0):
     ax = max(0.6, min(1.4, ax))
     physical = 5.0 + (ax - 0.6) * 6.25     # 5 .. 10 m physical
     return physical / scale
-
-
-def clamp_mag2(vx, vy, max_mag):
-    """Clamp the magnitude of a 2D vector to max_mag."""
-    mag = math.hypot(vx, vy)
-    if mag > max_mag and mag > 0:
-        s = max_mag / mag
-        return vx * s, vy * s
-    return vx, vy
 
 
 # ---------- command<->telemetry identity check ----------
@@ -420,116 +419,6 @@ def run_identity_check(swarm, cmd_sender, logger=None, timeout=IDCHECK_TIMEOUT_S
     return True
 
 
-# ---------- Olfati-Saber math (mirrors OlfatiSaber.cs) ----------
-
-class OlfatiSaber:
-    """2D port of the Unity OlfatiSaber component. Stateless math — one
-    instance can serve the whole swarm; per-drone state comes through args."""
-
-    def __init__(self, r0_coh=150.0, delta=0.1, a=0.9, b=1.5, c=0.0,
-                 c_vm=0.0, scale=10.0):
-        self.r0_coh = r0_coh
-        self.delta  = delta
-        self.a = a
-        self.b = b
-        self.c = c
-        self.c_vm = c_vm
-        self.scale = scale
-
-    # cohesion intensity ψ(r, d_ref)
-    def psi(self, r, d_ref):
-        diff = r - d_ref
-        return (((self.a + self.b) / 2.0)
-                * (math.sqrt(1 + (diff + self.c) ** 2) - math.sqrt(1 + self.c ** 2))
-                + ((self.a - self.b) * diff) / 2.0)
-
-    # ψ'(r, d_ref)
-    def psi_prime(self, r, d_ref):
-        diff = r - d_ref
-        return (((self.a + self.b) / 2.0)
-                * (diff + self.c) / math.sqrt(1 + (diff + self.c) ** 2)
-                + (self.a - self.b) / 2.0)
-
-    # neighbour weight w(r, r0)
-    def w_fn(self, r, r0):
-        rr = r / r0
-        if rr < self.delta:
-            return 1.0
-        if rr < 1.0:
-            arg = math.pi * (rr - self.delta) / (1 - self.delta)
-            return (0.5 * (1.0 + math.cos(arg))) ** 2
-        return 0.0
-
-    # w'(r, r0)
-    def w_prime(self, r, r0):
-        rr = r / r0
-        if rr < self.delta:
-            return 0.0
-        if rr < 1.0:
-            arg = math.pi * (rr - self.delta) / (1 - self.delta)
-            return 0.5 * (-math.pi) / (1 - self.delta) * (1 + math.cos(arg)) * math.sin(arg)
-        return 0.0
-
-    # Cohesion force scalar. Mirrors the C# verbatim, including the
-    # `1/r0_coh` term using the field (not the passed r0). Harmless here
-    # because we only call it with r0 == self.r0_coh anyway.
-    def cohesion_force(self, r, d_ref):
-        wp   = self.w_prime(r, self.r0_coh)
-        ps   = self.psi(r, d_ref)
-        ww   = self.w_fn(r, self.r0_coh)
-        psp  = self.psi_prime(r, d_ref)
-        return (1.0 / self.r0_coh) * wp * ps + ww * psp
-
-    def compute(self, self_pos_ne, self_vel_ne, neighbours, d_ref):
-        """Return the world-frame swarm correction for one drone, to be ADDED
-        to the joystick's desired velocity before sending to DJI VS.
-
-        Mirrors the new `OlfatiSaber.cs::GetSwarmAcceleration`:
-            return velocityConsensus + cohesion
-        where velocityConsensus sums c_vm*(v_neighbour - v_self) over neighbours
-        (pulling each drone toward its neighbours' velocities), and cohesion is
-        the σ-norm spacing potential.
-
-        The desired joystick velocity is NOT mixed in here — it goes straight
-        to DJI VS via set_velocity, with this correction added on top.
-
-        Args:
-            self_pos_ne:  (n, e) meters
-            self_vel_ne:  (vn, ve) m/s (world frame)
-            neighbours:   iterable of ((n, e), (vn, ve)) tuples for other drones
-            d_ref:        desired inter-drone spacing in scaled units
-        """
-        sn, se = self_pos_ne
-        vn, ve = self_vel_ne
-
-        consensus_n = 0.0
-        consensus_e = 0.0
-        coh_n = 0.0
-        coh_e = 0.0
-
-        for n_pos, n_vel in neighbours:
-            # Velocity consensus: pull toward each neighbour's velocity
-            consensus_n += self.c_vm * (n_vel[0] - vn)
-            consensus_e += self.c_vm * (n_vel[1] - ve)
-
-            # Cohesion: spacing potential along the relative-position unit vector
-            rel_n = n_pos[0] - sn
-            rel_e = n_pos[1] - se
-            rel_mag = math.hypot(rel_n, rel_e)
-            if rel_mag < 1e-6:
-                continue
-            r_scaled = rel_mag / self.scale
-            if r_scaled >= self.r0_coh:
-                continue  # outside cohesion well; contribution is zero anyway
-            force = self.cohesion_force(r_scaled, d_ref)
-            ux = rel_n / rel_mag
-            uy = rel_e / rel_mag
-            coh_n += force * ux
-            coh_e += force * uy
-
-        return consensus_n + coh_n, consensus_e + coh_e
-
-
 # Reverse command channel: the browser GUI (swarm_gui.py) forwards Start/Stop
 # button presses here as JSON UDP datagrams. Distinct from the joystick (:5055)
 # and telemetry (:5099) ports.
@@ -537,14 +426,21 @@ DEFAULT_CMD_HOST = "127.0.0.1"
 DEFAULT_CMD_PORT = 5098
 
 
-def command_listener(swarming, meta, host, port):
+def command_listener(swarming, meta, host, port, shapes_path=None):
     """Receive GUI command datagrams (Start/Stop, gimbal slider, heading
-    mode + point-inwards toggles) over UDP.
+    mode + point-inwards toggles, obstacle/geofence edits) over UDP.
 
     This thread NEVER touches ds_wrapper — it only mutates the shared `swarming`
     Event and the shared `meta` dict. The control loop (run) detects the edge /
     reads meta and performs the actual VS arm/disarm and gimbal set, so every
     hardware poke stays on the control-loop thread.
+
+    Shape edits also persist to `shapes_path` (atomic write) so they survive a
+    controller restart. CONCURRENCY RULE for meta["obstacles"]/meta["geofence"]:
+    REPLACE, never mutate — always assign a brand-new list (or None) in a
+    single statement. Dict item assignment is GIL-atomic, so run() sees either
+    the old or the new complete object, never a half-edited one. An in-place
+    .append() here would race the control loop's per-tick read.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -588,6 +484,68 @@ def command_listener(swarming, meta, host, port):
                 if meta is not None:
                     meta["point_inwards"] = bool(msg.get("value"))
                     print(f"[gui] point inwards -> {meta['point_inwards']}")
+            elif action == "add_obstacle":
+                # GUI map drag: a lat/lon-axis-aligned rectangle given by two
+                # opposite corners. Validation/normalization is shared with
+                # swarm_gui.py (olfati_saber.normalize_obstacle).
+                if meta is None:
+                    continue
+                new_ob = normalize_obstacle(msg.get("lat1"), msg.get("lon1"),
+                                            msg.get("lat2"), msg.get("lon2"))
+                if new_ob is None:
+                    print("[gui] obstacle rejected: invalid or too small")
+                    continue
+                current = meta.get("obstacles") or []
+                if len(current) >= MAX_OBSTACLES:
+                    print(f"[gui] obstacle rejected: limit of "
+                          f"{MAX_OBSTACLES} reached")
+                    continue
+                new_ob["id"] = max([ob["id"] for ob in current] or [0]) + 1
+                meta["obstacles"] = current + [new_ob]   # replace, not mutate
+                if shapes_path:
+                    save_shapes(shapes_path, meta["obstacles"], meta.get("geofence"))
+                print(f"[gui] obstacle {new_ob['id']} added "
+                      f"({len(meta['obstacles'])} total)")
+            elif action == "delete_obstacle":
+                if meta is None:
+                    continue
+                try:
+                    ob_id = int(msg.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                current = meta.get("obstacles") or []
+                meta["obstacles"] = [ob for ob in current if ob["id"] != ob_id]
+                if shapes_path:
+                    save_shapes(shapes_path, meta["obstacles"], meta.get("geofence"))
+                print(f"[gui] obstacle {ob_id} deleted "
+                      f"({len(meta['obstacles'])} remain)")
+            elif action == "clear_obstacles":
+                if meta is None:
+                    continue
+                meta["obstacles"] = []
+                if shapes_path:
+                    save_shapes(shapes_path, [], meta.get("geofence"))
+                print("[gui] all obstacles cleared")
+            elif action == "set_geofence":
+                # GUI polygon: ordered [lat, lon] vertices. Replaces any
+                # existing fence. run() picks it up on its next tick — a drone
+                # already outside is braked and removed immediately.
+                if meta is None:
+                    continue
+                fence = validate_fence(msg.get("vertices"))
+                if fence is None:
+                    continue
+                meta["geofence"] = fence                 # replace, not mutate
+                if shapes_path:
+                    save_shapes(shapes_path, meta.get("obstacles") or [], fence)
+                print(f"[gui] geofence set ({len(fence)} vertices)")
+            elif action == "clear_geofence":
+                if meta is None:
+                    continue
+                meta["geofence"] = None
+                if shapes_path:
+                    save_shapes(shapes_path, meta.get("obstacles") or [], None)
+                print("[gui] geofence cleared")
         except Exception:
             continue  # ignore malformed packets, keep listening
 
@@ -597,7 +555,7 @@ def command_listener(swarming, meta, host, port):
 def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         logger=None, speed_scale=1.0, meta=None, heading_ctrl=None,
         cmd_sender=None, identity_check=True,
-        min_separation=DEFAULT_MIN_SEPARATION_M):
+        min_separation=DEFAULT_MIN_SEPARATION_M, avoid=None):
     print("\n--- Olfati-Saber Swarm Mode ---")
     print(f"  Drones: {sorted(swarm.drones.keys())}")
     print(f"  c_vm={olfati.c_vm}  r0_coh={olfati.r0_coh}  scale={olfati.scale}")
@@ -629,6 +587,16 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
     last_t = time.time()
     last_print = 0.0
     no_fix_warned = set()
+    # Geofence breach bookkeeping. `removed` = drone ids braked + VS-disabled
+    # after crossing outside the fence; they get no commands and are not
+    # neighbours until swarming is stopped and started again (cleared on the
+    # rising edge below). `pending_disable` maps a breached drone id to the
+    # deadline after which its DISABLE_VS goes out — a non-blocking 0.4 s
+    # brake window (a time.sleep here would freeze every OTHER drone's
+    # control for ~8 ticks; one zero-velocity command suffices because the
+    # app re-sends the last VS command at its own 20 Hz).
+    removed = set()
+    pending_disable = {}
 
     while True:
         now = time.time()
@@ -705,6 +673,14 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 target_alt = max(sum(alts) / len(alts), START_ALT_FLOOR_M)
             else:
                 target_alt = max(INITIAL_ALT_M, START_ALT_FLOOR_M)
+            # Re-admit any geofence-breached drones: Stop→Start is the
+            # explicit operator action that clears the removed set, and
+            # enable_vs_all() below re-arms them along with everyone else.
+            if removed:
+                print(f"[fence] breach list cleared "
+                      f"(re-admitting drones {sorted(removed)})")
+                removed.clear()
+            pending_disable.clear()
             swarm.enable_vs_all()
             vs_on = True
             print(f"[swarm] START: VS armed  heading={target_yaw:+.1f}°  "
@@ -725,6 +701,10 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
 
         if meta is not None:
             meta["swarming"] = sw
+            # Live list of geofence-breached (VS-disabled) drone ids for the
+            # GUI's FENCED OUT badges; refreshed every tick, also while held,
+            # so a Stop→Start visibly clears it.
+            meta["removed"] = sorted(removed)
             # Publish the live target spacing to the GUI even while held (before
             # the swarming gate below), so the operator can see what d_ref the
             # joystick angular.x currently maps to *before* pressing Start. When
@@ -866,6 +846,18 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 vel_ne = (t['vx'], t['vy'])
             snap[did] = (pos_ne, vel_ne, t['heading'])
 
+        # Virtual obstacles / geofence: convert the GUI-drawn lat/lon shapes
+        # into local N/E metres with the SAME per-tick reference point as the
+        # drone positions above, so shapes and drones always share one frame
+        # no matter how the ref drifts with the swarm. Cheap (a few
+        # gps_to_local calls). The meta lists are replaced whole by
+        # command_listener (never mutated), so reading them here is safe.
+        obstacles = (meta or {}).get("obstacles") or []
+        fence = (meta or {}).get("geofence")
+        rects_ne = [rect_to_ne(ob, lat_ref, lon_ref) for ob in obstacles]
+        fence_ne = (polygon_to_ne(fence, lat_ref, lon_ref)
+                    if fence and len(fence) >= 3 else None)
+
         # Minimum-separation failsafe: any pair too close -> auto-STOP swarming
         # (the falling edge above then zeroes velocities, brakes, and disables
         # VS, exactly like the GUI Stop button; the drones GPS-hover apart).
@@ -893,13 +885,53 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 time.sleep(0.02)
                 continue
 
+        # Geofence hard cutoff: a drone whose GPS fix lands OUTSIDE the fence
+        # polygon is braked (one zero-velocity command; the app re-sends it at
+        # 20 Hz), then gets DISABLE_VS after a 0.4 s non-blocking brake window
+        # and is removed from the flock — no commands, not a neighbour — until
+        # swarming is stopped and started again. The soft inward repulsion
+        # (avoid.fence_force) is the real protection; this is the failsafe.
+        # Note breached drones stay in `snap`, so the min-separation failsafe
+        # above still covers the airspace they hover in.
+        if fence_ne is not None:
+            for did in snap:
+                if did in removed:
+                    continue
+                (n_pos, e_pos), _, _ = snap[did]
+                if point_in_polygon(n_pos, e_pos, fence_ne):
+                    continue
+                removed.add(did)
+                t = swarm.drones[did].telemetry
+                hold_alt = (max(t.get('alt', target_alt), MIN_ALT_M)
+                            if t else target_alt)
+                if not dry_run:
+                    swarm.drones[did].set_velocity(0.0, 0.0, 0.0, hold_alt)
+                pending_disable[did] = now + 0.4
+                print(f"[FENCE] drone {did} OUTSIDE geofence — braking, "
+                      f"DISABLE_VS in 0.4 s; removed from flock until "
+                      f"swarming restart")
+                if logger:
+                    logger.log_drone_command(did, "EVENT", cmd="FENCE_BREACH")
+        for did in list(pending_disable):
+            if now >= pending_disable[did]:
+                if not dry_run:
+                    swarm.drones[did].disable_vs()
+                del pending_disable[did]
+                print(f"[FENCE] drone {did} VS disabled — GPS-hovering; "
+                      f"recover on the RC. Stop→Start re-admits it.")
+                if logger:
+                    logger.log_drone_command(did, "EVENT",
+                                             cmd="FENCE_DISABLE_VS")
+
         # Convex-hull heading control: derive a per-drone target heading from
         # the swarm's hull (boundary drones face outward along their vertex
         # bisector; interior drones get None → hold current heading).
+        # Geofence-breached drones must not steer the flock's facing.
         hull_targets = None
         if hull_mode:
             hull_targets = heading_ctrl.update(
-                {did: pos for did, (pos, _, _) in snap.items()}, dt)
+                {did: pos for did, (pos, _, _) in snap.items()
+                 if did not in removed}, dt)
             if meta is not None:
                 meta["hull_boundary"] = heading_ctrl.boundary_ids()
 
@@ -910,6 +942,8 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         for did, ctrl in swarm.drones.items():
             if did not in snap:
                 continue  # no fix → DroneController holds last set_velocity
+            if did in removed:
+                continue  # fenced out: VS disabled, gets no commands
             try:
                 self_pos, self_vel, hdg = snap[did]
                 if hull_targets is not None:
@@ -933,13 +967,21 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                     drone_target = target_yaw
                     cmd_yaw_rate = heading_hold_rate(
                         target_yaw, hdg, ff_yaw_rate, p_scale=speed_scale)
-                neighbours = [(snap[j][0], snap[j][1]) for j in snap if j != did]
+                # Geofence-breached drones are NOT neighbours: nothing coheres
+                # toward (or velocity-matches) a fenced-out hoverer.
+                neighbours = [(snap[j][0], snap[j][1]) for j in snap
+                              if j != did and j not in removed]
                 # Swarm correction (consensus + cohesion) in world frame
                 v_n_corr, v_e_corr = olfati.compute(
                     self_pos, self_vel, neighbours, d_ref=d_ref,
                 )
-                v_n_total = v_n_des + v_n_corr
-                v_e_total = v_e_des + v_e_corr
+                # Virtual obstacles + geofence soft repulsion (β-agent term).
+                o_n, o_e = 0.0, 0.0
+                if avoid is not None and (rects_ne or fence_ne):
+                    o_n, o_e = avoid.compute(
+                        self_pos, self_vel, rects_ne, fence_ne)
+                v_n_total = v_n_des + v_n_corr + o_n
+                v_e_total = v_e_des + v_e_corr + o_e
                 v_n_total, v_e_total = clamp_mag2(v_n_total, v_e_total, MAX_CMD_MPS)
                 # --slow: scale the combined command (joystick desired + swarm
                 # correction) uniformly so the whole motion just runs slower —
@@ -949,7 +991,8 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 if logger:
                     logger.log_swarm_debug(
                         did, v_n_des, v_e_des, v_n_corr, v_e_corr,
-                        v_n_total, v_e_total, d_ref, len(neighbours))
+                        v_n_total, v_e_total, d_ref, len(neighbours),
+                        v_n_obs=o_n, v_e_obs=o_e)
                 # DJI VS is in GROUND/VELOCITY mode (SwarmActivity sets
                 # FlightCoordinateSystem.GROUND), so pitch = north m/s and
                 # roll = east m/s. We send world-frame velocities directly —
@@ -958,6 +1001,7 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                     print(f"  [dry] drone {did}  "
                           f"v_des=({v_n_des:+.2f}N,{v_e_des:+.2f}E)  "
                           f"corr=({v_n_corr:+.2f},{v_e_corr:+.2f})  "
+                          f"obs=({o_n:+.2f},{o_e:+.2f})  "
                           f"cmd=({v_n_total:+.2f}N,{v_e_total:+.2f}E)  "
                           f"hdg={hdg:+6.1f}°→{drone_target:+.1f}° "
                           f"yawrate={cmd_yaw_rate:+5.1f}°/s  "
@@ -1072,6 +1116,26 @@ def main():
                     help="Failsafe: auto-STOP swarming when any drone pair "
                          f"gets closer than this many metres (default "
                          f"{DEFAULT_MIN_SEPARATION_M:.1f}; 0 disables)")
+    ap.add_argument("--d-obs", type=float, default=5.0, metavar="M",
+                    help="Obstacle/geofence repulsion cutoff in PHYSICAL "
+                         "metres (default 5.0). The beta-agent kernel runs at "
+                         "d_obs/scale in scaled units so the repulsion stays "
+                         "commensurate with the cohesion forces; the push is "
+                         "maximal at contact and exactly 0 beyond this range.")
+    ap.add_argument("--r0-obs", type=float, default=6.0, metavar="M",
+                    help="Obstacle detection radius in PHYSICAL metres "
+                         "(default 6.0; must be >= --d-obs). Beyond this an "
+                         "obstacle is ignored entirely.")
+    ap.add_argument("--c-obs", type=float, default=4.3,
+                    help="Obstacle/geofence repulsion gain (default 4.3, "
+                         "matching the Unity sim; max push ~= c_obs * 1.45 "
+                         "m/s at contact).")
+    ap.add_argument("--shapes-file", default=DEFAULT_SHAPES_FILE,
+                    metavar="PATH",
+                    help="JSON file the GUI-drawn obstacles/geofence persist "
+                         f"to (default {DEFAULT_SHAPES_FILE}; relative paths "
+                         "resolve against this script's directory). Loaded "
+                         "at startup, rewritten on every edit.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print VS commands but do not send to drones")
     ap.add_argument("--no-gui", action="store_true",
@@ -1105,6 +1169,13 @@ def main():
         ap.error("--slow SCALE must be > 0")
     if args.min_separation < 0:
         ap.error("--min-separation must be >= 0 (0 disables the failsafe)")
+    if args.d_obs <= 0:
+        ap.error("--d-obs must be > 0")
+    if args.r0_obs < args.d_obs:
+        ap.error("--r0-obs must be >= --d-obs (an obstacle must be detected "
+                 "at least as far out as it repels)")
+    if args.c_obs < 0:
+        ap.error("--c-obs must be >= 0")
     if not (GIMBAL_PITCH_MIN <= args.gimbal_pitch <= GIMBAL_PITCH_MAX):
         ap.error(f"--gimbal-pitch must be in "
                  f"[{GIMBAL_PITCH_MIN:.0f}, {GIMBAL_PITCH_MAX:.0f}] (DJI Mini 3 Pro)")
@@ -1195,6 +1266,8 @@ def main():
             "drone_ips": resolved_ips,
             "identity_check": not args.no_identity_check,
             "min_separation": args.min_separation,
+            "d_obs": args.d_obs, "r0_obs": args.r0_obs, "c_obs": args.c_obs,
+            "shapes_file": args.shapes_file,
         })
         swarm.attach_logger(logger)
         print(f"  Flight logging -> {logger.session_dir} (disable with --no-log)")
@@ -1271,6 +1344,22 @@ def main():
 
     olfati = OlfatiSaber(r0_coh=args.r0, c_vm=args.c_vm, scale=args.scale)
 
+    # Virtual obstacles + geofence repulsion (β-agent term; params in physical
+    # metres, converted to the cohesion math's scaled units internally).
+    avoid = ObstacleAvoidance(d_obs_m=args.d_obs, r0_obs_m=args.r0_obs,
+                              c_obs=args.c_obs, scale=args.scale)
+
+    # GUI-drawn shapes persist across controller restarts in a JSON file next
+    # to this script (unless --shapes-file points elsewhere).
+    shapes_path = args.shapes_file
+    if not os.path.isabs(shapes_path):
+        shapes_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), shapes_path)
+    obstacles, geofence = load_shapes(shapes_path)
+    print(f"  Shapes: {len(obstacles)} obstacle(s), "
+          f"geofence {'with ' + str(len(geofence)) + ' vertices' if geofence else 'none'} "
+          f"({shapes_path})")
+
     # Always instantiated: the GUI can switch heading modes at runtime, so the
     # hull controller must exist even when starting in manual mode. run() only
     # consults it while meta["heading_mode"] == "convexhull".
@@ -1311,11 +1400,25 @@ def main():
             "c": olfati.c,
             "delta": olfati.delta,
         },
+        # Virtual obstacles + geofence, seeded from shapes.json and then owned
+        # by the GUI (command_listener replaces the lists wholesale on every
+        # edit and persists them; run() converts to local metres each tick).
+        # "removed" is the live list of geofence-breached (VS-disabled) drone
+        # ids, refreshed each tick by run() for the GUI's FENCED OUT badges.
+        "obstacles": obstacles,
+        "geofence": geofence,
+        "removed": [],
+        "obstacle_params": {
+            "d_obs_m": args.d_obs,
+            "r0_obs_m": args.r0_obs,
+            "c_obs": args.c_obs,
+        },
     }
 
     swarming = threading.Event()   # cleared = held (do nothing); set = flocking
     threading.Thread(target=command_listener,
-                     args=(swarming, swarm_meta, args.cmd_host, args.cmd_port),
+                     args=(swarming, swarm_meta, args.cmd_host, args.cmd_port,
+                           shapes_path),
                      daemon=True, name="GuiCommandListener").start()
 
     gui_feed = None
@@ -1335,7 +1438,7 @@ def main():
             dry_run=args.dry_run, vel_frame=args.vel_frame, logger=logger,
             speed_scale=args.slow, meta=swarm_meta, heading_ctrl=heading_ctrl,
             cmd_sender=cmd_sender, identity_check=identity_check,
-            min_separation=args.min_separation)
+            min_separation=args.min_separation, avoid=avoid)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:

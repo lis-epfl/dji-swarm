@@ -12,7 +12,7 @@
 
 @{
     # Number of drones in the swarm (creates IDs 1..N). CLI: -Drones
-    Drones = 1
+    Drones = 6
 
     # RC/broker IP addresses in DRONE-ID ORDER (index 1 = drone 1, ...). When
     # listed, swarm_flocking.py publishes commands DIRECTLY to each RC's MQTT
@@ -30,9 +30,8 @@
     # the server's slot order for that session instead of the switch ports.
     # @('server') = force the legacy command path via DroneSwarmServer (~4.5 Hz).
     # CLI: -DroneIPs 192.168.100.173,192.168.100.176  /  -DroneIPs server
-    # DroneIPs = @('192.168.100.173', '192.168.100.176', '192.168.100.247', '192.168.100.211')
+    # DroneIPs = @('192.168.100.150', '192.168.100.173', '192.168.100.176', '192.168.100.247', '192.168.100.211')
     DroneIPs = @()
-    # '192.168.100.150'
 
     # Browser GUI (swarm_gui.py) HTTP port. CLI: -HttpPort
     HttpPort = 8000
@@ -85,4 +84,17 @@
     R0 = 150.0
     # Distance scale factor, --scale (default 10.0, matches the Unity sim).
     Scale = 10.0
+
+    # --- Virtual obstacles / geofence (shapes are drawn on the GUI map and ---
+    # --- persist in shapes.json; these tune the beta-agent repulsion)      ---
+    # Repulsion cutoff in PHYSICAL metres: the push is maximal at contact and
+    # exactly 0 beyond this distance from an obstacle edge (or inside the
+    # geofence, from its boundary). CLI: -DObs
+    DObs = 5.0
+    # Detection radius in PHYSICAL metres (>= DObs); beyond it an obstacle is
+    # ignored entirely. CLI: -R0Obs
+    R0Obs = 6.0
+    # Repulsion gain (max push ~= CObs * 1.45 m/s at contact; 4.3 matches the
+    # Unity sim). CLI: -CObs
+    CObs = 4.3
 }

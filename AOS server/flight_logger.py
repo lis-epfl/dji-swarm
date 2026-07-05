@@ -70,6 +70,7 @@ _TELEM_COLS = ['t_epoch', 't_iso', 'drone_id'] + TELEMETRY_FIELDS
 _SWARM_COLS = [
     't_epoch', 't_iso', 'drone_id',
     'v_n_des', 'v_e_des', 'v_n_corr', 'v_e_corr',
+    'v_n_obs', 'v_e_obs',
     'v_n_total', 'v_e_total', 'd_ref', 'n_neighbours',
 ]
 
@@ -175,14 +176,19 @@ class FlightLogger:
         self._enqueue('telemetry', row)
 
     def log_swarm_debug(self, drone_id, v_n_des, v_e_des, v_n_corr, v_e_corr,
-                        v_n_total, v_e_total, d_ref, n_neighbours):
-        """Log the Olfati-Saber decomposition for one drone (swarm mode only)."""
+                        v_n_total, v_e_total, d_ref, n_neighbours,
+                        v_n_obs=0.0, v_e_obs=0.0):
+        """Log the Olfati-Saber decomposition for one drone (swarm mode only).
+        v_n_obs/v_e_obs is the virtual-obstacle + geofence repulsion term
+        (optional, defaults 0 so callers without obstacles stay unchanged)."""
         self._enqueue('swarm', {
             'drone_id': drone_id,
             'v_n_des': v_n_des,
             'v_e_des': v_e_des,
             'v_n_corr': v_n_corr,
             'v_e_corr': v_e_corr,
+            'v_n_obs': v_n_obs,
+            'v_e_obs': v_e_obs,
             'v_n_total': v_n_total,
             'v_e_total': v_e_total,
             'd_ref': d_ref,

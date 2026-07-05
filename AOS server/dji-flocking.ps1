@@ -34,6 +34,10 @@
 #                                     # -DroneIPs server = force the legacy server path.
 #   .\dji-flocking.ps1 -NoIdentityCheck   # skip the command<->telemetry identity probe
 #   .\dji-flocking.ps1 -MinSeparation 5   # auto-STOP swarming if any pair < 5 m (0 = off)
+#   .\dji-flocking.ps1 -DObs 3 -R0Obs 4   # obstacle/geofence repulsion cutoff + detection
+#                                     # radius (physical metres); -CObs sets the gain.
+#                                     # The obstacles/geofence themselves are drawn on the
+#                                     # GUI map and persist in shapes.json.
 #   .\dji-flocking.ps1 -Config .\my-other.psd1   # use a different config file
 #
 # If PowerShell blocks the script, either run once with:
@@ -50,6 +54,9 @@ param(
     [double]$R0,
     [double]$Scale,
     [double]$MinSeparation,
+    [double]$DObs,
+    [double]$R0Obs,
+    [double]$CObs,
     [switch]$ConvexHull,
     [switch]$PointInwards,
     [switch]$NoGui,
@@ -67,6 +74,7 @@ $settings = @{
     Heading = 'manual'; PointInwards = $false; NoGui = $false
     ImageStream = $false
     Cvm = 0.0; R0 = 150.0; Scale = 10.0
+    DObs = 5.0; R0Obs = 6.0; CObs = 4.3
     DroneIPs = @()
     IdentityCheck = $true; MinSeparation = 3.0
 }
@@ -92,6 +100,9 @@ if ($PSBoundParameters.ContainsKey('ImageStream'))  { $settings.ImageStream = [b
 if ($PSBoundParameters.ContainsKey('PointInwards')) { $settings.PointInwards = [bool]$PointInwards }
 if ($PSBoundParameters.ContainsKey('DroneIPs'))     { $settings.DroneIPs = $DroneIPs }
 if ($PSBoundParameters.ContainsKey('MinSeparation')){ $settings.MinSeparation = $MinSeparation }
+if ($PSBoundParameters.ContainsKey('DObs'))         { $settings.DObs = $DObs }
+if ($PSBoundParameters.ContainsKey('R0Obs'))        { $settings.R0Obs = $R0Obs }
+if ($PSBoundParameters.ContainsKey('CObs'))         { $settings.CObs = $CObs }
 # -ConvexHull is a convenience alias that forces convexhull heading mode.
 if ($ConvexHull)                                    { $settings.Heading = 'convexhull' }
 # -NoIdentityCheck disables the command<->telemetry identity probe for one run.
@@ -111,6 +122,9 @@ $Heading      = ("$($settings.Heading)").ToLower()
 $DroneIPs     = @($settings.DroneIPs | Where-Object { "$_".Trim() -ne '' })
 $IdentityCheck = [bool]$settings.IdentityCheck
 $MinSeparation = [double]$settings.MinSeparation
+$DObs          = [double]$settings.DObs
+$R0Obs         = [double]$settings.R0Obs
+$CObs          = [double]$settings.CObs
 
 # Command-path mode from the DroneIPs value:
 #   @()                     -> 'auto'    (swarm_flocking.py discovers the RC IPs from
@@ -135,6 +149,9 @@ if ($CmdMode -eq 'explicit' -and $DroneIPs.Count -lt $Drones) {
            "(order = drone id; extras beyond Drones are fine)")
 }
 if ($MinSeparation -lt 0) { throw "MinSeparation must be >= 0 (0 disables) (got $MinSeparation)" }
+if ($DObs -le 0) { throw "DObs must be > 0 (physical metres) (got $DObs)" }
+if ($R0Obs -lt $DObs) { throw "R0Obs must be >= DObs (detect at least as far as the repulsion reaches) (got R0Obs=$R0Obs, DObs=$DObs)" }
+if ($CObs -lt 0) { throw "CObs must be >= 0 (got $CObs)" }
 
 $CmdPathDesc = switch ($CmdMode) {
     'auto'     { "auto-discover RC IPs from DroneSwarmServer (drone id = server slot)" }
@@ -144,6 +161,7 @@ $CmdPathDesc = switch ($CmdMode) {
 Write-Host ("[dji-flocking] config $Config -> drones=$Drones slow=$Slow gimbal=$GimbalPitch " +
             "heading=$Heading pointInwards=$PointInwards noGui=$NoGui imageStream=$ImageStream " +
             "c_vm=$Cvm r0=$R0 scale=$Scale minSep=$MinSeparation identityCheck=$IdentityCheck " +
+            "dObs=$DObs r0Obs=$R0Obs cObs=$CObs " +
             "httpPort=$HttpPort cmdPath=$CmdPathDesc")
 
 # --- Build the swarm_flocking.py CLI -----------------------------------------
@@ -184,7 +202,12 @@ $DroneIPsArg = switch ($CmdMode) {
 $IdentityArg = if (-not $IdentityCheck)   { " --no-identity-check" }                     else { "" }
 $MinSepArg   = if ($MinSeparation -ne 3.0){ " --min-separation " + (Inv $MinSeparation) } else { "" }
 
-$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg$IdentityArg$MinSepArg"
+# Obstacle/geofence repulsion tuning (physical metres; script defaults 5/6/4.3).
+$DObsArg  = if ($DObs -ne 5.0)  { " --d-obs " + (Inv $DObs) }   else { "" }
+$R0ObsArg = if ($R0Obs -ne 6.0) { " --r0-obs " + (Inv $R0Obs) } else { "" }
+$CObsArg  = if ($CObs -ne 4.3)  { " --c-obs " + (Inv $CObs) }   else { "" }
+
+$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg$IdentityArg$MinSepArg$DObsArg$R0ObsArg$CObsArg"
 
 # The readController pane sources the conda hook and activates this env
 # before launching the script. Edit if your miniconda lives elsewhere.

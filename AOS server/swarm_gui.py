@@ -36,6 +36,18 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# Shared shapes validation + shapes.json persistence (olfati_saber.py is pure
+# stdlib, no ds_wrapper — safe to import here). The GUI keeps its own store so
+# obstacles/geofence can be drawn, saved, and shown with NO controller running.
+from olfati_saber import (
+    DEFAULT_SHAPES_FILE,
+    MAX_OBSTACLES,
+    normalize_obstacle,
+    validate_fence,
+    load_shapes,
+    save_shapes,
+)
+
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui")
 
@@ -88,7 +100,79 @@ class SwarmState:
                     "meta": dict(self._meta), "drones": drones}
 
 
-def udp_listener(state, host, port):
+class ShapesStore:
+    """Thread-safe obstacles/geofence store persisted to shapes.json.
+
+    Exists so the operator can draw (and keep) shapes with NO controller
+    running: every edit is applied here, saved to disk, and ALSO forwarded to
+    the controller's command port. While a controller is alive its meta echo
+    is authoritative — sync_from_feed() adopts it (without re-saving; the
+    controller persisted that edit itself), so ids and content converge on the
+    controller's view. Both processes default to the same file in this folder,
+    and duplicate saves of the same edit write identical content atomically.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._obstacles, self._geofence = load_shapes(path)
+
+    def get(self):
+        with self._lock:
+            return {"obstacles": list(self._obstacles),
+                    "geofence": self._geofence}
+
+    def sync_from_feed(self, meta):
+        """Adopt the controller's live shapes from a telemetry datagram."""
+        if not isinstance(meta, dict):
+            return
+        with self._lock:
+            if "obstacles" in meta:
+                self._obstacles = list(meta.get("obstacles") or [])
+            if "geofence" in meta:
+                self._geofence = meta.get("geofence")
+
+    def _save(self):
+        save_shapes(self.path, self._obstacles, self._geofence)
+
+    def add_obstacle(self, lat1, lon1, lat2, lon2):
+        ob = normalize_obstacle(lat1, lon1, lat2, lon2)
+        if ob is None:
+            return False
+        with self._lock:
+            if len(self._obstacles) >= MAX_OBSTACLES:
+                return False
+            ob["id"] = max([o["id"] for o in self._obstacles] or [0]) + 1
+            self._obstacles = self._obstacles + [ob]
+            self._save()
+        return True
+
+    def delete_obstacle(self, ob_id):
+        with self._lock:
+            self._obstacles = [o for o in self._obstacles if o["id"] != ob_id]
+            self._save()
+
+    def clear_obstacles(self):
+        with self._lock:
+            self._obstacles = []
+            self._save()
+
+    def set_geofence(self, vertices):
+        fence = validate_fence(vertices)
+        if fence is None:
+            return False
+        with self._lock:
+            self._geofence = fence
+            self._save()
+        return True
+
+    def clear_geofence(self):
+        with self._lock:
+            self._geofence = None
+            self._save()
+
+
+def udp_listener(state, host, port, shapes=None):
     """Receive telemetry datagrams from the flight controller forever."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -97,12 +181,15 @@ def udp_listener(state, host, port):
     while True:
         try:
             data, _ = sock.recvfrom(65535)
-            state.update(json.loads(data.decode("utf-8")))
+            payload = json.loads(data.decode("utf-8"))
+            state.update(payload)
+            if shapes is not None:
+                shapes.sync_from_feed(payload.get("meta"))
         except Exception:
             continue  # ignore malformed packets, keep listening
 
 
-def make_handler(state, cmd_sock=None, cmd_addr=None):
+def make_handler(state, cmd_sock=None, cmd_addr=None, shapes=None):
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype):
             self.send_response(code)
@@ -119,7 +206,13 @@ def make_handler(state, cmd_sock=None, cmd_addr=None):
             path = self.path.split("?", 1)[0]
 
             if path == "/telemetry":
-                body = json.dumps(state.snapshot()).encode("utf-8")
+                snap = state.snapshot()
+                # Shapes come from the GUI's own store (seeded from
+                # shapes.json, synced from the controller's echo while one is
+                # running) so they stay visible with no controller at all.
+                if shapes is not None:
+                    snap["shapes"] = shapes.get()
+                body = json.dumps(snap).encode("utf-8")
                 self._send(200, body, "application/json")
                 return
 
@@ -143,7 +236,8 @@ def make_handler(state, cmd_sock=None, cmd_addr=None):
 
         def do_POST(self):
             # The only POST route: swarm controls (Start/Stop buttons, gimbal
-            # pitch slider, heading mode + point-inwards toggles). We forward
+            # pitch slider, heading mode + point-inwards toggles, obstacle/
+            # geofence edits drawn on the map). We forward
             # the action to the flight controller
             # (swarm_flocking.py) as a local UDP datagram on the command port.
             # This server never touches ds_wrapper.
@@ -179,6 +273,42 @@ def make_handler(state, cmd_sock=None, cmd_addr=None):
             elif action == "point_inwards":
                 # Convex-hull facing toggle: boundary drones face the centroid.
                 out = {"action": "point_inwards", "value": bool(msg.get("value"))}
+            elif action == "add_obstacle":
+                # Rectangular virtual obstacle: two opposite corners drawn on
+                # the map. Applied to the GUI's own store (validated + saved
+                # to shapes.json — works with no controller) and forwarded so
+                # a running controller applies the identical edit.
+                corners = {k: msg.get(k) for k in ("lat1", "lon1", "lat2", "lon2")}
+                if shapes is None or not shapes.add_obstacle(**corners):
+                    self._send(400, b'{"ok":false,"error":"bad value"}', "application/json")
+                    return
+                out = {k: float(v) for k, v in corners.items()}
+                out["action"] = "add_obstacle"
+            elif action == "delete_obstacle":
+                try:
+                    ob_id = int(msg.get("id"))
+                except (TypeError, ValueError):
+                    self._send(400, b'{"ok":false,"error":"bad value"}', "application/json")
+                    return
+                if shapes is not None:
+                    shapes.delete_obstacle(ob_id)
+                out = {"action": "delete_obstacle", "id": ob_id}
+            elif action == "clear_obstacles":
+                if shapes is not None:
+                    shapes.clear_obstacles()
+                out = {"action": action}
+            elif action == "clear_geofence":
+                if shapes is not None:
+                    shapes.clear_geofence()
+                out = {"action": action}
+            elif action == "set_geofence":
+                # Geofence polygon: ordered [lat, lon] vertex list.
+                fence = validate_fence(msg.get("vertices"))
+                if fence is None or shapes is None:
+                    self._send(400, b'{"ok":false,"error":"bad vertices"}', "application/json")
+                    return
+                shapes.set_geofence(fence)
+                out = {"action": "set_geofence", "vertices": fence}
             else:
                 self._send(400, b'{"ok":false,"error":"bad action"}', "application/json")
                 return
@@ -210,6 +340,12 @@ def main():
     ap.add_argument("--cmd-port", type=int, default=5098,
                     help="UDP port the controller listens on for Start/Stop "
                          "commands (match swarm_flocking.py --cmd-port)")
+    ap.add_argument("--shapes-file", default=DEFAULT_SHAPES_FILE,
+                    metavar="PATH",
+                    help="JSON file the drawn obstacles/geofence persist to "
+                         f"(default {DEFAULT_SHAPES_FILE}; relative paths "
+                         "resolve against this script's directory — keep it "
+                         "matching swarm_flocking.py --shapes-file)")
     ap.add_argument("--open", action="store_true",
                     help="Open the GUI in the default browser on startup")
     args = ap.parse_args()
@@ -219,8 +355,17 @@ def main():
 
     state = SwarmState()
 
+    shapes_path = args.shapes_file
+    if not os.path.isabs(shapes_path):
+        shapes_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), shapes_path)
+    shapes = ShapesStore(shapes_path)
+    loaded = shapes.get()
+    print(f"  Shapes: {len(loaded['obstacles'])} obstacle(s), "
+          f"geofence {'set' if loaded['geofence'] else 'none'} ({shapes_path})")
+
     t = threading.Thread(target=udp_listener,
-                         args=(state, args.udp_host, args.udp_port),
+                         args=(state, args.udp_host, args.udp_port, shapes),
                          daemon=True, name="UdpTelemetryListener")
     t.start()
 
@@ -231,7 +376,7 @@ def main():
     cmd_addr = (args.cmd_host, args.cmd_port)
 
     httpd = ThreadingHTTPServer((args.http_host, args.http_port),
-                                make_handler(state, cmd_sock, cmd_addr))
+                                make_handler(state, cmd_sock, cmd_addr, shapes))
     url = f"http://{'127.0.0.1' if args.http_host in ('0.0.0.0', '') else args.http_host}:{args.http_port}"
     print("LIS_Swarm GUI server")
     print(f"  Open: {url}")
