@@ -451,8 +451,16 @@ public class SwarmActivity extends Activity {
                 // a smooth yaw rate; vsYaw is deg/s. (See the yaw note in CLAUDE.md.)
                 param.setYawControlMode(YawControlMode.ANGULAR_VELOCITY);
                 param.setVerticalControlMode(VerticalControlMode.POSITION);
-                param.setPitch(vsPitch);
-                param.setRoll(vsRoll);
+                // AXIS NOTE: in GROUND + VELOCITY on this Mini 3 Pro / MSDK v5,
+                // the DJI pitch axis moves the aircraft EAST and the roll axis
+                // moves it NORTH — the transpose of the naive assumption. Verified
+                // by the 2026-07-05 rotation-check: with pitch<-north/roll<-east
+                // every drone flew east on a north command and north on an east
+                // command, identically at west/north/south headings (heading-
+                // independent => world frame, but N/E swapped). So feed the
+                // protocol's EAST field to setPitch and its NORTH field to setRoll.
+                param.setPitch(vsRoll);   // vsRoll  = protocol EAST  field -> DJI pitch(E)
+                param.setRoll(vsPitch);   // vsPitch = protocol NORTH field -> DJI roll(N)
                 param.setYaw(vsYaw);
                 param.setVerticalThrottle(vsThrottle);
 

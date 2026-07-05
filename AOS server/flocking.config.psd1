@@ -39,7 +39,7 @@
     # Slow test mode: uniformly scale ALL commanded velocities + the yaw/climb
     # rates for slow, controlled tuning. 1.0 = full speed; e.g. 0.3 = 30%.
     # CLI: -Slow
-    Slow = 0.2
+    Slow = 1.0
 
     # Initial gimbal pitch/tilt (deg) for every drone and the GUI slider's start
     # position. DJI Mini 3 Pro range [-90 (down), 60 (up)]. CLI: -GimbalPitch
@@ -65,7 +65,7 @@
 
     # Minimum-separation failsafe (physical metres): swarming auto-STOPs if
     # any drone pair gets closer than this. 0 disables. CLI: -MinSeparation
-    MinSeparation = 3.0
+    MinSeparation = 2.5
 
     # Skip the browser-GUI map pane and pass --no-gui to the controller so it
     # does not push telemetry. CLI: -NoGui

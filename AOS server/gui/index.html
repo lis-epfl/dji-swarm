@@ -224,7 +224,7 @@
     <button id="btn-stop" class="swarm-btn" disabled
             title="Stop swarming — drones hold position (disarms Virtual Stick)">&#9632; Stop swarming</button>
     <button id="btn-rotcheck"
-            title="Open-loop actuation check (run while HOLDING, drones well separated): each drone in turn flies a short pulse north then east at its current altitude; the GPS track gives a per-drone rotation/gain verdict (OK / SKEWED / ROTATED / DEAD). Any verdict other than OK means the drone executes commands in the wrong direction — do NOT start swarming with it.">&#10227; Rotation check</button>
+            title="Open-loop actuation check (run while HOLDING, drones well separated): each drone in turn flies a short pulse north then east at its current altitude; the GPS track gives a per-drone rotation/gain verdict (OK / SKEWED / ROTATED / SWAPPED / DEAD). Any verdict other than OK means the drone executes commands in the wrong direction — do NOT start swarming with it.">&#10227; Rotation check</button>
     <label id="heading-ctl"
            title="Heading control: Manual = joystick yaw steers a shared target heading; Convex hull = drones on the swarm's outer ring face outward (GLOBAL_CONVEXHULL), interior drones hold heading, stick yaw is ignored">
       Heading

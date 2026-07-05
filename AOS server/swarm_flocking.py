@@ -218,14 +218,14 @@ def swarm_mean_heading(swarm):
 
 
 def d_ref_from_ax(ax, scale=10.0):
-    """Map angular.x ∈ [0.6, 1.4] → scaled d_ref ∈ [0.5, 1.0].
+    """Map angular.x ∈ [0.6, 1.4] → scaled d_ref ∈ [0.4, 1.2].
 
     The OlfatiSaber math operates in scaled units (ScaleFactor=10 by default),
     so the returned d_ref is divided by `scale` to match. Physical spacing
     sits roughly at `d_ref * scale + 2.58 m` (the cohesion well's equilibrium
     is offset slightly from d_ref by the (a-b)/2 term in ψ')."""
     ax = max(0.6, min(1.4, ax))
-    physical = 5.0 + (ax - 0.6) * 6.25     # 5 .. 10 m physical
+    physical = 4.0 + (ax - 0.6) * 10.0     # 4 .. 12 m physical
     return physical / scale
 
 
@@ -454,7 +454,10 @@ class RotationProbe:
 
         OK       |rot| <= PROBE_OK_DEG and gain healthy
         SKEWED   PROBE_OK_DEG < |rot| <= PROBE_ROTATED_DEG
-        ROTATED  |rot| > PROBE_ROTATED_DEG   (the 2026-07-05 failure mode)
+        ROTATED  |rot| > PROBE_ROTATED_DEG
+        SWAPPED  N command flew east and E command flew north — the DJI GROUND
+                 pitch/roll (N/E) axes are transposed (the 2026-07-05 failure
+                 mode; fixed app-side, this catches a regression)
         DEAD     gain < PROBE_MIN_GAIN        (didn't follow at all)
         VS FAIL  vs_enabled never went true after ENABLE_VS
         NO GPS   no usable fix; drone skipped entirely
@@ -646,24 +649,53 @@ class RotationProbe:
 
     def _evaluate(self):
         """Least-squares rotation+gain from the two pulse displacements
-        (complex n + 1j*e; same convention as ResponseMonitor)."""
+        (complex n + 1j*e; same convention as ResponseMonitor), plus an
+        explicit North<->East axis-swap check.
+
+        A pure axis swap (the 2026-07-05 failure: DJI's GROUND pitch axis drives
+        EAST and roll drives NORTH, so a north command flies east and vice-versa)
+        makes the two pulses' contributions cancel in the rotation fit and
+        deflates the gain to ~0 — it reads as DEAD with a garbage angle even
+        though each axis actually followed at ~unity gain. So test for the swap
+        directly (N command landing on the E axis and E command on the N axis,
+        both with healthy gain) and report SWAPPED before the DEAD fallthrough.
+        """
         L = PROBE_SPEED_MPS * PROBE_PULSE_S
-        num_re = num_im = den = 0.0
-        used = 0
-        for phase, (cn, ce) in (("pulse_n", (L, 0.0)), ("pulse_e", (0.0, L))):
+        # Per-pulse world displacement, keyed by commanded axis.
+        meas = {}
+        for phase in ("pulse_n", "pulse_e"):
             p0 = self._disp.get(phase + "_start")
             p1 = self._disp.get(phase + "_end")
             if p0 is None or p1 is None:
                 continue
-            dn, de = gps_to_local(p1[0], p1[1], p0[0], p0[1])
+            meas[phase] = gps_to_local(p1[0], p1[1], p0[0], p0[1])
+        if not meas:
+            return None, None, "NO GPS"
+
+        num_re = num_im = den = 0.0
+        for phase, (cn, ce) in (("pulse_n", (L, 0.0)), ("pulse_e", (0.0, L))):
+            if phase not in meas:
+                continue
+            dn, de = meas[phase]
             num_re += dn * cn + de * ce
             num_im += de * cn - dn * ce
             den += cn * cn + ce * ce
-            used += 1
-        if used == 0 or den <= 0.0:
-            return None, None, "NO GPS"
         rot = math.degrees(math.atan2(num_im, num_re))
         gain = math.hypot(num_re, num_im) / den
+
+        # Axis-swap check (needs both pulses): the N command must land mostly on
+        # the E axis and the E command mostly on the N axis, each at a healthy
+        # gain. A true ~90 deg rotation instead sends E south (dn_e < 0), so it
+        # fails the sign test here and falls through to ROTATED below.
+        if "pulse_n" in meas and "pulse_e" in meas:
+            dn_n, de_n = meas["pulse_n"]
+            dn_e, de_e = meas["pulse_e"]
+            g_swap_n = de_n / L      # north command -> east response
+            g_swap_e = dn_e / L      # east command  -> north response
+            if (g_swap_n >= PROBE_MIN_GAIN and g_swap_e >= PROBE_MIN_GAIN
+                    and abs(de_n) > abs(dn_n) and abs(dn_e) > abs(de_e)):
+                return 90.0, 0.5 * (g_swap_n + g_swap_e), "SWAPPED"
+
         if gain < PROBE_MIN_GAIN:
             return rot, gain, "DEAD"
         if abs(rot) <= PROBE_OK_DEG:

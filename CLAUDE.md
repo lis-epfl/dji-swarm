@@ -201,6 +201,16 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   world→body in Python before filling pitch/roll** — doing so double-rotates and the
   drone scrambles directions at any heading ≠ 0. Telemetry `vx/vy/vz` are NED world-frame
   too. If anyone changes the app back to BODY mode, this whole assumption breaks.
+  **DJI axis transpose (do NOT "fix" it back):** on this Mini 3 Pro / MSDK v5 combo the
+  GROUND-frame `param.setPitch(...)` actually drives the aircraft **EAST** and `setRoll(...)`
+  drives it **NORTH** — the transpose of the obvious mapping. So `SwarmActivity`'s send loop
+  deliberately feeds the protocol's **east** field to `setPitch` and its **north** field to
+  `setRoll`. Verified by the 2026-07-05 rotation-check: with the naive pitch←north/roll←east,
+  every drone flew east on a north command and north on an east command, *identically at west/
+  north/south headings* (heading-independent ⇒ still world frame, just N/E swapped — not a
+  compass/body-frame problem). The Python side and the `VS:` protocol keep pitch=north/
+  roll=east; only the app's DJI binding is transposed. Reverting `setPitch`/`setRoll` to the
+  "matching" fields reintroduces the 90° swap.
 - **Yaw is a RATE, not an angle (read before touching yaw).** The app's VS yaw channel is
   `YawControlMode.ANGULAR_VELOCITY`, so the `VS:` `yaw` field is **deg/s**, not an absolute
   heading. ANGLE mode (the old default) fed the FC's position controller a stepped heading
