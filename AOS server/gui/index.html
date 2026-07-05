@@ -145,6 +145,16 @@
   #banner .chip.swarm-on  { background: rgba(63,185,80,.18);  color: #7ee787; border-color: rgba(63,185,80,.45); }
   #banner .chip.swarm-off { background: rgba(139,148,158,.16); color: var(--muted); }
   #banner .chip.fence-warn { background: rgba(248,81,73,.18); color: #ff938c; border-color: rgba(248,81,73,.45); }
+  /* Rotation-check chip + per-drone response colors */
+  #banner .chip.rot-run  { background: rgba(63,192,255,.16);  color: #7cd6ff; border-color: rgba(63,192,255,.45); }
+  #banner .chip.rot-ok   { background: rgba(63,185,80,.18);   color: #7ee787; border-color: rgba(63,185,80,.45); }
+  #banner .chip.rot-bad  { background: rgba(248,81,73,.18);   color: #ff938c; border-color: rgba(248,81,73,.45); }
+  .v.rot-ok   { color: #5cf2a6; }
+  .v.rot-warn { color: #ffd23f; }
+  .v.rot-bad  { color: #ff938c; font-weight: 700; }
+  .pill.rot-ok   { background: rgba(63,185,80,.18);  color: #7ee787; }
+  .pill.rot-warn { background: rgba(255,210,63,.16); color: #ffd23f; }
+  .pill.rot-bad  { background: rgba(248,81,73,.18);  color: #ff938c; }
 
   /* Red ✕ overlaid on a geofence-breached (VS-disabled) drone's marker. */
   .drone-x { position: absolute; top: 0; left: 0; width: 40px; height: 40px;
@@ -168,6 +178,22 @@
   .dist-label.dist-off { color: #ffd23f; border-color: rgba(255,210,63,.55); }
 
   .leaflet-container { background: #0d1117; }
+
+  /* ---- cohesion-force plot (bottom-right; port of Unity TuneOlfatiSaber) ---- */
+  /* Sits just left of the status panel (width 300 + margins) so it reads as the
+     map's bottom-right corner without covering the cards. */
+  #cohesion-panel {
+    position: absolute; right: 320px; bottom: 10px; z-index: 1000; width: 380px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: 0 2px 14px rgba(0,0,0,.5); padding: 8px 10px 6px;
+    display: flex; flex-direction: column; gap: 5px;
+  }
+  #cohesion-panel .cp-hd { display: flex; justify-content: space-between;
+    align-items: baseline; font-size: 12px; font-weight: 700; letter-spacing: .3px; }
+  #cohesion-panel .cp-sub { color: var(--muted); font-weight: 400; font-size: 11px;
+    font-variant-numeric: tabular-nums; }
+  #cp-canvas { width: 100%; height: 210px; display: block; }
+  @media (max-width: 760px) { #cohesion-panel { right: 10px; } }
 </style>
 </head>
 <body>
@@ -180,6 +206,7 @@
     <span class="chip" id="heading-chip" style="display:none"></span>
     <span class="chip" id="swarm-chip" style="display:none"></span>
     <span class="chip" id="fence-chip" style="display:none"></span>
+    <span class="chip" id="rotcheck-chip" style="display:none"></span>
   </div>
 
   <div id="panel">
@@ -196,6 +223,8 @@
             title="Start sending swarming commands (arms Virtual Stick)">&#9654; Start swarming</button>
     <button id="btn-stop" class="swarm-btn" disabled
             title="Stop swarming — drones hold position (disarms Virtual Stick)">&#9632; Stop swarming</button>
+    <button id="btn-rotcheck"
+            title="Open-loop actuation check (run while HOLDING, drones well separated): each drone in turn flies a short pulse north then east at its current altitude; the GPS track gives a per-drone rotation/gain verdict (OK / SKEWED / ROTATED / DEAD). Any verdict other than OK means the drone executes commands in the wrong direction — do NOT start swarming with it.">&#10227; Rotation check</button>
     <label id="heading-ctl"
            title="Heading control: Manual = joystick yaw steers a shared target heading; Convex hull = drones on the swarm's outer ring face outward (GLOBAL_CONVEXHULL), interior drones hold heading, stick yaw is ignored">
       Heading
@@ -220,9 +249,21 @@
     <button id="btn-finish-fence" style="display:none"
             title="Close the geofence polygon with the vertices placed so far">Finish fence</button>
     <button id="btn-clear-fence" title="Remove the geofence">Clear fence</button>
+    <button id="btn-cohesion"
+            title="Toggle the live Olfati-Saber cohesion-force curve (bottom-right): the spacing potential vs inter-drone distance for the current tuning, with each drone pair's present distance marked on the curve">&#128200; Cohesion plot</button>
     <button id="btn-recenter" title="Fit the map to all drones">Recenter on swarm</button>
     <button id="btn-epfl" title="Jump back to EPFL Lausanne">EPFL</button>
     <label><input type="checkbox" id="chk-follow" /> Follow swarm</label>
+  </div>
+
+  <!-- Live cohesion-force plot (port of Unity TuneOlfatiSaber.cs). Hidden until
+       toggled; drawn client-side from meta.olfati + meta.d_ref_m each poll. -->
+  <div id="cohesion-panel" style="display:none">
+    <div class="cp-hd">
+      <span>Cohesion force &nbsp;<span style="color:var(--muted);font-weight:400">F(distance)</span></span>
+      <span class="cp-sub" id="cp-sub"></span>
+    </div>
+    <canvas id="cp-canvas"></canvas>
   </div>
 
 <script>
@@ -322,7 +363,18 @@ function hzCell(v, target) {
 }
 
 // ---- status cards ----
-function renderCard(id, rec, status, onHull, fenced) {
+
+// Verdict/rotation color: OK green, SKEWED yellow, everything else red.
+function rotClass(rot, verdict) {
+  if (verdict === 'OK') return 'rot-ok';
+  if (verdict === 'SKEWED') return 'rot-warn';
+  if (verdict) return 'rot-bad';
+  // live fit (no verdict): color by |rot| like the probe thresholds
+  if (!Number.isFinite(rot)) return '';
+  return Math.abs(rot) <= 25 ? 'rot-ok' : (Math.abs(rot) <= 60 ? 'rot-warn' : 'rot-bad');
+}
+
+function renderCard(id, rec, status, onHull, fenced, resp, rotRes) {
   const t = rec.telem || {};
   const age = rec.age;
   const color = colorFor(id);
@@ -338,13 +390,29 @@ function renderCard(id, rec, status, onHull, fenced) {
               ? Math.hypot(t.vx, t.vy) : null;
   const vsOn = !!t.vs_enabled;
 
+  // Command->response line: the live ResponseMonitor fit while swarming, and
+  // the last Rotation-check verdict while holding. rot 0° / gain 1 = healthy.
+  const rr = rotRes || null;              // {rot, gain, verdict} from the probe
+  const lv = resp || null;                // {rot, gain} live fit
+  let respCell = '<span class="v">—</span>';
+  let rotPill = '';
+  if (lv && Number.isFinite(lv.rot)) {
+    respCell = `<span class="v ${rotClass(lv.rot, null)}" title="Live fit: rotation between sent velocity commands and the GPS track (0° / gain 1 = healthy)">${lv.rot > 0 ? '+' : ''}${lv.rot.toFixed(0)}° ×${lv.gain.toFixed(2)}</span>`;
+  } else if (rr) {
+    respCell = `<span class="v ${rotClass(rr.rot, rr.verdict)}" title="Last rotation-check result">${Number.isFinite(rr.rot) ? (rr.rot > 0 ? '+' : '') + rr.rot.toFixed(0) + '° ×' + rr.gain.toFixed(2) : rr.verdict}</span>`;
+  }
+  if (rr && rr.verdict && rr.verdict !== 'OK') {
+    rotPill = `<span class="pill ${rotClass(rr.rot, rr.verdict)}" style="margin-left:0" title="Rotation check: this drone did not fly its commands correctly — do not start swarming with it">${rr.verdict}</span>`;
+  }
+
   card.innerHTML = `
     <div class="hdr">
       <span class="badge" style="background:${color}">${id}</span>
       <span class="name">Drone ${id}</span>
       ${fenced ? '<span class="pill fenced" style="margin-left:auto" title="Crossed outside the geofence — VS disabled, out of the flock; Stop then Start swarming to re-admit">FENCED OUT</span>' : ''}
       ${onHull ? `<span class="pill hull" ${fenced ? '' : 'style="margin-left:auto"'} title="On the swarm\'s convex hull — hull heading control is steering this drone">HULL</span>` : ''}
-      <span class="pill ${pill[0]}" ${(onHull || fenced) ? 'style="margin-left:0"' : ''}>${pill[1]}</span>
+      ${rotPill}
+      <span class="pill ${pill[0]}" ${(onHull || fenced || rotPill) ? 'style="margin-left:0"' : ''}>${pill[1]}</span>
     </div>
     <div class="grid">
       <span class="k">Alt</span>     <span class="v">${fmt(t.alt, 1, ' m')}</span>
@@ -353,6 +421,7 @@ function renderCard(id, rec, status, onHull, fenced) {
       <span class="k">Climb</span>   <span class="v">${fmt(t.vz, 2, ' m/s')}</span>
       <span class="k">Sats</span>    <span class="v">${Number.isFinite(t.sat_count) ? t.sat_count : '—'}</span>
       <span class="k">VS</span>      <span class="v ${vsOn ? 'vs-on' : 'vs-off'}">${vsOn ? 'ENABLED' : 'off'}</span>
+      <span class="k">Cmd&rarr;resp</span> ${respCell}
       <span class="k">Cmd rate</span>   ${hzCell(rec.send_hz, 20)}
       <span class="k">Telem rate</span> ${hzCell(rec.recv_hz, 10)}
       <span class="k">Link</span>    <span class="v">${fmt(age, 1, ' s')}</span>
@@ -519,6 +588,37 @@ function render(data) {
   bStart.disabled = swarming;
   bStop.disabled = !swarming;
 
+  // ----- rotation check (open-loop actuation probe) -----
+  const rc = meta.rotation_check || null;
+  const rcRunning = !!(rc && rc.state === 'running');
+  const bRot = document.getElementById('btn-rotcheck');
+  bRot.disabled = swarming || rcRunning || !feedLive;
+  const rcChip = document.getElementById('rotcheck-chip');
+  if (rc && feedLive) {
+    rcChip.style.display = '';
+    const res = rc.results || {};
+    if (rcRunning) {
+      const done = Object.keys(res).length;
+      rcChip.className = 'chip rot-run';
+      rcChip.textContent = `Rot check: drone ${rc.drone == null ? '—' : rc.drone} ${rc.phase || ''} (${done} done)`;
+    } else if (rc.state === 'refused') {
+      rcChip.className = 'chip rot-bad';
+      rcChip.textContent = `Rot check refused — ${rc.msg || ''}`;
+    } else {   // done
+      const verdicts = Object.values(res).map(r => r.verdict);
+      const bad = verdicts.filter(v => v !== 'OK').length;
+      rcChip.className = 'chip ' + (bad ? 'rot-bad' : 'rot-ok');
+      rcChip.textContent = bad
+        ? `Rot check: ${bad}/${verdicts.length} NOT OK — see cards`
+        : `Rot check: all ${verdicts.length} OK`;
+    }
+  } else {
+    rcChip.style.display = 'none';
+  }
+  // Per-drone data for the cards: live fit while swarming, probe verdicts after.
+  const respMap = meta.resp || {};
+  const rotResults = (rc && rc.results) || {};
+
   const drones = data.drones || {};
   const ids = Object.keys(drones).sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
 
@@ -560,7 +660,8 @@ function render(data) {
 
     // Status card for everything the controller still knows about.
     if (age <= DRONE_STALE_S) cards.appendChild(
-      renderCard(id, rec, status, hullSet.has(id), fencedSet.has(id)));
+      renderCard(id, rec, status, hullSet.has(id), fencedSet.has(id),
+                 respMap[id] || null, rotResults[id] || null));
   }
 
   document.getElementById('drone-count').textContent =
@@ -587,6 +688,11 @@ function render(data) {
       linesLayer.addLayer(poly);
     }
   }
+
+  // ----- cohesion-force plot (bottom-right) -----
+  // Uses the exact tuning the controller is flying (meta.olfati) and the live
+  // physical target spacing (dref, metres); dots mark each pair's distance.
+  renderCohesionPlot(data.meta && data.meta.olfati, dref, placed);
 
   // ----- camera -----
   if (placed.length > 0) {
@@ -622,6 +728,7 @@ async function postCommand(payload) {
 }
 document.getElementById('btn-start').addEventListener('click', () => postCommand({ action: 'start' }));
 document.getElementById('btn-stop').addEventListener('click', () => postCommand({ action: 'stop' }));
+document.getElementById('btn-rotcheck').addEventListener('click', () => postCommand({ action: 'rotation_check' }));
 
 // Heading mode (manual / convex hull) + point-inwards. The controller owns the
 // live value (meta.heading_mode / meta.point_inwards); render() reflects it
@@ -783,6 +890,167 @@ window.deleteObstacle = function (id) {
   postCommand({ action: 'delete_obstacle', id: id });
   map.closePopup();   // the echo removes the rectangle on the next poll
 };
+
+// ---- cohesion-force plot (port of Unity TuneOlfatiSaber.cs) ----
+// A live plot of the Olfati-Saber spacing potential F vs inter-drone distance,
+// drawn from the SAME parameters the controller is flying (meta.olfati) and the
+// live target spacing (meta.d_ref_m). Each drone pair's current distance is
+// marked on the curve (the JS equivalent of the C# neighbour markers), so the
+// operator can see at a glance which pairs are being pulled together (F>0) or
+// pushed apart (F<0) and where the cohesion well (F=0) sits.
+const cohesionPanel = document.getElementById('cohesion-panel');
+const cpCanvas      = document.getElementById('cp-canvas');
+const btnCohesion   = document.getElementById('btn-cohesion');
+let cohesionVisible = false;
+btnCohesion.addEventListener('click', () => {
+  cohesionVisible = !cohesionVisible;
+  cohesionPanel.style.display = cohesionVisible ? '' : 'none';
+  btnCohesion.classList.toggle('armed', cohesionVisible);
+});
+
+// Olfati-Saber cohesion math, mirrored 1:1 from olfati_saber.py (scaled units:
+// r = physical_metres / scale, d_ref likewise). `o` is the meta.olfati dict.
+function osNeighbourWeight(r, r0, o) {
+  const rr = r / r0;
+  if (rr < o.delta) return 1.0;
+  if (rr < 1.0) { const a = Math.PI * (rr - o.delta) / (1 - o.delta);
+                  return Math.pow(0.5 * (1 + Math.cos(a)), 2); }
+  return 0.0;
+}
+function osNeighbourWeightDeriv(r, r0, o) {
+  const rr = r / r0;
+  if (rr < o.delta) return 0.0;
+  if (rr < 1.0) { const a = Math.PI * (rr - o.delta) / (1 - o.delta);
+                  return 0.5 * (-Math.PI) / (1 - o.delta) * (1 + Math.cos(a)) * Math.sin(a); }
+  return 0.0;
+}
+function osCohesionIntensity(r, refd, o) {
+  const diff = r - refd;
+  return ((o.a + o.b) / 2) * (Math.sqrt(1 + Math.pow(diff + o.c, 2)) - Math.sqrt(1 + o.c * o.c))
+       + ((o.a - o.b) * diff) / 2;
+}
+function osCohesionIntensityDeriv(r, refd, o) {
+  const diff = r - refd;
+  return ((o.a + o.b) / 2) * (diff + o.c) / Math.sqrt(1 + Math.pow(diff + o.c, 2))
+       + (o.a - o.b) / 2;
+}
+function osCohesionForce(r, refd, o) {
+  const r0 = o.r0_coh;
+  return (1 / r0) * osNeighbourWeightDeriv(r, r0, o) * osCohesionIntensity(r, refd, o)
+       + osNeighbourWeight(r, r0, o) * osCohesionIntensityDeriv(r, refd, o);
+}
+
+function renderCohesionPlot(o, drefM, placed) {
+  if (!cohesionVisible) return;
+  const cv = cpCanvas, ctx = cv.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = cv.clientWidth || 358, cssH = cv.clientHeight || 210;
+  if (cv.width !== Math.round(cssW * dpr) || cv.height !== Math.round(cssH * dpr)) {
+    cv.width = Math.round(cssW * dpr); cv.height = Math.round(cssH * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  const sub = document.getElementById('cp-sub');
+
+  // No swarm params yet (no controller running, or --no-gui): placeholder.
+  if (!o || !Number.isFinite(o.a)) {
+    sub.textContent = '';
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '12px "Segoe UI", system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('Waiting for swarm parameters…', cssW / 2, cssH / 2);
+    return;
+  }
+
+  const scale = Number.isFinite(o.scale) && o.scale > 0 ? o.scale : 10;
+  const drefPhys = (Number.isFinite(drefM) ? drefM : 7.0);   // physical metres
+  const drefScaled = drefPhys / scale;
+  // Physical-metre x range: always show the cohesion well (F=0 near d_ref+0.258·scale).
+  const maxD = Math.max(20, drefPhys * 3);
+
+  // Sample the curve and auto-scale the symmetric force axis to it.
+  const N = 220, fs = new Array(N);
+  let maxAbs = 1e-6;
+  for (let i = 0; i < N; i++) {
+    const dPhys = maxD * i / (N - 1);
+    const f = osCohesionForce(dPhys / scale, drefScaled, o);
+    fs[i] = f;
+    if (Number.isFinite(f)) maxAbs = Math.max(maxAbs, Math.abs(f));
+  }
+  const fRange = maxAbs * 1.15;
+
+  // Plot area (leave room for axis labels).
+  const mL = 46, mR = 12, mT = 10, mB = 26;
+  const pw = cssW - mL - mR, ph = cssH - mT - mB;
+  const x2px = d => mL + (d / maxD) * pw;
+  const f2py = f => mT + ph * 0.5 - (f / fRange) * (ph * 0.5);
+  const y0 = f2py(0);
+
+  // Grid + tick labels.
+  ctx.font = '10px "Segoe UI", system-ui, sans-serif';
+  ctx.strokeStyle = '#2a3340'; ctx.fillStyle = '#8b949e'; ctx.lineWidth = 1;
+  const xTicks = 5, yTicks = 4;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  for (let i = 0; i <= xTicks; i++) {
+    const d = maxD * i / xTicks, x = x2px(d);
+    ctx.beginPath(); ctx.moveTo(x, mT); ctx.lineTo(x, mT + ph); ctx.stroke();
+    ctx.fillText(d.toFixed(0), x, mT + ph + 4);
+  }
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  for (let i = 0; i <= yTicks; i++) {
+    const f = fRange - (2 * fRange) * i / yTicks, y = f2py(f);
+    ctx.beginPath(); ctx.moveTo(mL, y); ctx.lineTo(mL + pw, y); ctx.stroke();
+    ctx.fillText(f.toFixed(2), mL - 5, y);
+  }
+
+  // Axes: Y at x=0, and the F=0 line highlighted.
+  ctx.strokeStyle = '#586069'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(mL, mT); ctx.lineTo(mL, mT + ph); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(mL, y0); ctx.lineTo(mL + pw, y0); ctx.stroke();
+
+  // d_ref marker (vertical dashed line).
+  const xRef = x2px(drefPhys);
+  if (xRef >= mL && xRef <= mL + pw) {
+    ctx.save();
+    ctx.strokeStyle = '#9fd8ff'; ctx.setLineDash([4, 3]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(xRef, mT); ctx.lineTo(xRef, mT + ph); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = '#9fd8ff'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillText('d_ref', xRef, mT + 1);
+  }
+
+  // The cohesion-force curve (green), clipped to the plot area.
+  ctx.save();
+  ctx.beginPath(); ctx.rect(mL, mT, pw, ph); ctx.clip();
+  ctx.strokeStyle = '#5cf2a6'; ctx.lineWidth = 2; ctx.beginPath();
+  for (let i = 0; i < N; i++) {
+    const x = x2px(maxD * i / (N - 1)), y = f2py(fs[i]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.restore();
+
+  // Pair markers: each unique inter-drone distance placed on the curve.
+  let pairCount = 0;
+  ctx.fillStyle = '#ffd23f';
+  for (let i = 0; i < placed.length; i++) {
+    for (let j = i + 1; j < placed.length; j++) {
+      const dPhys = distMeters(placed[i], placed[j]);
+      if (dPhys < 0 || dPhys > maxD) continue;
+      pairCount++;
+      const x = x2px(dPhys);
+      const y = f2py(osCohesionForce(dPhys / scale, drefScaled, o));
+      if (y < mT || y > mT + ph) continue;
+      ctx.beginPath(); ctx.arc(x, y, 3, 0, 2 * Math.PI); ctx.fill();
+    }
+  }
+
+  // X-axis caption.
+  ctx.fillStyle = '#8b949e'; ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+  ctx.fillText('distance (m)', mL + pw, mT + ph + 15);
+
+  sub.textContent = `d_ref ${drefPhys.toFixed(1)} m · ${pairCount} pair${pairCount === 1 ? '' : 's'}`;
+}
 
 // ---- poll loop ----
 async function tick() {
