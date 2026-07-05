@@ -176,8 +176,22 @@ def closest_point_on_polygon(n, e, poly_ne):
 # ---------- cohesion + velocity consensus (mirrors OlfatiSaber.cs) ----------
 
 class OlfatiSaber:
-    """2D port of the Unity OlfatiSaber component. Stateless math — one
-    instance can serve the whole swarm; per-drone state comes through args."""
+    """2D port of the Unity OlfatiSaber component (vr_swarm_simulation
+    Assets/Scripts/swarm/OlfatiSaber.cs). Method names and formulas mirror the
+    C# one-to-one — when editing, diff against the C# file, NOT the paper.
+    Stateless math — one instance can serve the whole swarm; per-drone state
+    comes through args.
+
+    Not ported from the C# on purpose:
+      - Is3D=false altitude correction (c_altitude_2d pull toward the mean
+        neighbour altitude): the real drones fly a shared ABSOLUTE altitude
+        setpoint (DJI VS VerticalControlMode.POSITION), which already does
+        this job; adding the Unity term would fight that channel.
+      - gamma, lambda_obs, MaxMigrationDistance: declared in the C# but not
+        used by GetSwarmAcceleration.
+      - GetObstacleForce lives in ObstacleAvoidance below (the Unity version
+        queries the physics engine; here the shapes are explicit geometry).
+    """
 
     def __init__(self, r0_coh=150.0, delta=0.1, a=0.9, b=1.5, c=0.0,
                  c_vm=0.0, scale=10.0):
@@ -189,59 +203,63 @@ class OlfatiSaber:
         self.c_vm = c_vm
         self.scale = scale
 
-    # cohesion intensity ψ(r, d_ref)
-    def psi(self, r, d_ref):
-        diff = r - d_ref
+    # C# GetCohesionIntensity(r, ref_d)
+    def GetCohesionIntensity(self, r, ref_d):
+        diff = r - ref_d
         return (((self.a + self.b) / 2.0)
                 * (math.sqrt(1 + (diff + self.c) ** 2) - math.sqrt(1 + self.c ** 2))
                 + ((self.a - self.b) * diff) / 2.0)
 
-    # ψ'(r, d_ref)
-    def psi_prime(self, r, d_ref):
-        diff = r - d_ref
+    # C# GetCohesionIntensityDerivative(r, ref_d)
+    def GetCohesionIntensityDerivative(self, r, ref_d):
+        diff = r - ref_d
         return (((self.a + self.b) / 2.0)
                 * (diff + self.c) / math.sqrt(1 + (diff + self.c) ** 2)
                 + (self.a - self.b) / 2.0)
 
-    # neighbour weight w(r, r0)
-    def w_fn(self, r, r0):
-        rr = r / r0
-        if rr < self.delta:
+    # C# GetNeighbourWeight(r, r0)
+    def GetNeighbourWeight(self, r, r0):
+        r_ratio = r / r0
+        if r_ratio < self.delta:
             return 1.0
-        if rr < 1.0:
-            arg = math.pi * (rr - self.delta) / (1 - self.delta)
+        if r_ratio < 1.0:
+            arg = math.pi * (r_ratio - self.delta) / (1 - self.delta)
             return (0.5 * (1.0 + math.cos(arg))) ** 2
         return 0.0
 
-    # w'(r, r0)
-    def w_prime(self, r, r0):
-        rr = r / r0
-        if rr < self.delta:
+    # C# GetNeighbourWeightDerivative(r, r0)
+    def GetNeighbourWeightDerivative(self, r, r0):
+        r_ratio = r / r0
+        if r_ratio < self.delta:
             return 0.0
-        if rr < 1.0:
-            arg = math.pi * (rr - self.delta) / (1 - self.delta)
+        if r_ratio < 1.0:
+            arg = math.pi * (r_ratio - self.delta) / (1 - self.delta)
             return 0.5 * (-math.pi) / (1 - self.delta) * (1 + math.cos(arg)) * math.sin(arg)
         return 0.0
 
-    # Cohesion force scalar. Mirrors the C# verbatim, including the
-    # `1/r0_coh` term using the field (not the passed r0). Harmless here
-    # because we only call it with r0 == self.r0_coh anyway.
-    def cohesion_force(self, r, d_ref):
-        wp   = self.w_prime(r, self.r0_coh)
-        ps   = self.psi(r, d_ref)
-        ww   = self.w_fn(r, self.r0_coh)
-        psp  = self.psi_prime(r, d_ref)
-        return (1.0 / self.r0_coh) * wp * ps + ww * psp
+    # C# GetCohesionForce(r, ref_d, r0):
+    #   1/r0 * GetNeighbourWeightDerivative * GetCohesionIntensity
+    #   + GetNeighbourWeight * GetCohesionIntensityDerivative
+    def GetCohesionForce(self, r, ref_d, r0=None):
+        if r0 is None:
+            r0 = self.r0_coh
+        neighbour_weight_derivative = self.GetNeighbourWeightDerivative(r, r0)
+        cohesion_intensity = self.GetCohesionIntensity(r, ref_d)
+        neighbour_weight = self.GetNeighbourWeight(r, r0)
+        cohesion_intensity_derivative = self.GetCohesionIntensityDerivative(r, ref_d)
+        return (1.0 / r0 * neighbour_weight_derivative * cohesion_intensity
+                + neighbour_weight * cohesion_intensity_derivative)
 
-    def compute(self, self_pos_ne, self_vel_ne, neighbours, d_ref):
+    def GetSwarmAcceleration(self, self_pos_ne, self_vel_ne, neighbours, d_ref):
         """Return the world-frame swarm correction for one drone, to be ADDED
         to the joystick's desired velocity before sending to DJI VS.
 
-        Mirrors the new `OlfatiSaber.cs::GetSwarmAcceleration`:
+        Mirrors `OlfatiSaber.cs::GetSwarmAcceleration` (2D, minus the parts
+        listed in the class docstring):
             return velocityConsensus + cohesion
         where velocityConsensus sums c_vm*(v_neighbour - v_self) over neighbours
-        (pulling each drone toward its neighbours' velocities), and cohesion is
-        the σ-norm spacing potential.
+        (pulling each drone toward its neighbours' velocities), and cohesion
+        sums GetCohesionForce along each relative-position unit vector.
 
         The desired joystick velocity is NOT mixed in here — it goes straight
         to DJI VS via set_velocity, with this correction added on top.
@@ -265,22 +283,25 @@ class OlfatiSaber:
             consensus_n += self.c_vm * (n_vel[0] - vn)
             consensus_e += self.c_vm * (n_vel[1] - ve)
 
-            # Cohesion: spacing potential along the relative-position unit vector
+            # Cohesion: spacing potential along the relative-position unit
+            # vector. distance = relativePosition.magnitude / ScaleFactor
             rel_n = n_pos[0] - sn
             rel_e = n_pos[1] - se
             rel_mag = math.hypot(rel_n, rel_e)
             if rel_mag < 1e-6:
+                # Unity's Vector3.normalized is the zero vector here too
                 continue
-            r_scaled = rel_mag / self.scale
-            if r_scaled >= self.r0_coh:
-                continue  # outside cohesion well; contribution is zero anyway
-            force = self.cohesion_force(r_scaled, d_ref)
+            distance = rel_mag / self.scale
+            force = self.GetCohesionForce(distance, d_ref)
             ux = rel_n / rel_mag
             uy = rel_e / rel_mag
             coh_n += force * ux
             coh_e += force * uy
 
         return consensus_n + coh_n, consensus_e + coh_e
+
+    # Back-compat alias (pre-C#-naming callers)
+    compute = GetSwarmAcceleration
 
 
 # ---------- β-agent obstacle / geofence repulsion ----------
@@ -298,41 +319,43 @@ class ObstacleAvoidance:
     contact, decaying smoothly to exactly 0 at 5 m — commensurate with
     MAX_CMD_MPS = 6.0 and the ~1 m/s cohesion corrections.
 
-    The C# ObsVel virtual-agent velocity term is ported for fidelity but its
-    gain `c_vm_obs` defaults to 0 (the real flights run cohesion c_vm = 0
-    too), so it is inert unless deliberately enabled.
+    The C# ObsVel virtual-agent velocity term uses the SAME `c_vm` gain as the
+    cohesion velocity consensus (OlfatiSaber.cs line `c_obs * ObsCoh +
+    c_vm * ObsVel`); pass the swarm's c_vm here to match. The real flights run
+    c_vm = 0, so it is inert unless deliberately enabled.
     """
 
     def __init__(self, d_obs_m=5.0, r0_obs_m=6.0, c_obs=4.3,
-                 c_vm_obs=0.0, delta=0.1, scale=10.0):
+                 c_vm=0.0, delta=0.1, scale=10.0):
         self.scale    = scale
         self.d_obs    = d_obs_m / scale     # kernel cutoff, scaled units
         self.r0_obs   = r0_obs_m / scale    # detection radius, scaled units
         self.c_obs    = c_obs
-        self.c_vm_obs = c_vm_obs
+        self.c_vm     = c_vm
         self.delta    = delta
 
-    # σ1(z) = z / sqrt(1 + z²)  (the paper's σ_1 saturation)
+    # C# Sigma1(z) = z / sqrt(1 + z²)
     @staticmethod
-    def sigma1(z):
+    def Sigma1(z):
         return z / math.sqrt(1.0 + z * z)
 
-    # Same bump function as OlfatiSaber.w_fn (kept local so this class stays
-    # self-contained and independently testable).
-    def w_fn(self, r, r0):
-        rr = r / r0
-        if rr < self.delta:
+    # C# GetNeighbourWeight(r, r0) — same bump as OlfatiSaber's (kept local so
+    # this class stays self-contained and independently testable).
+    def GetNeighbourWeight(self, r, r0):
+        r_ratio = r / r0
+        if r_ratio < self.delta:
             return 1.0
-        if rr < 1.0:
-            arg = math.pi * (rr - self.delta) / (1 - self.delta)
+        if r_ratio < 1.0:
+            arg = math.pi * (r_ratio - self.delta) / (1 - self.delta)
             return (0.5 * (1.0 + math.cos(arg))) ** 2
         return 0.0
 
-    def repulsion(self, r):
-        """Strictly-repulsive β-agent action ψ_β (Olfati-Saber Eq. 56):
-        w(r/d_obs)·(σ1(r − d_obs) − 1). Always <= 0; exactly 0 for
-        r >= d_obs (the bump cuts). `r` in scaled units."""
-        return self.w_fn(r, self.d_obs) * (self.sigma1(r - self.d_obs) - 1.0)
+    def GetObstacleRepulsion(self, r):
+        """C# GetObstacleRepulsion(r):
+        GetNeighbourWeight(r, d_obs)·(Sigma1(r − d_obs) − 1). Always <= 0;
+        exactly 0 for r >= d_obs (the bump cuts). `r` in scaled units."""
+        return (self.GetNeighbourWeight(r, self.d_obs)
+                * (self.Sigma1(r - self.d_obs) - 1.0))
 
     def beta_force(self, pos_ne, vel_ne, closest_ne, inside=False):
         """One β-agent contribution from a closest obstacle point.
@@ -345,7 +368,8 @@ class ObstacleAvoidance:
                         then maximal and flipped to push OUT toward that
                         nearest-edge point instead of away from it.
 
-        Returns (fn, fe) world N/E m/s: c_obs·ObsCoh + c_vm_obs·ObsVel.
+        Returns (fn, fe) world N/E m/s: c_obs·ObsCoh + c_vm·ObsVel
+        (the C# GetObstacleForce return line).
         """
         dn = closest_ne[0] - pos_ne[0]
         de = closest_ne[1] - pos_ne[1]
@@ -361,7 +385,7 @@ class ObstacleAvoidance:
             ue = de / dist_m
         else:
             return 0.0, 0.0  # degenerate (on the boundary): no defined direction
-        rep = self.repulsion(r)          # <= 0
+        rep = self.GetObstacleRepulsion(r)   # <= 0
         if inside:
             rep = -rep                   # push TOWARD the nearest edge (= out)
         coh_n = rep * un
@@ -371,7 +395,7 @@ class ObstacleAvoidance:
         # positions so s/s_der match the C# scaled frame; inert at gain 0).
         vel_n = 0.0
         vel_e = 0.0
-        if self.c_vm_obs != 0.0:
+        if self.c_vm != 0.0:
             vn_s = vel_ne[0] / self.scale
             ve_s = vel_ne[1] / self.scale
             s = 1.0 / (r + 1.0)
@@ -381,8 +405,8 @@ class ObstacleAvoidance:
             vel_n = ((s - 1.0) * vn_s - (s_der / s) * un) * self.scale
             vel_e = ((s - 1.0) * ve_s - (s_der / s) * ue) * self.scale
 
-        return (self.c_obs * coh_n + self.c_vm_obs * vel_n,
-                self.c_obs * coh_e + self.c_vm_obs * vel_e)
+        return (self.c_obs * coh_n + self.c_vm * vel_n,
+                self.c_obs * coh_e + self.c_vm * vel_e)
 
     def rect_force(self, pos_ne, vel_ne, rect_ne):
         """Repulsion from one axis-aligned rect (n_min, n_max, e_min, e_max)."""
@@ -403,8 +427,10 @@ class ObstacleAvoidance:
         cn, ce, _ = closest_point_on_polygon(pos_ne[0], pos_ne[1], poly_ne)
         return self.beta_force(pos_ne, vel_ne, (cn, ce), inside=False)
 
-    def compute(self, pos_ne, vel_ne, rects_ne, fence_ne=None):
-        """Total obstacle + geofence force for one drone.
+    def GetObstacleForce(self, pos_ne, vel_ne, rects_ne, fence_ne=None):
+        """Total obstacle + geofence force for one drone (C# GetObstacleForce;
+        the Unity version finds obstacles via Physics.OverlapSphere — here the
+        rects/fence come in as explicit geometry).
 
         Args:
             pos_ne:   (n, e) metres
@@ -425,6 +451,9 @@ class ObstacleAvoidance:
             total_n += fn
             total_e += fe
         return total_n, total_e
+
+    # Back-compat alias (pre-C#-naming callers)
+    compute = GetObstacleForce
 
 
 # ---------- shape validation + shapes.json persistence ----------

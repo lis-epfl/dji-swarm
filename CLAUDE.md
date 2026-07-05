@@ -61,7 +61,17 @@ no video.
   `PostMessage` calls target this app's `WM_PYWRAPPER_*` message handlers.
 - **Python control scripts** (run against the built `ds_wrapper.*.pyd`):
   - `joystick_controller.py` — primary single-drone joystick driver (UDP joystick or `--cli`).
-  - `swarm_flocking.py` — multi-drone Olfati-Saber flocking from one joystick.
+  - `swarm_flocking.py` — multi-drone Olfati-Saber flocking from one joystick. Also
+    hosts `RotationProbe` — the GUI's **Rotation check** button: while swarming is HELD,
+    each drone in turn is VS-armed and flies a 0.6 m/s open-loop pulse north then east
+    at its current altitude; the GPS displacement gives a per-drone rotation/gain
+    verdict (OK / SKEWED / ROTATED / DEAD / VS FAIL, in `meta["rotation_check"]` and the
+    flight log). Run it before Start — any verdict other than OK means that aircraft
+    executes velocity commands in the wrong direction (2026-07-05 flight: several
+    aircraft flew commands rotated 90–180°, suspected FC compass/yaw error, so the
+    cohesion loop closed with flipped sign → one drone ejected + pair collapse to the
+    min-sep failsafe). Deliberately NOT `--slow`-scaled (needs ~2 m displacement to
+    clear GPS noise); refuses to run if any pair is closer than min-separation + ~5 m.
   - `olfati_saber.py` — the flocking math, extracted from `swarm_flocking.py`: the
     `OlfatiSaber` cohesion/velocity-consensus class, plus `ObstacleAvoidance` — a port of
     the Unity sim's `GetObstacleForce` β-agent term for 2D **virtual obstacles** (axis-
@@ -87,6 +97,13 @@ no video.
     settings owned by the GUI** (Heading selector in `swarm_gui.py`'s controls bar →
     `/command` POST → UDP :5098 → `command_listener` → `meta["heading_mode"]`); the
     `--heading`/`--point-inwards` CLI flags only seed them. Pure Python, no `ds_wrapper` import.
+  - `response_monitor.py` — pure module: `ResponseMonitor`, a sliding-window
+    least-squares fit of the rotation+gain between the velocity commands actually sent
+    to each drone (post `--slow`) and its GPS-derived velocity (healthy ≈ 0° / gain 1).
+    Fed by the flocking loop while swarming, logged to `swarm_debug.csv`
+    (`resp_rot_deg`/`resp_gain`) and shown live in the GUI drone cards
+    (`meta["resp"]`), so a drone executing commands in the wrong frame is visible
+    in-flight instead of only in offline log analysis. No `ds_wrapper` import.
   - `udp_joystick_receiver.py` — receives joystick JSON over UDP :5055 (used by the above).
   - `joyreporter.py` — pygame joystick debug readout.
   - `swarm_gui.py` — browser GUI server: a satellite map (default EPFL Lausanne) showing

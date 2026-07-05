@@ -273,6 +273,11 @@ def make_handler(state, cmd_sock=None, cmd_addr=None, shapes=None):
             elif action == "point_inwards":
                 # Convex-hull facing toggle: boundary drones face the centroid.
                 out = {"action": "point_inwards", "value": bool(msg.get("value"))}
+            elif action == "rotation_check":
+                # Open-loop actuation probe: forwarded as a plain request; the
+                # controller runs it only while swarming is held and reports
+                # progress/results back via meta.rotation_check.
+                out = {"action": "rotation_check"}
             elif action == "add_obstacle":
                 # Rectangular virtual obstacle: two opposite corners drawn on
                 # the map. Applied to the GUI's own store (validated + saved

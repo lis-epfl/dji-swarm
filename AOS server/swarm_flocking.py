@@ -100,6 +100,7 @@ from olfati_saber import (
 )
 from image_stream_feed import ImageStreamPublisher
 from mqtt_command_sender import MqttCommandSender
+from response_monitor import ResponseMonitor
 from joystick_controller import (
     DroneController,
     SwarmController,
@@ -154,6 +155,28 @@ DEFAULT_MIN_SEPARATION_M = 3.0
 # an RC broker. The server's fallback send path takes ~220 ms per command
 # (connect -> publish -> disconnect); 2 s absorbs a slow broker comfortably.
 IDCHECK_TIMEOUT_S = 2.0
+
+# ---- Rotation check (open-loop actuation probe; GUI "Rotation check") ----
+# One drone at a time: enable VS, fly a short pulse NORTH then EAST at the
+# drone's current altitude, measure the GPS displacement of each pulse, and
+# fit rotation+gain between commanded and flown direction. Added after the
+# 2026-07-05 flight where several aircraft executed velocity commands rotated
+# 90-180° (suspected FC yaw/compass error) and the defect was only visible in
+# offline analysis. Deliberately NOT scaled by --slow: the measurement needs
+# ~2 m of displacement to stand clear of GPS noise.
+PROBE_SPEED_MPS = 0.6         # pulse speed (m/s)
+PROBE_PULSE_S = 3.0           # pulse duration -> ~1.8 m per axis
+PROBE_ENABLE_S = 1.5          # wait after ENABLE_VS before pulsing
+PROBE_SETTLE_S = 2.0          # brake/settle after each pulse
+PROBE_LAG_S = 0.6             # actuation+GPS lag: sample positions this late
+PROBE_OK_DEG = 25.0           # |rot| <= this -> OK
+PROBE_ROTATED_DEG = 60.0      # |rot| > this -> ROTATED (in between: SKEWED)
+PROBE_MIN_GAIN = 0.3          # gain below this -> DEAD (didn't follow at all)
+# Worst-case travel of one drone over the whole check is
+# sqrt(2)*PROBE_SPEED*PROBE_PULSE_S; two drones probed in successive turns can
+# close twice that, so refuse to start unless every pair has this much room
+# beyond the min-separation failsafe distance.
+PROBE_CLEARANCE_M = 2.0 * 1.4142 * PROBE_SPEED_MPS * PROBE_PULSE_S
 
 
 # ---------- helpers ----------
@@ -419,6 +442,260 @@ def run_identity_check(swarm, cmd_sender, logger=None, timeout=IDCHECK_TIMEOUT_S
     return True
 
 
+class RotationProbe:
+    """Open-loop actuation check — the GUI's "Rotation check" button.
+
+    One drone at a time (drones assumed sufficiently spaced): ENABLE_VS, hold,
+    pulse NORTH for PROBE_PULSE_S at PROBE_SPEED_MPS, brake, pulse EAST,
+    brake, DISABLE_VS, next drone. Each pulse's GPS displacement is measured
+    (positions sampled PROBE_LAG_S after pulse start/end to absorb actuation
+    lag) and the two pulses give a least-squares rotation+gain between the
+    commanded and flown directions:
+
+        OK       |rot| <= PROBE_OK_DEG and gain healthy
+        SKEWED   PROBE_OK_DEG < |rot| <= PROBE_ROTATED_DEG
+        ROTATED  |rot| > PROBE_ROTATED_DEG   (the 2026-07-05 failure mode)
+        DEAD     gain < PROBE_MIN_GAIN        (didn't follow at all)
+        VS FAIL  vs_enabled never went true after ENABLE_VS
+        NO GPS   no usable fix; drone skipped entirely
+
+    Run this BEFORE Start swarming — any verdict other than OK means the
+    cohesion loop would close with the wrong sign/direction on that drone.
+
+    This is a state machine ticked at ~50 Hz from run()'s held branch, so
+    every hardware poke stays on the control-loop thread (same rule as the
+    rest of the controller; command_listener only files the request in meta).
+    It never runs while swarming is armed; pressing Start aborts it.
+
+    Rotation sign: positive = response rotated clockwise (toward east) from
+    the command, compass sense — comparable to ResponseMonitor's live fit.
+    """
+
+    def __init__(self, swarm, meta=None, logger=None,
+                 min_separation=DEFAULT_MIN_SEPARATION_M):
+        self.swarm = swarm
+        self.meta = meta
+        self.logger = logger
+        self.min_separation = max(min_separation, 0.0)
+        self.active = False
+        self.results = {}          # did -> {"rot","gain","verdict"}
+        self._queue = []           # drone ids still to probe
+        self._did = None           # drone under test
+        self._phase = None
+        self._phase_end = 0.0
+        self._hold_alt = None
+        self._marks = []           # [(t_due, key), ...] position captures
+        self._disp = {}            # key -> (lat, lon)
+
+    # ---- lifecycle ----
+
+    def start(self, now):
+        """Pre-check and begin. Publishes 'refused' to meta and returns False
+        when it cannot run safely; True when the state machine is live."""
+        fixes = {}
+        for did, ctrl in sorted(self.swarm.drones.items()):
+            t = ctrl.telemetry
+            if (t and t.get('sat_count', 0) >= MIN_SAT_COUNT
+                    and not (t['lat'] == 0 and t['lon'] == 0)):
+                fixes[did] = t
+            else:
+                self.results[did] = {"rot": None, "gain": None,
+                                     "verdict": "NO GPS"}
+        if not fixes:
+            return self._refuse("no drone has a GPS fix")
+        # Every pair needs room for the worst-case probe travel on top of the
+        # min-separation failsafe distance.
+        need = self.min_separation + PROBE_CLEARANCE_M
+        ids = sorted(fixes)
+        lat0 = fixes[ids[0]]['lat']
+        lon0 = fixes[ids[0]]['lon']
+        pos = {d: gps_to_local(fixes[d]['lat'], fixes[d]['lon'], lat0, lon0)
+               for d in ids}
+        for i, a in enumerate(ids):
+            for b in ids[i + 1:]:
+                dist = math.hypot(pos[a][0] - pos[b][0], pos[a][1] - pos[b][1])
+                if dist < need:
+                    return self._refuse(
+                        "drones %d-%d only %.1f m apart (need >= %.1f m); "
+                        "spread the swarm out first" % (a, b, dist, need))
+        self._queue = ids
+        self.active = True
+        print("[rotcheck] START — %.1f m/s pulses N then E, %d drone(s): %s"
+              % (PROBE_SPEED_MPS, len(ids), ids))
+        if self.logger:
+            self.logger.log_drone_command(0, "EVENT", cmd="ROTCHECK_START")
+        self._next_drone(now)
+        return True
+
+    def abort(self, now, reason):
+        """Zero + DISABLE_VS the drone under test and stop. Partial results
+        stay visible in the GUI."""
+        if not self.active:
+            return
+        if self._did is not None:
+            ctrl = self.swarm.drones[self._did]
+            ctrl.set_velocity(0.0, 0.0, 0.0, self._hold_alt or MIN_ALT_M)
+            ctrl.disable_vs()
+            self.results[self._did] = {"rot": None, "gain": None,
+                                       "verdict": "ABORTED"}
+        self.active = False
+        self._did = None
+        print("[rotcheck] ABORTED: %s" % reason)
+        if self.logger:
+            self.logger.log_drone_command(
+                0, "EVENT", cmd="ROTCHECK_ABORT:%s" % reason)
+        self._publish("done", now, msg="aborted: %s" % reason)
+
+    # ---- state machine ----
+
+    def tick(self, now):
+        if not self.active:
+            return
+        # Capture due position marks (fresh telemetry is ~5 Hz; PROBE_LAG_S
+        # of margin makes the +-0.2 s sample jitter irrelevant at ~1.8 m of
+        # displacement).
+        for due, key in list(self._marks):
+            if now >= due:
+                t = self.swarm.drones[self._did].telemetry
+                if t and not (t['lat'] == 0 and t['lon'] == 0):
+                    self._disp[key] = (t['lat'], t['lon'])
+                self._marks.remove((due, key))
+        if now < self._phase_end:
+            self._publish("running", now)
+            return
+        ctrl = self.swarm.drones[self._did]
+        if self._phase == "enable":
+            t = ctrl.telemetry
+            if not t or not t.get('vs_enabled'):
+                # The d3 failure mode from 2026-07-05: ENABLE_VS sent, app
+                # never armed. Don't pulse a drone that isn't listening.
+                self._finish_drone(now, None, None, "VS FAIL")
+                return
+            self._begin_pulse(now, "pulse_n", PROBE_SPEED_MPS, 0.0)
+        elif self._phase == "pulse_n":
+            ctrl.set_velocity(0.0, 0.0, 0.0, self._hold_alt)
+            self._phase = "settle_n"
+            self._phase_end = now + PROBE_SETTLE_S
+        elif self._phase == "settle_n":
+            self._begin_pulse(now, "pulse_e", 0.0, PROBE_SPEED_MPS)
+        elif self._phase == "pulse_e":
+            ctrl.set_velocity(0.0, 0.0, 0.0, self._hold_alt)
+            self._phase = "settle_e"
+            self._phase_end = now + PROBE_SETTLE_S
+        elif self._phase == "settle_e":
+            rot, gain, verdict = self._evaluate()
+            self._finish_drone(now, rot, gain, verdict)
+
+    def _begin_pulse(self, now, phase, v_n, v_e):
+        ctrl = self.swarm.drones[self._did]
+        ctrl.set_velocity(v_n, v_e, 0.0, self._hold_alt)
+        self._phase = phase
+        self._phase_end = now + PROBE_PULSE_S
+        self._marks.append((now + PROBE_LAG_S, phase + "_start"))
+        self._marks.append((now + PROBE_PULSE_S + PROBE_LAG_S, phase + "_end"))
+        print("[rotcheck] drone %d %s (%.1f m/s N=%.1f E=%.1f, %.0f s)"
+              % (self._did, phase, PROBE_SPEED_MPS, v_n, v_e, PROBE_PULSE_S))
+
+    def _next_drone(self, now):
+        if not self._queue:
+            self.active = False
+            self._did = None
+            summary = "  ".join(
+                "%d:%s" % (d, r["verdict"]) for d, r in sorted(self.results.items()))
+            print("[rotcheck] DONE — %s" % summary)
+            if self.logger:
+                self.logger.log_drone_command(0, "EVENT", cmd="ROTCHECK_DONE")
+            self._publish("done", now)
+            return
+        self._did = self._queue.pop(0)
+        ctrl = self.swarm.drones[self._did]
+        t = ctrl.telemetry
+        self._hold_alt = max(t.get('alt', MIN_ALT_M) if t else MIN_ALT_M,
+                             MIN_ALT_M)
+        self._marks = []
+        self._disp = {}
+        ctrl.set_velocity(0.0, 0.0, 0.0, self._hold_alt)
+        ctrl.enable_vs()
+        self._phase = "enable"
+        self._phase_end = now + PROBE_ENABLE_S
+        print("[rotcheck] drone %d: ENABLE_VS, hold alt %.1f m"
+              % (self._did, self._hold_alt))
+        self._publish("running", now)
+
+    def _finish_drone(self, now, rot, gain, verdict):
+        ctrl = self.swarm.drones[self._did]
+        ctrl.set_velocity(0.0, 0.0, 0.0, self._hold_alt)
+        ctrl.disable_vs()
+        self.results[self._did] = {
+            "rot": None if rot is None else round(rot, 1),
+            "gain": None if gain is None else round(gain, 2),
+            "verdict": verdict,
+        }
+        print("[rotcheck] drone %d: %s%s"
+              % (self._did, verdict,
+                 "" if rot is None else
+                 "  rot=%+.1f deg  gain=%.2f" % (rot, gain)))
+        if self.logger:
+            self.logger.log_drone_command(
+                self._did, "EVENT",
+                cmd="ROTCHECK:rot=%s:gain=%s:%s"
+                    % ("" if rot is None else "%+.1f" % rot,
+                       "" if gain is None else "%.2f" % gain, verdict))
+        self._did = None
+        self._next_drone(now)
+
+    def _evaluate(self):
+        """Least-squares rotation+gain from the two pulse displacements
+        (complex n + 1j*e; same convention as ResponseMonitor)."""
+        L = PROBE_SPEED_MPS * PROBE_PULSE_S
+        num_re = num_im = den = 0.0
+        used = 0
+        for phase, (cn, ce) in (("pulse_n", (L, 0.0)), ("pulse_e", (0.0, L))):
+            p0 = self._disp.get(phase + "_start")
+            p1 = self._disp.get(phase + "_end")
+            if p0 is None or p1 is None:
+                continue
+            dn, de = gps_to_local(p1[0], p1[1], p0[0], p0[1])
+            num_re += dn * cn + de * ce
+            num_im += de * cn - dn * ce
+            den += cn * cn + ce * ce
+            used += 1
+        if used == 0 or den <= 0.0:
+            return None, None, "NO GPS"
+        rot = math.degrees(math.atan2(num_im, num_re))
+        gain = math.hypot(num_re, num_im) / den
+        if gain < PROBE_MIN_GAIN:
+            return rot, gain, "DEAD"
+        if abs(rot) <= PROBE_OK_DEG:
+            return rot, gain, "OK"
+        if abs(rot) <= PROBE_ROTATED_DEG:
+            return rot, gain, "SKEWED"
+        return rot, gain, "ROTATED"
+
+    # ---- reporting ----
+
+    def _refuse(self, msg):
+        print("[rotcheck] REFUSED: %s" % msg)
+        if self.logger:
+            self.logger.log_drone_command(0, "EVENT",
+                                          cmd="ROTCHECK_REFUSED:%s" % msg)
+        self._publish("refused", time.time(), msg=msg)
+        return False
+
+    def _publish(self, state, now, msg=None):
+        if self.meta is None:
+            return
+        # Replace the whole dict (concurrency rule: GIL-atomic assignment).
+        self.meta["rotation_check"] = {
+            "state": state,
+            "t": now,
+            "drone": self._did,
+            "phase": self._phase if self.active else None,
+            "results": {str(d): dict(r) for d, r in self.results.items()},
+            "msg": msg,
+        }
+
+
 # Reverse command channel: the browser GUI (swarm_gui.py) forwards Start/Stop
 # button presses here as JSON UDP datagrams. Distinct from the joystick (:5055)
 # and telemetry (:5099) ports.
@@ -484,6 +761,13 @@ def command_listener(swarming, meta, host, port, shapes_path=None):
                 if meta is not None:
                     meta["point_inwards"] = bool(msg.get("value"))
                     print(f"[gui] point inwards -> {meta['point_inwards']}")
+            elif action == "rotation_check":
+                # GUI button: open-loop actuation probe (RotationProbe). Only
+                # a request marker — run() starts/ticks the probe on the
+                # control-loop thread, and only while swarming is held.
+                if meta is not None:
+                    meta["rotation_check_req"] = time.time()
+                    print("[gui] rotation check requested")
             elif action == "add_obstacle":
                 # GUI map drag: a lat/lon-axis-aligned rectangle given by two
                 # opposite corners. Validation/normalization is shared with
@@ -598,6 +882,15 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
     removed = set()
     pending_disable = {}
 
+    # Live command->response rotation fit per drone (logged to swarm_debug +
+    # published as meta["resp"] for the GUI). Fed only with what was actually
+    # sent, so it stays silent in --dry-run and while held.
+    monitor = ResponseMonitor()
+    # Open-loop actuation probe (GUI "Rotation check"); created on request,
+    # ticked from the held branch below.
+    probe = None
+    last_probe_req = (meta or {}).get("rotation_check_req")
+
     while True:
         now = time.time()
         dt = now - last_t
@@ -647,6 +940,10 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         # thread, and so the GUI can Start/Stop even with no joystick connected.
         sw = swarming.is_set()
         if sw and not last_swarming:
+            # A running rotation check must not overlap the swarm arming
+            # (Start wins; the probe's partial results stay in the GUI).
+            if probe is not None and probe.active:
+                probe.abort(now, "swarming started")
             # Rising: re-verify the command<->telemetry identity before arming.
             # The probe is inert (marker strings the app ignores) and takes
             # ~0.5 s per drone, so it runs on every Start — an RC re-plugged or
@@ -697,6 +994,8 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             swarm.disable_vs_all()
             vs_on = False
             print("[swarm] VS disabled — drones holding position autonomously")
+            if meta is not None:
+                meta["resp"] = {}   # live rotation fits are meaningless held
         last_swarming = sw
 
         if meta is not None:
@@ -705,6 +1004,16 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             # GUI's FENCED OUT badges; refreshed every tick, also while held,
             # so a Stop→Start visibly clears it.
             meta["removed"] = sorted(removed)
+            # A rotation-check click while armed is refused NOW — consuming it
+            # here stops it from firing as a surprise right after Stop.
+            req = meta.get("rotation_check_req")
+            if sw and req is not None and req != last_probe_req:
+                last_probe_req = req
+                print("[rotcheck] refused: stop swarming first")
+                meta["rotation_check"] = {
+                    "state": "refused", "t": now, "drone": None,
+                    "phase": None, "results": {},
+                    "msg": "stop swarming first"}
             # Publish the live target spacing to the GUI even while held (before
             # the swarming gate below), so the operator can see what d_ref the
             # joystick angular.x currently maps to *before* pressing Start. When
@@ -760,9 +1069,28 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 if logger:
                     logger.log_drone_command(0, "EVENT", cmd=f"POINT_INWARDS:{pin}")
 
-        # Held → do nothing: VS is off and the drones hover autonomously until
-        # Start is pressed again.
+        # Held → VS is off and the drones hover autonomously until Start is
+        # pressed again. This is also the only place the rotation check may
+        # run (it arms/pulses one drone at a time on this thread).
         if not sw:
+            if meta is not None:
+                req = meta.get("rotation_check_req")
+                if req is not None and req != last_probe_req:
+                    last_probe_req = req
+                    if probe is not None and probe.active:
+                        print("[rotcheck] already running — request ignored")
+                    elif dry_run:
+                        print("[rotcheck] not available in --dry-run")
+                        meta["rotation_check"] = {
+                            "state": "refused", "t": now, "drone": None,
+                            "phase": None, "results": {},
+                            "msg": "not available in --dry-run"}
+                    else:
+                        probe = RotationProbe(swarm, meta, logger,
+                                              min_separation=min_separation)
+                        probe.start(now)
+            if probe is not None and probe.active:
+                probe.tick(now)
             time.sleep(0.02)
             continue
 
@@ -833,6 +1161,10 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         lon_ref = sum(t['lon'] for _, t in fixes) / len(fixes)
         snap = {}
         for did, t in fixes:
+            # ResponseMonitor keeps its own FIXED reference internally — the
+            # per-tick centroid ref below drifts with the swarm and would
+            # alias into the GPS-derived velocities.
+            monitor.note_fix(did, now, t['lat'], t['lon'])
             pos_ne = gps_to_local(t['lat'], t['lon'], lat_ref, lon_ref)
             if vel_frame == "body":
                 # vx = body forward, vy = body right. Rotate into world NED.
@@ -939,6 +1271,7 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         # straight through (DJI VS already runs a velocity tracker); the swarm
         # algorithm only contributes a correction (neighbour-velocity consensus
         # + cohesion) that gets added on top.
+        resp_map = {}   # per-drone live rotation fit for the GUI, this tick
         for did, ctrl in swarm.drones.items():
             if did not in snap:
                 continue  # no fix → DroneController holds last set_velocity
@@ -972,13 +1305,13 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 neighbours = [(snap[j][0], snap[j][1]) for j in snap
                               if j != did and j not in removed]
                 # Swarm correction (consensus + cohesion) in world frame
-                v_n_corr, v_e_corr = olfati.compute(
+                v_n_corr, v_e_corr = olfati.GetSwarmAcceleration(
                     self_pos, self_vel, neighbours, d_ref=d_ref,
                 )
                 # Virtual obstacles + geofence soft repulsion (β-agent term).
                 o_n, o_e = 0.0, 0.0
                 if avoid is not None and (rects_ne or fence_ne):
-                    o_n, o_e = avoid.compute(
+                    o_n, o_e = avoid.GetObstacleForce(
                         self_pos, self_vel, rects_ne, fence_ne)
                 v_n_total = v_n_des + v_n_corr + o_n
                 v_e_total = v_e_des + v_e_corr + o_e
@@ -988,11 +1321,22 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 # the relative behaviour being tuned keeps its shape.
                 v_n_total *= speed_scale
                 v_e_total *= speed_scale
+                # Live command->response rotation fit: feed what is actually
+                # sent (post-scale), read back the sliding-window estimate.
+                resp = None
+                if not dry_run:
+                    monitor.note_command(did, now, v_n_total, v_e_total)
+                    resp = monitor.fit(did, now)
+                resp_map[str(did)] = (
+                    None if resp is None
+                    else {"rot": round(resp[0], 1), "gain": round(resp[1], 2)})
                 if logger:
                     logger.log_swarm_debug(
                         did, v_n_des, v_e_des, v_n_corr, v_e_corr,
                         v_n_total, v_e_total, d_ref, len(neighbours),
-                        v_n_obs=o_n, v_e_obs=o_e)
+                        v_n_obs=o_n, v_e_obs=o_e,
+                        resp_rot_deg=None if resp is None else round(resp[0], 2),
+                        resp_gain=None if resp is None else round(resp[1], 3))
                 # DJI VS is in GROUND/VELOCITY mode (SwarmActivity sets
                 # FlightCoordinateSystem.GROUND), so pitch = north m/s and
                 # roll = east m/s. We send world-frame velocities directly —
@@ -1011,6 +1355,9 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                     ctrl.set_velocity(v_n_total, v_e_total, cmd_yaw_rate, target_alt)
             except Exception as e:
                 print(f"[drone {did}] flocking error: {e}")
+
+        if meta is not None:
+            meta["resp"] = resp_map   # replace whole (concurrency rule)
 
         if now - last_print > 1.0:
             if hull_mode:
@@ -1346,8 +1693,12 @@ def main():
 
     # Virtual obstacles + geofence repulsion (β-agent term; params in physical
     # metres, converted to the cohesion math's scaled units internally).
+    # c_vm: the C# GetObstacleForce uses the SAME velocity-matching gain as
+    # the cohesion consensus, so the swarm's --c-vm is passed here too
+    # (inert at the default c_vm = 0).
     avoid = ObstacleAvoidance(d_obs_m=args.d_obs, r0_obs_m=args.r0_obs,
-                              c_obs=args.c_obs, scale=args.scale)
+                              c_obs=args.c_obs, c_vm=args.c_vm,
+                              scale=args.scale)
 
     # GUI-drawn shapes persist across controller restarts in a JSON file next
     # to this script (unless --shapes-file points elsewhere).

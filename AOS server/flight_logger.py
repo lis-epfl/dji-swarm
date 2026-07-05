@@ -72,6 +72,7 @@ _SWARM_COLS = [
     'v_n_des', 'v_e_des', 'v_n_corr', 'v_e_corr',
     'v_n_obs', 'v_e_obs',
     'v_n_total', 'v_e_total', 'd_ref', 'n_neighbours',
+    'resp_rot_deg', 'resp_gain',
 ]
 
 # Stream name -> (filename, column list).
@@ -177,10 +178,13 @@ class FlightLogger:
 
     def log_swarm_debug(self, drone_id, v_n_des, v_e_des, v_n_corr, v_e_corr,
                         v_n_total, v_e_total, d_ref, n_neighbours,
-                        v_n_obs=0.0, v_e_obs=0.0):
+                        v_n_obs=0.0, v_e_obs=0.0,
+                        resp_rot_deg=None, resp_gain=None):
         """Log the Olfati-Saber decomposition for one drone (swarm mode only).
         v_n_obs/v_e_obs is the virtual-obstacle + geofence repulsion term
-        (optional, defaults 0 so callers without obstacles stay unchanged)."""
+        (optional, defaults 0 so callers without obstacles stay unchanged).
+        resp_rot_deg/resp_gain is the ResponseMonitor's live command->response
+        rotation fit (blank while there is not enough commanded motion)."""
         self._enqueue('swarm', {
             'drone_id': drone_id,
             'v_n_des': v_n_des,
@@ -193,6 +197,8 @@ class FlightLogger:
             'v_e_total': v_e_total,
             'd_ref': d_ref,
             'n_neighbours': n_neighbours,
+            'resp_rot_deg': resp_rot_deg,
+            'resp_gain': resp_gain,
         })
 
     # ------------------------------------------------------------------ #
