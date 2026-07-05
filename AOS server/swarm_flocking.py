@@ -22,10 +22,14 @@ Joystick → swarm mapping:
     linear.z   → climb (integrated into shared target altitude)
     angular.z  → yaw rate (feed-forward; a shared target heading is held per
                  drone via heading_hold_rate → smooth yaw RATE to the DJI VS).
-                 Ignored with --heading convexhull: there the per-drone target
-                 heading comes from the swarm's convex hull instead (boundary
-                 drones face outward, interior drones hold heading — port of
-                 the Unity sim's GLOBAL_CONVEXHULL, see heading_convexhull.py)
+                 With --heading convexhull the per-drone heading comes from the
+                 swarm's convex hull instead (boundary drones face outward,
+                 interior drones hold heading — port of the Unity sim's
+                 GLOBAL_CONVEXHULL, see heading_convexhull.py), so the stick no
+                 longer steers the drones; there it rotates the operator's
+                 command reference frame (cmd_frame_yaw) — the compass heading
+                 that linear.x/linear.y point along — decoupling "push forward"
+                 from where the drones are actually facing.
     angular.x  → d_ref, linear map [0.6, 1.4] → scaled [0.5, 1.0]
                  (≈ physical [5, 10] m at ScaleFactor = 10)
     switch s1  → toggle ENABLE_VS / DISABLE_VS for all drones (rising edge)
@@ -82,7 +86,7 @@ from swarm_telemetry_feed import (
     DEFAULT_GUI_HOST,
     DEFAULT_GUI_PORT,
 )
-from heading_convexhull import ConvexHullHeading
+from heading_convexhull import ConvexHullHeading, _wrap180
 from olfati_saber import (
     OlfatiSaber,
     ObstacleAvoidance,
@@ -883,7 +887,8 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
     print(f"  Heading: {mode0} — switchable live from the GUI. "
           f"manual = stick yaw steers a shared target heading; "
           f"convexhull = GLOBAL_CONVEXHULL (boundary drones face outward, "
-          f"interior drones hold heading, stick yaw ignored)")
+          f"interior drones hold heading; stick yaw rotates the command "
+          f"reference frame instead of steering the drones)")
     print(f"  Telemetry velocity frame: {vel_frame}  "
           f"(switch via --vel-frame if consensus oscillates)")
     if speed_scale != 1.0:
@@ -893,6 +898,13 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
     print(f"  Ctrl+C: same, abrupt\n")
 
     target_yaw = 0.0
+    # Convex-hull mode: the yaw stick does not steer the drones (the hull owns
+    # their headings), so it instead rotates the operator's command reference
+    # frame. cmd_frame_yaw is the compass heading that stick-forward (linear.x)
+    # points along; stick-right (linear.y) is 90° clockwise of it. 0 = world
+    # frame (forward=north). Seeded from the swarm mean heading on entering
+    # hull mode, then integrated from the stick like a free (unclamped) yaw.
+    cmd_frame_yaw = 0.0
     target_alt = INITIAL_ALT_M
     vs_on = False
     last_heading_mode = mode0           # detect GUI mode switches (below)
@@ -1083,6 +1095,11 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                     # Fresh activation: stale debounce timers / held targets
                     # from a previous stint must not leak in.
                     heading_ctrl.reset()
+                    # Seed the command reference frame from where the swarm
+                    # currently points, so stick-forward starts out matching
+                    # the swarm's mean heading before the operator rotates it.
+                    mh = swarm_mean_heading(swarm)
+                    cmd_frame_yaw = mh if mh is not None else 0.0
                 else:
                     # Back to manual: re-seed the shared target from the live
                     # mean heading so drones don't snap to a stale target_yaw.
@@ -1143,14 +1160,19 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         # drones smoothly servo their nose to the shared target_yaw.
         # In convex-hull heading mode the hull owns every drone's heading
         # (mirrors the Unity AttitudeAlgorithm suppressing the input yaw rate),
-        # so the stick doesn't integrate the shared target. In manual mode the
-        # integration is lead-clamped against the swarm's mean heading
-        # (anti-windup — see integrate_target_heading) so releasing the stick
-        # leaves at most MAX_TARGET_LEAD_DEG of catch-up turn.
+        # so the stick doesn't steer the drones. Instead it rotates the
+        # operator's command reference frame (cmd_frame_yaw): a free integrator
+        # with no lead clamp, since there is no measured heading to servo it
+        # against — it's a pure operator-chosen frame. In manual mode the
+        # integration steers the shared target heading, lead-clamped against the
+        # swarm's mean heading (anti-windup — see integrate_target_heading) so
+        # releasing the stick leaves at most MAX_TARGET_LEAD_DEG of catch-up turn.
         ff_yaw_rate = ang_z * YAW_RATE_DEG_S * speed_scale
         if not hull_mode:
             target_yaw = integrate_target_heading(
                 target_yaw, ff_yaw_rate, dt, swarm_mean_heading(swarm))
+        else:
+            cmd_frame_yaw = _wrap180(cmd_frame_yaw + ff_yaw_rate * dt)
         target_alt = max(MIN_ALT_M, min(MAX_ALT_M,
                                         target_alt + lin_z * VERT_RATE_MPS * speed_scale * dt))
         # d_ref (scaled units); physical spacing = d_ref * scale. Already
@@ -1159,10 +1181,17 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
 
         # World-frame group desired velocity, shared across the swarm: every
         # drone tries to move in the same compass direction regardless of its
-        # own heading. Per drone the world v_des gets rotated into body pitch/
-        # roll using that drone's individual heading (world_to_body below).
-        v_n_des = lin_x * MAX_PITCH_MPS    # north (m/s)
-        v_e_des = lin_y * MAX_ROLL_MPS     # east  (m/s)
+        # own heading. The DJI VS (GROUND mode) does the world→body rotation
+        # per drone internally, so we always hand it world N/E.
+        if hull_mode:
+            # Convex-hull mode: the stick commands motion in the operator's
+            # rotatable command frame (steered by the yaw stick above), so
+            # rotate stick forward/right by cmd_frame_yaw into world N/E.
+            v_n_des, v_e_des = body_to_world(
+                lin_x * MAX_PITCH_MPS, lin_y * MAX_ROLL_MPS, cmd_frame_yaw)
+        else:
+            v_n_des = lin_x * MAX_PITCH_MPS    # north (m/s)
+            v_e_des = lin_y * MAX_ROLL_MPS     # east  (m/s)
 
         # Snapshot the swarm state in local (N, E) meters
         fixes = []
@@ -1393,8 +1422,9 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
 
         if now - last_print > 1.0:
             if hull_mode:
-                yaw_desc = ("hull-boundary=" +
-                            (",".join(map(str, heading_ctrl.boundary_ids())) or "none"))
+                yaw_desc = ("cmdframe=%+6.1f°  hull-boundary=%s"
+                            % (cmd_frame_yaw,
+                               ",".join(map(str, heading_ctrl.boundary_ids())) or "none"))
             else:
                 yaw_desc = f"yaw={target_yaw:+6.1f}°"
             print(f"  v_des=({v_n_des:+5.2f}N,{v_e_des:+5.2f}E) world  "
@@ -1465,7 +1495,9 @@ def main():
                          "ports the Unity sim's GLOBAL_CONVEXHULL attitude "
                          "algorithm — drones on the swarm's convex hull face "
                          "outward along their vertex bisector, interior drones "
-                         "hold heading, stick yaw is ignored.")
+                         "hold heading; the stick yaw then rotates the "
+                         "operator's command reference frame instead of "
+                         "steering the drones.")
     ap.add_argument("--point-inwards", action="store_true",
                     help="Seed the point-inwards toggle (live-switchable from "
                          "the GUI): in convexhull mode, boundary drones face "

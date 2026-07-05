@@ -12,7 +12,7 @@
 
 @{
     # Number of drones in the swarm (creates IDs 1..N). CLI: -Drones
-    Drones = 3
+    Drones = 6
 
     # RC/broker IP addresses in DRONE-ID ORDER (index 1 = drone 1, ...). When
     # listed, swarm_flocking.py publishes commands DIRECTLY to each RC's MQTT
@@ -50,7 +50,7 @@
     #   'convexhull' - GLOBAL_CONVEXHULL: hull drones face outward, interior
     #                  drones hold heading, stick yaw ignored
     # CLI: -ConvexHull forces 'convexhull' for that run.
-    Heading = 'manual'
+    Heading = 'ConvexHull'
 
     # convexhull mode only: boundary drones face the swarm centroid instead of
     # outward. Ignored in manual mode. CLI: -PointInwards
@@ -75,7 +75,7 @@
     # INSIDE swarm_flocking.py (--image-stream). Runs off the telemetry
     # threads' existing image fetches, so it cannot slow the cmd/telem rates
     # (unlike the old standalone image_stream.py process). CLI: -ImageStream
-    ImageStream = $false
+    ImageStream = $true
 
     # --- Olfati-Saber flocking tuning (seed values; the GUI can retune live) ---
     # Velocity-matching gain, swarm_flocking.py --c-vm (default 0.0).
