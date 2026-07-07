@@ -12,7 +12,7 @@
 
 @{
     # Number of drones in the swarm (creates IDs 1..N). CLI: -Drones
-    Drones = 6
+    Drones = 1
 
     # RC/broker IP addresses in DRONE-ID ORDER (index 1 = drone 1, ...). When
     # listed, swarm_flocking.py publishes commands DIRECTLY to each RC's MQTT
@@ -50,7 +50,7 @@
     #   'convexhull' - GLOBAL_CONVEXHULL: hull drones face outward, interior
     #                  drones hold heading, stick yaw ignored
     # CLI: -ConvexHull forces 'convexhull' for that run.
-    Heading = 'ConvexHull'
+    Heading = 'manual'
 
     # convexhull mode only: boundary drones face the swarm centroid instead of
     # outward. Ignored in manual mode. CLI: -PointInwards
@@ -65,7 +65,7 @@
 
     # Minimum-separation failsafe (physical metres): swarming auto-STOPs if
     # any drone pair gets closer than this. 0 disables. CLI: -MinSeparation
-    MinSeparation = 2.5
+    MinSeparation = 2.0
 
     # Skip the browser-GUI map pane and pass --no-gui to the controller so it
     # does not push telemetry. CLI: -NoGui

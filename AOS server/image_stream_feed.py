@@ -84,11 +84,23 @@ class ImageStreamPublisher:
         self._size = (int(width), int(height))
         self._image_bytes = self._size[0] * self._size[1] * 3
         self._block_bytes = BLOCK_HEADER_BYTES + self._image_bytes
-        # Fixed capacity: the mapping is always MAX_DRONES blocks so its size
-        # matches what ImageSharing.cs creates regardless of fleet size or of
-        # which process creates the named mapping first.
-        self._mmf = mmap.mmap(-1, MAX_DRONES * self._block_bytes,
-                              BLOCK_MAP_NAME)
+        # Per-worker memory maps: each drone's worker owns its OWN mmap object
+        # over the same named section. Multiple mmap views of one Windows named
+        # mapping share the physical pages but keep INDEPENDENT file positions.
+        # A SINGLE shared mmap has one file position, and write_memory drives it
+        # through seek()->write() sequences that are NOT GIL-atomic, so with 2+
+        # worker threads one drone's write can resume at another drone's offset:
+        # frames land in the wrong block (torn/garbled) and a mis-placed flag
+        # reset wedges a block at flag=1 forever (that feed freezes). Separate
+        # mmap objects give each worker its own position, so disjoint per-drone
+        # blocks can never cross-write and no lock is needed.
+        # Fixed capacity: every map is MAX_DRONES blocks so its size matches
+        # what ImageSharing.cs creates regardless of fleet size or of which
+        # process creates the named mapping first.
+        self._mmfs = {
+            did: mmap.mmap(-1, MAX_DRONES * self._block_bytes, BLOCK_MAP_NAME)
+            for did in self._drones
+        }
         # Per-drone latest-wins mailbox: {id: (yuv_copy, heading)} + an event
         # the worker sleeps on. A slow worker just drops frames, never queues.
         self._latest = {}
@@ -119,6 +131,7 @@ class ImageStreamPublisher:
 
     def _worker(self, drone_id):
         event = self._events[drone_id]
+        mmf = self._mmfs[drone_id]
         while self._running:
             if not event.wait(timeout=0.5):
                 continue
@@ -132,7 +145,7 @@ class ImageStreamPublisher:
                 img = cv2.cvtColor(yuv.reshape(RAW_ROWS, RAW_COLS), self._cvt)
                 img = cv2.resize(img, self._size)
                 imageSharingUtil.write_memory(
-                    self._mmf, (drone_id - 1) * self._block_bytes,
+                    mmf, (drone_id - 1) * self._block_bytes,
                     self._image_bytes, img, drone_id - 1, heading,
                     pace_s=0.04)
             except Exception as e:
@@ -159,7 +172,10 @@ class ImageStreamPublisher:
         for t in self._threads:
             t.join(timeout=1.5)
         self._threads = []
-        try:
-            self._mmf.close()
-        except Exception:
-            pass
+        # Close every per-worker mmap (workers no longer touch them once
+        # _running is False and their threads have joined).
+        for mmf in self._mmfs.values():
+            try:
+                mmf.close()
+            except Exception:
+                pass
