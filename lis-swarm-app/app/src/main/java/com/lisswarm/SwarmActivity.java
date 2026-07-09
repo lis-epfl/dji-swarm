@@ -17,9 +17,15 @@ import at.jku.icg.aos_dji_sdkv5.dji.DJIManager;
 
 import dji.sdk.keyvalue.key.AirLinkKey;
 import dji.sdk.keyvalue.key.BatteryKey;
+import dji.sdk.keyvalue.key.DJIKeyInfo;
 import dji.sdk.keyvalue.key.FlightControllerKey;
 import dji.sdk.keyvalue.key.GimbalKey;
 import dji.sdk.keyvalue.key.KeyTools;
+import dji.sdk.keyvalue.value.airlink.ChannelSelectionMode;
+import dji.sdk.keyvalue.value.airlink.FrequencyBand;
+import dji.sdk.keyvalue.value.camera.VideoFrameRate;
+import dji.sdk.keyvalue.value.camera.VideoResolution;
+import dji.sdk.keyvalue.value.camera.VideoResolutionFrameRate;
 import dji.sdk.keyvalue.value.common.Attitude;
 import dji.sdk.keyvalue.value.common.EmptyMsg;
 import dji.sdk.keyvalue.value.common.LocationCoordinate3D;
@@ -62,6 +68,9 @@ import java.util.TimerTask;
  *     throttle = absolute altitude m, gimbal angles = absolute deg.
  *   "ENABLE_VS" / "DISABLE_VS"
  *   "TAKEOFF" / "LAND"
+ *   "AIRLINK:band:channel:res@fps" — one-shot radio/camera-stream setup
+ *     (see applyAirlinkSettings; sent by the PC after its command channel
+ *     connects so per-drone radio config lives in the PC's flocking config)
  */
 public class SwarmActivity extends Activity {
 
@@ -283,7 +292,143 @@ public class SwarmActivity extends Activity {
             performTakeoff();
         } else if (command.equals("LAND")) {
             performLanding();
+        } else if (command.startsWith("AIRLINK:")) {
+            applyAirlinkSettings(command.substring("AIRLINK:".length()));
         }
+    }
+
+    // ========== AirLink management ==========
+
+    /**
+     * "AIRLINK:&lt;band&gt;:&lt;channel&gt;:&lt;res@fps&gt;" — with ten aircraft/RC links
+     * sharing the spectrum, DJI's per-link auto channel selection has no view
+     * of the whole fleet, so the PC assigns bands/channels deterministically.
+     * Fields ('-' or empty = leave unchanged):
+     *   band     2G4 | 5G8 | DUAL (firmware picks per packet)
+     *   channel  &gt;=0 = ChannelSelectionMode MANUAL + that channel number;
+     *            -1  = back to ChannelSelectionMode AUTO
+     *   res@fps  camera stream cap, e.g. 1920x1080@24 — lowers the encoded
+     *            bitrate and thus the per-link airtime
+     * Every set is read back and surfaced via updateStatus/logcat, so firmware
+     * that locks a key (likely for manual channels on consumer aircraft) is
+     * visible on the RC screen during a bench test; a rejected MANUAL channel
+     * falls back to AUTO rather than leaving the link half-configured.
+     */
+    private void applyAirlinkSettings(String spec) {
+        try {
+            String[] parts = spec.split(":");
+            String bandTok = parts.length >= 1 ? parts[0].trim() : "";
+            String chanTok = parts.length >= 2 ? parts[1].trim() : "";
+            String resTok = parts.length >= 3 ? parts[2].trim() : "";
+
+            if (!bandTok.isEmpty() && !bandTok.equals("-")) {
+                FrequencyBand band =
+                    bandTok.equals("2G4") ? FrequencyBand.BAND_2_DOT_4G :
+                    bandTok.equals("5G8") ? FrequencyBand.BAND_5_DOT_8G :
+                    bandTok.equals("DUAL") ? FrequencyBand.BAND_DUAL : null;
+                if (band == null) {
+                    updateStatus("AIRLINK: unknown band '" + bandTok + "'");
+                } else {
+                    setAirlinkKeyAndVerify("band", AirLinkKey.KeyFrequencyBand, band);
+                }
+            }
+
+            if (!chanTok.isEmpty() && !chanTok.equals("-")) {
+                int channel = Integer.parseInt(chanTok);
+                if (channel < 0) {
+                    setAirlinkKeyAndVerify("channel mode",
+                        AirLinkKey.KeyChannelSelectionMode, ChannelSelectionMode.AUTO);
+                } else {
+                    setManualChannel(channel);
+                }
+            }
+
+            if (!resTok.isEmpty() && !resTok.equals("-")) {
+                int at = resTok.indexOf('@');
+                VideoResolution res = VideoResolution.valueOf(
+                    "RESOLUTION_" + resTok.substring(0, at));
+                VideoFrameRate rate = VideoFrameRate.valueOf(
+                    "RATE_" + resTok.substring(at + 1) + "FPS");
+                droneSwarmStreamData.setVideoResolution(
+                    new VideoResolutionFrameRate(res, rate));
+                updateStatus("AIRLINK video -> " + resTok);
+            }
+        } catch (Exception e) {
+            // Never let a malformed one-shot kill the command listener
+            updateStatus("AIRLINK parse failed for '" + spec + "': " + e);
+        }
+    }
+
+    /** MANUAL selection mode first, then the channel number; either rejection
+     *  reverts to AUTO so the link is never left half-configured. */
+    private void setManualChannel(int channel) {
+        KeyManager.getInstance().setValue(
+            KeyTools.createKey(AirLinkKey.KeyChannelSelectionMode),
+            ChannelSelectionMode.MANUAL,
+            new CommonCallbacks.CompletionCallback() {
+                @Override
+                public void onSuccess() {
+                    KeyManager.getInstance().setValue(
+                        KeyTools.createKey(AirLinkKey.KeyChannelNumber),
+                        channel,
+                        new CommonCallbacks.CompletionCallback() {
+                            @Override
+                            public void onSuccess() {
+                                readBackAirlinkKey("channel", AirLinkKey.KeyChannelNumber);
+                            }
+
+                            @Override
+                            public void onFailure(IDJIError error) {
+                                updateStatus("AIRLINK channel=" + channel
+                                    + " REJECTED (" + error.description()
+                                    + ") — reverting to AUTO");
+                                setAirlinkKeyAndVerify("channel mode",
+                                    AirLinkKey.KeyChannelSelectionMode,
+                                    ChannelSelectionMode.AUTO);
+                            }
+                        });
+                }
+
+                @Override
+                public void onFailure(IDJIError error) {
+                    updateStatus("AIRLINK MANUAL mode REJECTED ("
+                        + error.description() + ") — staying AUTO");
+                }
+            });
+    }
+
+    private <T> void setAirlinkKeyAndVerify(String what, DJIKeyInfo<T> keyInfo, T value) {
+        KeyManager.getInstance().setValue(
+            KeyTools.createKey(keyInfo), value,
+            new CommonCallbacks.CompletionCallback() {
+                @Override
+                public void onSuccess() {
+                    readBackAirlinkKey(what, keyInfo);
+                }
+
+                @Override
+                public void onFailure(IDJIError error) {
+                    updateStatus("AIRLINK " + what + "=" + value
+                        + " REJECTED: " + error.description());
+                }
+            });
+    }
+
+    private <T> void readBackAirlinkKey(String what, DJIKeyInfo<T> keyInfo) {
+        KeyManager.getInstance().getValue(
+            KeyTools.createKey(keyInfo),
+            new CommonCallbacks.CompletionCallbackWithParam<T>() {
+                @Override
+                public void onSuccess(T readBack) {
+                    updateStatus("AIRLINK " + what + " -> " + readBack);
+                }
+
+                @Override
+                public void onFailure(IDJIError error) {
+                    updateStatus("AIRLINK " + what
+                        + " set OK but read-back failed: " + error.description());
+                }
+            });
     }
 
     // ========== Telemetry Display ==========

@@ -38,6 +38,11 @@
 #                                     # radius (physical metres); -CObs sets the gain.
 #                                     # The obstacles/geofence themselves are drawn on the
 #                                     # GUI map and persist in shapes.json.
+#   .\dji-flocking.ps1 -AirlinkBands 2G4,2G4,5G8   # per-drone RF band split (2G4|5G8|DUAL|-),
+#                                     # one value = all drones; sent as a one-shot AIRLINK
+#                                     # command to each RC at startup (results on the RC screen)
+#   .\dji-flocking.ps1 -AirlinkChannels 1,6,11     # per-drone manual channels (-1 = auto, - = skip)
+#   .\dji-flocking.ps1 -VideoMode 1920x1080@24     # cap the camera stream on every RC
 #   .\dji-flocking.ps1 -Config .\my-other.psd1   # use a different config file
 #
 # If PowerShell blocks the script, either run once with:
@@ -63,6 +68,9 @@ param(
     [switch]$ImageStream,
     [switch]$NoIdentityCheck,
     [string[]]$DroneIPs,
+    [string[]]$AirlinkBands,
+    [string[]]$AirlinkChannels,
+    [string]$VideoMode,
     [string]$Config = "$PSScriptRoot\flocking.config.psd1"
 )
 
@@ -77,6 +85,7 @@ $settings = @{
     DObs = 5.0; R0Obs = 6.0; CObs = 4.3
     DroneIPs = @()
     IdentityCheck = $true; MinSeparation = 3.0
+    AirlinkBands = @(); AirlinkChannels = @(); VideoMode = ''
 }
 
 if (-not (Test-Path $Config)) {
@@ -99,6 +108,9 @@ if ($PSBoundParameters.ContainsKey('NoGui'))        { $settings.NoGui = [bool]$N
 if ($PSBoundParameters.ContainsKey('ImageStream'))  { $settings.ImageStream = [bool]$ImageStream }
 if ($PSBoundParameters.ContainsKey('PointInwards')) { $settings.PointInwards = [bool]$PointInwards }
 if ($PSBoundParameters.ContainsKey('DroneIPs'))     { $settings.DroneIPs = $DroneIPs }
+if ($PSBoundParameters.ContainsKey('AirlinkBands'))    { $settings.AirlinkBands = $AirlinkBands }
+if ($PSBoundParameters.ContainsKey('AirlinkChannels')) { $settings.AirlinkChannels = $AirlinkChannels }
+if ($PSBoundParameters.ContainsKey('VideoMode'))       { $settings.VideoMode = $VideoMode }
 if ($PSBoundParameters.ContainsKey('MinSeparation')){ $settings.MinSeparation = $MinSeparation }
 if ($PSBoundParameters.ContainsKey('DObs'))         { $settings.DObs = $DObs }
 if ($PSBoundParameters.ContainsKey('R0Obs'))        { $settings.R0Obs = $R0Obs }
@@ -125,6 +137,9 @@ $MinSeparation = [double]$settings.MinSeparation
 $DObs          = [double]$settings.DObs
 $R0Obs         = [double]$settings.R0Obs
 $CObs          = [double]$settings.CObs
+$AirlinkBands    = @($settings.AirlinkBands | Where-Object { "$_".Trim() -ne '' })
+$AirlinkChannels = @($settings.AirlinkChannels | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne '' })
+$VideoMode       = "$($settings.VideoMode)".Trim()
 
 # Command-path mode from the DroneIPs value:
 #   @()                     -> 'auto'    (swarm_flocking.py discovers the RC IPs from
@@ -158,11 +173,14 @@ $CmdPathDesc = switch ($CmdMode) {
     'server'   { "via DroneSwarmServer (legacy, ~4.5 Hz, forced)" }
     'explicit' { "direct MQTT [$($DroneIPs -join ', ')]" }
 }
+$AirlinkDesc = if ($AirlinkBands.Count -or $AirlinkChannels.Count -or $VideoMode) {
+    "bands=[$($AirlinkBands -join ',')] channels=[$($AirlinkChannels -join ',')] video=$VideoMode"
+} else { "unmanaged (DJI auto)" }
 Write-Host ("[dji-flocking] config $Config -> drones=$Drones slow=$Slow gimbal=$GimbalPitch " +
             "heading=$Heading pointInwards=$PointInwards noGui=$NoGui imageStream=$ImageStream " +
             "c_vm=$Cvm r0=$R0 scale=$Scale minSep=$MinSeparation identityCheck=$IdentityCheck " +
             "dObs=$DObs r0Obs=$R0Obs cObs=$CObs " +
-            "httpPort=$HttpPort cmdPath=$CmdPathDesc")
+            "httpPort=$HttpPort cmdPath=$CmdPathDesc airlink=$AirlinkDesc")
 
 # --- Build the swarm_flocking.py CLI -----------------------------------------
 # Format doubles invariantly so the decimal point survives locales that use a
@@ -207,7 +225,14 @@ $DObsArg  = if ($DObs -ne 5.0)  { " --d-obs " + (Inv $DObs) }   else { "" }
 $R0ObsArg = if ($R0Obs -ne 6.0) { " --r0-obs " + (Inv $R0Obs) } else { "" }
 $CObsArg  = if ($CObs -ne 4.3)  { " --c-obs " + (Inv $CObs) }   else { "" }
 
-$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg$IdentityArg$MinSepArg$DObsArg$R0ObsArg$CObsArg"
+# One-shot AirLink / camera-stream setup at startup (empty = send nothing,
+# leaving every link on DJI's own auto selection).
+$AirlinkArg = ""
+if ($AirlinkBands.Count)    { $AirlinkArg += " --airlink-bands " + ($AirlinkBands -join ',') }
+if ($AirlinkChannels.Count) { $AirlinkArg += " --airlink-channels " + ($AirlinkChannels -join ',') }
+if ($VideoMode)             { $AirlinkArg += " --video-mode $VideoMode" }
+
+$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg$IdentityArg$MinSepArg$DObsArg$R0ObsArg$CObsArg$AirlinkArg"
 
 # The readController pane sources the conda hook and activates this env
 # before launching the script. Edit if your miniconda lives elsewhere.

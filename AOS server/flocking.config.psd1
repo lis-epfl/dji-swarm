@@ -67,6 +67,28 @@
     # any drone pair gets closer than this. 0 disables. CLI: -MinSeparation
     MinSeparation = 2.0
 
+    # --- AirLink / RF management (sent once per drone at controller startup ---
+    # --- as an "AIRLINK:" MQTT one-shot; the RC shows applied/rejected on   ---
+    # --- its status line — bench-test before relying on it in the field)    ---
+    # Per-drone RF band in drone-id order: '2G4' | '5G8' | 'DUAL' | '-' (leave
+    # unchanged). ONE value applies to every drone; @() sends nothing and all
+    # links stay on DJI auto selection. With ~10 co-located OcuSync links,
+    # splitting the fleet across the two bands halves the contenders per band,
+    # e.g. @('2G4','2G4','2G4','2G4','2G4','5G8','5G8','5G8','5G8','5G8').
+    # CLI: -AirlinkBands 2G4,2G4,5G8
+    AirlinkBands = @()
+
+    # Per-drone manual channel numbers in drone-id order (-1 = auto channel
+    # selection, '-' = leave unchanged; one value = all drones). Consumer
+    # firmware may lock manual selection — the app then reverts that RC to
+    # AUTO and says so on-screen. @() sends nothing. CLI: -AirlinkChannels
+    AirlinkChannels = @()
+
+    # Camera stream cap applied on every RC, e.g. '1920x1080@24' — a lower
+    # encoded bitrate leaves more airlink headroom per link (and less RTSP
+    # load on the PC). '' leaves the camera as-is. CLI: -VideoMode
+    VideoMode = ''
+
     # Skip the browser-GUI map pane and pass --no-gui to the controller so it
     # does not push telemetry. CLI: -NoGui
     NoGui = $false

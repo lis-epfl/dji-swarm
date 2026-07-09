@@ -173,12 +173,21 @@ stream / QoS 1 for one-shots) or via `sendWayPointData` → `DroneSwarmServer` (
 ```
 VS:pitch:roll:yaw:throttle:gimbal_pitch:gimbal_yaw
 ENABLE_VS | DISABLE_VS | TAKEOFF | LAND
+AIRLINK:band:channel:res@fps
 ```
 Parsed in `SwarmActivity.onCommandReceived`. Fields: `pitch`/`roll` = velocity m/s,
 `yaw` = **yaw RATE deg/s** (DJI VS angular-velocity mode; + = clockwise),
 `throttle` = **absolute altitude m**, gimbal angles abs deg. The PC keeps an absolute
 target heading and runs a heading-hold P controller (`joystick_controller.heading_hold_rate`)
 that emits this rate — see the [yaw gotcha](#critical-gotchas).
+`AIRLINK:` is a one-shot radio/camera-stream setup (`SwarmActivity.applyAirlinkSettings`)
+sent per drone by `swarm_flocking.py` at startup when `AirlinkBands`/`AirlinkChannels`/
+`VideoMode` (config) or the matching `--airlink-*`/`--video-mode` flags are set: band
+`2G4|5G8|DUAL|-`, channel int (`-1` = auto mode, `-` = skip), optional `1920x1080@24`-style
+camera cap. Every set is read back and shown on the RC status line; a rejected MANUAL
+channel reverts that RC to AUTO. The AirLink keys are inherited from MSDK 5.3.0's internal
+`co_b` base class (not on the public `AirLinkKey` docs for 5.3) — bench-verify on the
+Mini 3 Pro before relying on them in the field.
 
 **Telemetry string** (app → Python; travels inside the drone's RTSP session as a
 non-video data stream — NOT over MQTT — then lands in shared memory appended after the
@@ -316,7 +325,7 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 | Launcher | Starts | Params → script flags |
 | --- | --- | --- |
 | `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
-| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-DObs`→`--d-obs` / `-R0Obs`→`--r0-obs` / `-CObs`→`--c-obs` (virtual-obstacle/geofence repulsion cutoff, detection radius [physical m] and gain; config keys `DObs`/`R0Obs`/`CObs`; the shapes themselves are drawn in the GUI and persist in `shapes.json`), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
+| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-DObs`→`--d-obs` / `-R0Obs`→`--r0-obs` / `-CObs`→`--c-obs` (virtual-obstacle/geofence repulsion cutoff, detection radius [physical m] and gain; config keys `DObs`/`R0Obs`/`CObs`; the shapes themselves are drawn in the GUI and persist in `shapes.json`), `-AirlinkBands`→`--airlink-bands` / `-AirlinkChannels`→`--airlink-channels` / `-VideoMode`→`--video-mode` (per-drone RF band/channel assignment + camera-stream cap, sent to each RC as an `AIRLINK:` one-shot at startup; config keys `AirlinkBands`/`AirlinkChannels`/`VideoMode`; empty = leave the radios on DJI auto), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
 | `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
 
 `dji-flocking.ps1`'s launch settings live in **`AOS server/flocking.config.psd1`** (a

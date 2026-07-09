@@ -66,6 +66,7 @@ import json
 import math
 import msvcrt    # Windows console: non-blocking keyboard read for the 'q' stop
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -1536,6 +1537,26 @@ def main():
                     help="Failsafe: auto-STOP swarming when any drone pair "
                          f"gets closer than this many metres (default "
                          f"{DEFAULT_MIN_SEPARATION_M:.1f}; 0 disables)")
+    ap.add_argument("--airlink-bands", default="", metavar="LIST",
+                    help="Per-drone RF band assignment, sent to each RC as a "
+                         "one-shot AIRLINK command at startup: comma list in "
+                         "drone-id order of 2G4 | 5G8 | DUAL | '-' (leave that "
+                         "drone unchanged); a single value applies to every "
+                         "drone. Empty (default) sends nothing. With many "
+                         "co-located OcuSync links, splitting the fleet "
+                         "across 2.4/5.8 GHz halves the contenders per band.")
+    ap.add_argument("--airlink-channels", default="", metavar="LIST",
+                    help="Per-drone manual channel numbers (comma list in "
+                         "drone-id order; -1 = auto channel selection, '-' = "
+                         "leave unchanged; a single value applies to all). "
+                         "The app sets ChannelSelectionMode MANUAL and falls "
+                         "back to AUTO — reported on the RC screen — if the "
+                         "firmware rejects it. Empty (default) sends nothing.")
+    ap.add_argument("--video-mode", default="", metavar="WxH@FPS",
+                    help="Camera stream cap applied on every RC at startup, "
+                         "e.g. 1920x1080@24 (lower encoded bitrate = more "
+                         "airlink headroom per link). Empty (default) leaves "
+                         "the camera as-is.")
     ap.add_argument("--d-obs", type=float, default=5.0, metavar="M",
                     help="Obstacle/geofence repulsion cutoff in PHYSICAL "
                          "metres (default 5.0). The beta-agent kernel runs at "
@@ -1599,6 +1620,36 @@ def main():
     if not (GIMBAL_PITCH_MIN <= args.gimbal_pitch <= GIMBAL_PITCH_MAX):
         ap.error(f"--gimbal-pitch must be in "
                  f"[{GIMBAL_PITCH_MIN:.0f}, {GIMBAL_PITCH_MAX:.0f}] (DJI Mini 3 Pro)")
+
+    def per_drone_list(raw, flag):
+        """Expand a comma list to one token per drone (a single token fans
+        out to all); [] when the flag wasn't given."""
+        toks = [t.strip() for t in raw.split(",") if t.strip()]
+        if not toks:
+            return []
+        if len(toks) == 1:
+            return toks * args.drones
+        if len(toks) < args.drones:
+            ap.error(f"--{flag} has {len(toks)} entries but --drones is "
+                     f"{args.drones} (give one value, or one per drone)")
+        return toks[:args.drones]
+
+    airlink_bands = [b.upper() for b in
+                     per_drone_list(args.airlink_bands, "airlink-bands")]
+    for b in airlink_bands:
+        if b not in ("2G4", "5G8", "DUAL", "-"):
+            ap.error(f"--airlink-bands: unknown band '{b}' "
+                     "(expected 2G4, 5G8, DUAL or -)")
+    airlink_channels = per_drone_list(args.airlink_channels, "airlink-channels")
+    for c in airlink_channels:
+        if c != "-":
+            try:
+                int(c)
+            except ValueError:
+                ap.error(f"--airlink-channels: '{c}' is not an integer or '-'")
+    video_mode = args.video_mode.strip()
+    if video_mode and not re.match(r"^\d+x\d+@\d+$", video_mode):
+        ap.error("--video-mode must look like 1920x1080@24")
     # Command-path mode: 'explicit' (IP list = canonical drone ids),
     # 'auto' (discover IPs from the server, drone id = slot), or
     # 'server' (legacy path through DroneSwarmServer).
@@ -1688,6 +1739,9 @@ def main():
             "min_separation": args.min_separation,
             "d_obs": args.d_obs, "r0_obs": args.r0_obs, "c_obs": args.c_obs,
             "shapes_file": args.shapes_file,
+            "airlink_bands": airlink_bands,
+            "airlink_channels": airlink_channels,
+            "video_mode": video_mode,
         })
         swarm.attach_logger(logger)
         print(f"  Flight logging -> {logger.session_dir} (disable with --no-log)")
@@ -1706,6 +1760,22 @@ def main():
                 print("OK", flush=True)
             except Exception as e:
                 print(f"FAIL: {e}", flush=True)
+
+    # One-shot AirLink / camera-stream setup ("AIRLINK:<band>:<channel>:<res>",
+    # parsed by SwarmActivity.applyAirlinkSettings). Per-drone radio config
+    # lives HERE — the RCs run identical APKs, and addressing follows the
+    # command channel (drone id), the same identity commands use. QoS 1 on the
+    # direct path queues the message for an RC that is still connecting; each
+    # RC shows the applied/rejected result on its own status line. Placed
+    # after the synchronous probe so a missing server slot surfaces there
+    # first (on the server path this send blocks in the wrapper too).
+    if (airlink_bands or airlink_channels or video_mode) and not args.dry_run:
+        for did in sorted(swarm.drones):
+            band = airlink_bands[did - 1] if airlink_bands else "-"
+            chan = airlink_channels[did - 1] if airlink_channels else "-"
+            cmd = "AIRLINK:{}:{}:{}".format(band, chan, video_mode or "-")
+            print(f"  AirLink setup -> drone {did}: {cmd}", flush=True)
+            swarm.drones[did].send_command(cmd)
 
     # Start background threads one drone at a time, with a brief sleep so each
     # thread can do its first iteration and surface any error before we move on.
