@@ -12,7 +12,7 @@
 
 @{
     # Number of drones in the swarm (creates IDs 1..N). CLI: -Drones
-    Drones = 1
+    Drones = 5
 
     # RC/broker IP addresses in DRONE-ID ORDER (index 1 = drone 1, ...). When
     # listed, swarm_flocking.py publishes commands DIRECTLY to each RC's MQTT

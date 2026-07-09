@@ -32,8 +32,10 @@ Joystick → swarm mapping:
                  from where the drones are actually facing.
     angular.x  → d_ref, linear map [0.6, 1.4] → scaled [0.5, 1.0]
                  (≈ physical [5, 10] m at ScaleFactor = 10)
-    switch s1  → toggle ENABLE_VS / DISABLE_VS for all drones (rising edge)
-    switch s2  → LAND all drones (rising edge)
+    switches   → intentionally unused; swarming Start/Stop is GUI-only (the
+                 browser Start/Stop buttons, via command_listener). Leaving the
+                 s1/s2 switches unwired means a switch left 'on' at connect can
+                 never auto-start the swarm.
     PC key 'q' → zero velocities, hold current position, disable VS, exit
 
 Obstacle avoidance from the C# original is ported in olfati_saber.py
@@ -893,7 +895,7 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
           f"(switch via --vel-frame if consensus oscillates)")
     if speed_scale != 1.0:
         print(f"  SLOW TEST MODE: commanded velocities/rates scaled to {speed_scale:.0%}")
-    print(f"  s1 / GUI button: toggle swarming (arm VS + flock)    s2: LAND-all")
+    print(f"  GUI Start/Stop buttons: toggle swarming (arm VS + flock)")
     print(f"  q  (PC keyboard): stop, hold position, disable VS, exit")
     print(f"  Ctrl+C: same, abrupt\n")
 
@@ -910,8 +912,6 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
     last_heading_mode = mode0           # detect GUI mode switches (below)
     last_swarming = swarming.is_set()   # starts cleared = held (do nothing)
     last_gimbal = None                  # last gimbal pitch applied to the drones
-    last_s1 = 0
-    last_s2 = 0
     last_t = time.time()
     last_print = 0.0
     no_fix_warned = set()
@@ -964,24 +964,11 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
 
         js = receiver.get_state()
 
-        # s1 rising edge: toggle the shared swarming gate (identical to the GUI
-        # Start/Stop buttons). Needs the joystick, so only when one is present.
-        if js is not None:
-            if js.s1 == 1 and last_s1 == 0:
-                (swarming.clear if swarming.is_set() else swarming.set)()
-                print(f"[s1] {'START' if swarming.is_set() else 'STOP'} swarming")
-            last_s1 = js.s1
-
-            # s2 rising edge: LAND all drones
-            if js.s2 == 1 and last_s2 == 0:
-                for d in swarm.drones.values():
-                    d.land()
-                print("[s2] LAND_ALL")
-            last_s2 = js.s2
-
-        # Swarming edge → arm/disarm VS. Done here (not in the listener thread or
-        # the s1 branch) so every ds_wrapper poke stays on this control-loop
-        # thread, and so the GUI can Start/Stop even with no joystick connected.
+        # Swarming edge → arm/disarm VS. Done here (not in the listener thread)
+        # so every ds_wrapper poke stays on this control-loop thread, and so the
+        # GUI can Start/Stop even with no joystick connected. The joystick s1/s2
+        # switches are intentionally NOT wired to swarming/LAND — Start/Stop is
+        # GUI-only, so a switch left 'on' at connect can't auto-arm the swarm.
         sw = swarming.is_set()
         if sw and not last_swarming:
             # A running rotation check must not overlap the swarm arming
