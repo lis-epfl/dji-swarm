@@ -38,6 +38,8 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.LinkedList;
 import java.util.Queue;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.concurrent.ArrayBlockingQueue;
 
 /* JADX INFO: loaded from: classes.dex */
@@ -52,6 +54,7 @@ public class DroneSwarmStreamData implements StreamDataListener {
     private static final int MSG_PACKET_2_PARSER = 4;
     private static final int MSG_TELEMETRY_DATA = 5;
     private static final int MSG_YUV_DATA = 3;
+    private static final long TELEMETRY_PUSH_INTERVAL_MS = 100;   // 10 Hz
     public static final String TAG;
     private static YuvDecoder dec;
     public boolean EnableRtspStream;
@@ -71,6 +74,7 @@ public class DroneSwarmStreamData implements StreamDataListener {
     private int resWH;
     private Surface surface;
     private VideoResolutionFrameRate vidResFrameRate;
+    private Timer telemetryPushTimer;
     private int width;
     private Attitude aircraft_attitude = null;
     private LocationCoordinate3D curr_loc = null;
@@ -86,20 +90,23 @@ public class DroneSwarmStreamData implements StreamDataListener {
     private long frameIndex = 0;
     private long rtspFramesFed = 0;
     private long parseCount = 0;
-    private double curr_lat_dj = 0.0d;
-    private double curr_lon_dj = 0.0d;
-    private double curr_alt_dj = 0.0d;
-    private double curr_comp = 0.0d;
-    private double curr_tilt = 0.0d;
-    private double gimbal_pan = 0.0d;
-    private double gimbal_yaw = 0.0d;
-    private double drone_pitch = 0.0d;
-    private double drone_roll = 0.0d;
-    private double drone_yaw = 0.0d;
-    private double velocity_x = 0.0d;
-    private double velocity_y = 0.0d;
-    private double velocity_z = 0.0d;
-    private Integer satelliteCount = 0;
+    // Telemetry cache: written by the KeyManager listeners registered in
+    // startTelemetryKeyListeners() (push updates from the aircraft), read by
+    // getTelemetryData() on the handler thread — hence volatile.
+    private volatile double curr_lat_dj = 0.0d;
+    private volatile double curr_lon_dj = 0.0d;
+    private volatile double curr_alt_dj = 0.0d;
+    private volatile double curr_comp = 0.0d;
+    private volatile double curr_tilt = 0.0d;
+    private volatile double gimbal_pan = 0.0d;
+    private volatile double gimbal_yaw = 0.0d;
+    private volatile double drone_pitch = 0.0d;
+    private volatile double drone_roll = 0.0d;
+    private volatile double drone_yaw = 0.0d;
+    private volatile double velocity_x = 0.0d;
+    private volatile double velocity_y = 0.0d;
+    private volatile double velocity_z = 0.0d;
+    private volatile Integer satelliteCount = 0;
     private Integer targetWayPointDone = 0;
     private Integer targetWayPointDoneset = 0;
     private Integer withlimit = 0;
@@ -191,6 +198,7 @@ public class DroneSwarmStreamData implements StreamDataListener {
                 return false;
             }
         });
+        startTelemetryKeyListeners();
     }
 
     public void onReceive(IVideoFrame iVideoFrame) {
@@ -753,6 +761,8 @@ public class DroneSwarmStreamData implements StreamDataListener {
         // Enable feedFrame immediately
         this.EnableRtspStream = true;
         Log.v(TAG, "feedFrame enabled — RTSP streaming active");
+        // Telemetry pushes no longer depend solely on video frames arriving
+        startTelemetryPushTimer();
         // Step 4: Switch camera resolution back and forth to force new IDR/VPS/SPS/PPS
         new Thread(() -> {
             try {
@@ -773,6 +783,11 @@ public class DroneSwarmStreamData implements StreamDataListener {
     }
 
     public void stop() {
+        if (this.telemetryPushTimer != null) {
+            this.telemetryPushTimer.cancel();
+            this.telemetryPushTimer = null;
+        }
+        KeyManager.getInstance().cancelListen(this);
         if (this.RtspIsRunning) {
             stopRTSPServer(this.sessionId);
         }
@@ -801,78 +816,94 @@ public class DroneSwarmStreamData implements StreamDataListener {
         this.virtualstickonoff = d;
     }
 
+    /**
+     * Register push listeners for every telemetry key. The old implementation
+     * issued six one-shot KeyManager.getValue() round-trips per received video
+     * frame (~30 Hz = ~180 key requests/s over the OcuSync link, each answered
+     * from a cache that only refreshes at the aircraft push rate anyway).
+     * Listeners deliver the same cache updates without the per-frame request
+     * chatter — which matters once ten aircraft/RC links share the spectrum.
+     */
+    private void startTelemetryKeyListeners() {
+        KeyManager.getInstance().listen(
+            KeyTools.createKey(GimbalKey.KeyGimbalAttitude), this,
+            (Attitude oldVal, Attitude newVal) -> {
+                if (newVal != null) {
+                    this.curr_tilt = newVal.getPitch().doubleValue();
+                    this.gimbal_pan = newVal.getRoll().doubleValue();
+                    this.gimbal_yaw = newVal.getYaw().doubleValue();
+                }
+            });
+        KeyManager.getInstance().listen(
+            KeyTools.createKey(FlightControllerKey.KeyGPSSatelliteCount), this,
+            (Integer oldVal, Integer newVal) -> {
+                if (newVal != null) this.satelliteCount = newVal;
+            });
+        KeyManager.getInstance().listen(
+            KeyTools.createKey(FlightControllerKey.KeyAircraftAttitude), this,
+            (Attitude oldVal, Attitude newVal) -> {
+                if (newVal != null) {
+                    this.drone_pitch = newVal.getPitch().doubleValue();
+                    this.drone_roll = newVal.getRoll().doubleValue();
+                    this.drone_yaw = newVal.getYaw().doubleValue();
+                }
+            });
+        KeyManager.getInstance().listen(
+            KeyTools.createKey(FlightControllerKey.KeyAircraftVelocity), this,
+            (Velocity3D oldVal, Velocity3D newVal) -> {
+                if (newVal != null) {
+                    this.velocity_x = newVal.getX().doubleValue();
+                    this.velocity_y = newVal.getY().doubleValue();
+                    this.velocity_z = newVal.getZ().doubleValue();
+                }
+            });
+        // In RTK mode getTelemetryData() overwrites position/heading from the
+        // RTK listener, so these two can update the cache unconditionally.
+        KeyManager.getInstance().listen(
+            KeyTools.createKey(FlightControllerKey.KeyAircraftLocation3D), this,
+            (LocationCoordinate3D oldVal, LocationCoordinate3D newVal) -> {
+                if (newVal != null) {
+                    this.curr_lat_dj = newVal.getLatitude().doubleValue();
+                    this.curr_lon_dj = newVal.getLongitude().doubleValue();
+                    this.curr_alt_dj = newVal.getAltitude().doubleValue();
+                }
+            });
+        KeyManager.getInstance().listen(
+            KeyTools.createKey(FlightControllerKey.KeyCompassHeading), this,
+            (Double oldVal, Double newVal) -> {
+                if (newVal != null) this.curr_comp = newVal.doubleValue();
+            });
+    }
+
+    /**
+     * Push the cached telemetry into the native RTSP data stream at a fixed
+     * 10 Hz, independent of video frame arrival. The per-frame trigger in
+     * onReceive() remains: if the native lib only flushes telemetry alongside
+     * frames the duplicates are harmless (latest-wins on the PC), and when
+     * video stalls under RF congestion this timer keeps telemetry flowing.
+     */
+    private void startTelemetryPushTimer() {
+        if (this.telemetryPushTimer != null) {
+            return;
+        }
+        this.telemetryPushTimer = new Timer("TelemetryPush");
+        this.telemetryPushTimer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                Message messageObtain = Message.obtain();
+                messageObtain.what = 5;
+                DroneSwarmStreamData.this.handlerNew.sendMessage(messageObtain);
+            }
+        }, TELEMETRY_PUSH_INTERVAL_MS, TELEMETRY_PUSH_INTERVAL_MS);
+    }
+
     /* JADX INFO: Access modifiers changed from: private */
     public void getTelemetryData() {
-        if (this.aosManager.isRunning()) {
-            KeyManager.getInstance().getValue(KeyTools.createKey(GimbalKey.KeyGimbalAttitude), new CommonCallbacks.CompletionCallbackWithParam<Attitude>() { // from class: at.jku.icg.aos_dji_sdkv5.core.DroneSwarmStreamData.7
-                public void onFailure(IDJIError iDJIError) {
-                }
-
-                /* JADX DEBUG: Method merged with bridge method: onSuccess(Ljava/lang/Object;)V */
-                public void onSuccess(Attitude attitude) {
-                    DroneSwarmStreamData.this.curr_tilt = attitude.getPitch().doubleValue();
-                    DroneSwarmStreamData.this.gimbal_pan = attitude.getRoll().doubleValue();
-                    DroneSwarmStreamData.this.gimbal_yaw = attitude.getYaw().doubleValue();
-                }
-            });
-            KeyManager.getInstance().getValue(KeyTools.createKey(FlightControllerKey.KeyGPSSatelliteCount), new CommonCallbacks.CompletionCallbackWithParam<Integer>() { // from class: at.jku.icg.aos_dji_sdkv5.core.DroneSwarmStreamData.8
-                public void onFailure(IDJIError iDJIError) {
-                }
-
-                /* JADX DEBUG: Method merged with bridge method: onSuccess(Ljava/lang/Object;)V */
-                public void onSuccess(Integer num) {
-                    DroneSwarmStreamData.this.satelliteCount = num;
-                }
-            });
-            KeyManager.getInstance().getValue(KeyTools.createKey(FlightControllerKey.KeyAircraftAttitude), new CommonCallbacks.CompletionCallbackWithParam<Attitude>() { // from class: at.jku.icg.aos_dji_sdkv5.core.DroneSwarmStreamData.9
-                public void onFailure(IDJIError iDJIError) {
-                }
-
-                /* JADX DEBUG: Method merged with bridge method: onSuccess(Ljava/lang/Object;)V */
-                public void onSuccess(Attitude attitude) {
-                    DroneSwarmStreamData.this.drone_pitch = attitude.getPitch().doubleValue();
-                    DroneSwarmStreamData.this.drone_roll = attitude.getRoll().doubleValue();
-                    DroneSwarmStreamData.this.drone_yaw = attitude.getYaw().doubleValue();
-                }
-            });
-            KeyManager.getInstance().getValue(KeyTools.createKey(FlightControllerKey.KeyAircraftVelocity), new CommonCallbacks.CompletionCallbackWithParam<Velocity3D>() { // from class: at.jku.icg.aos_dji_sdkv5.core.DroneSwarmStreamData.10
-                public void onFailure(IDJIError iDJIError) {
-                }
-
-                /* JADX DEBUG: Method merged with bridge method: onSuccess(Ljava/lang/Object;)V */
-                public void onSuccess(Velocity3D velocity3D) {
-                    DroneSwarmStreamData.this.velocity_x = velocity3D.getX().doubleValue();
-                    DroneSwarmStreamData.this.velocity_y = velocity3D.getY().doubleValue();
-                    DroneSwarmStreamData.this.velocity_z = velocity3D.getZ().doubleValue();
-                }
-            });
-        }
         if (this.rtk_mode.booleanValue()) {
             this.curr_lat_dj = this.curr_loc_rtk.getLatitude().doubleValue();
             this.curr_lon_dj = this.curr_loc_rtk.getLongitude().doubleValue();
             this.curr_alt_dj = this.curr_loc_rtk1.getAltitude().doubleValue();
             this.curr_comp = this.curr_compass_rtk.doubleValue();
-        } else {
-            KeyManager.getInstance().getValue(KeyTools.createKey(FlightControllerKey.KeyAircraftLocation3D), new CommonCallbacks.CompletionCallbackWithParam<LocationCoordinate3D>() { // from class: at.jku.icg.aos_dji_sdkv5.core.DroneSwarmStreamData.11
-                public void onFailure(IDJIError iDJIError) {
-                }
-
-                /* JADX DEBUG: Method merged with bridge method: onSuccess(Ljava/lang/Object;)V */
-                public void onSuccess(LocationCoordinate3D locationCoordinate3D) {
-                    DroneSwarmStreamData.this.curr_lat_dj = locationCoordinate3D.getLatitude().doubleValue();
-                    DroneSwarmStreamData.this.curr_lon_dj = locationCoordinate3D.getLongitude().doubleValue();
-                    DroneSwarmStreamData.this.curr_alt_dj = locationCoordinate3D.getAltitude().doubleValue();
-                }
-            });
-            KeyManager.getInstance().getValue(KeyTools.createKey(FlightControllerKey.KeyCompassHeading), new CommonCallbacks.CompletionCallbackWithParam<Double>() { // from class: at.jku.icg.aos_dji_sdkv5.core.DroneSwarmStreamData.12
-                public void onFailure(IDJIError iDJIError) {
-                }
-
-                /* JADX DEBUG: Method merged with bridge method: onSuccess(Ljava/lang/Object;)V */
-                public void onSuccess(Double d) {
-                    DroneSwarmStreamData.this.curr_comp = d.doubleValue();
-                }
-            });
         }
         setTelemetryData(this.curr_lat_dj, this.curr_lon_dj, this.curr_alt_dj, this.curr_comp, this.curr_tilt, this.gimbal_pan, this.gimbal_yaw, this.satelliteCount.intValue(), this.drone_pitch, this.drone_roll, this.drone_yaw, this.velocity_x, this.velocity_y, this.velocity_z, this.targetWayPointDone.intValue(), this.setvaluetocheck, this.virtualstickonoff);
     }
