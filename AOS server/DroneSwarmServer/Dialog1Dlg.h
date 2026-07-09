@@ -100,7 +100,9 @@ public:
 	CString IPperDrone[10];
 	CString PortperDrone[10];
 	int MQTTDrone_Number;
-	int droneNum;
+	// Currently selected drone (spin control). Written by the UI thread, read
+	// by every AVThread decode worker to skip UI work for unselected drones.
+	volatile int droneNum;
 	int dNum;
 	long interval;
 	UINT Timeval;

@@ -246,6 +246,16 @@ def _probe_slot_receivers(slots, sender, timeout=IDCHECK_TIMEOUT_S):
     the duration. Markers are inert on the app side (SwarmActivity ignores
     unknown command strings).
 
+    Slots are probed concurrently, one worker thread each: every
+    ``sendWayPointData`` still blocks ~220 ms in the server (its send path
+    reconnects per command) and an unresolved slot still waits the full
+    `timeout`, but the round-trips overlap, so the whole probe costs about one
+    slot's worst case instead of N of them (~25 s -> ~2.5 s at 10 drones on
+    the swarming-Start edge). Safe to overlap: each slot has its own shared-
+    memory status byte, the wrapper releases the GIL while it spins, the
+    server handles each send on a detached thread, and probe_wait_for filters
+    the shared capture buffer by its own marker under a lock.
+
     Returns ({slot: receiver_id}, problems): receiver_id is the sender key
     (drone id / provisional index) whose broker got the marker; `problems` is
     a list of human-readable strings (empty = every slot resolved uniquely).
@@ -253,6 +263,28 @@ def _probe_slot_receivers(slots, sender, timeout=IDCHECK_TIMEOUT_S):
     nonce = "{}_{}".format(os.getpid(), int(time.time()))
     received = {}
     problems = []
+    slot_problems = {}
+
+    def probe_one(slot):
+        marker = "IDCHECK:{}:{}".format(slot, nonce)
+        try:
+            w.sendWayPointData(marker, slot)
+        except Exception as e:
+            slot_problems[slot] = ("server slot {}: sendWayPointData failed "
+                                   "({})".format(slot, e))
+            return
+        hits = sender.probe_wait_for(marker, timeout=timeout)
+        if len(hits) == 1:
+            received[slot] = hits[0]
+        elif not hits:
+            slot_problems[slot] = ("server slot {}: marker never arrived on "
+                                   "any known broker (slot not connected in "
+                                   "the server, or its RC is not among the "
+                                   "command IPs)".format(slot))
+        else:
+            slot_problems[slot] = ("server slot {}: marker arrived on "
+                                   "multiple command connections {} — "
+                                   "duplicate IP?".format(slot, hits))
 
     offline = sender.probe_start()
     try:
@@ -261,28 +293,18 @@ def _probe_slot_receivers(slots, sender, timeout=IDCHECK_TIMEOUT_S):
                             "invisible to the probe".format(
                                 offline,
                                 ", ".join(sender.ip_of(d) or "?" for d in offline)))
+        workers = [threading.Thread(target=probe_one, args=(slot,),
+                                    name="IDProbe_{}".format(slot), daemon=True)
+                   for slot in slots]
+        for t in workers:
+            t.start()
+        for t in workers:
+            t.join()
+        # Per-slot verdicts land in dicts keyed by slot (one writer each, so
+        # no lock needed); report problems in slot order for stable logs.
         for slot in slots:
-            marker = "IDCHECK:{}:{}".format(slot, nonce)
-            try:
-                # Blocks ~220 ms for the server's connect->publish->disconnect;
-                # returns fast if the slot isn't connected in the server.
-                w.sendWayPointData(marker, slot)
-            except Exception as e:
-                problems.append("server slot {}: sendWayPointData failed ({})"
-                                .format(slot, e))
-                continue
-            hits = sender.probe_wait_for(marker, timeout=timeout)
-            if len(hits) == 1:
-                received[slot] = hits[0]
-            elif not hits:
-                problems.append("server slot {}: marker never arrived on any "
-                                "known broker (slot not connected in the "
-                                "server, or its RC is not among the command "
-                                "IPs)".format(slot))
-            else:
-                problems.append("server slot {}: marker arrived on multiple "
-                                "command connections {} — duplicate IP?"
-                                .format(slot, hits))
+            if slot in slot_problems:
+                problems.append(slot_problems[slot])
     finally:
         sender.probe_stop()
 

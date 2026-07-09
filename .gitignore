@@ -49,9 +49,11 @@ packages/
 # the DroneSwarmServer.exe, the ds_wrapper Python module). Required Android
 # .so libs live under lis-swarm-app/app/src/main/{lib,jniLibs} and are NOT ignored.
 *.exe
+*.exe.old
 *.lib
 *.a
 *.pyd
+*.pyd.old
 python37.dll
 
 # ===== Generated / captured runtime artifacts =====

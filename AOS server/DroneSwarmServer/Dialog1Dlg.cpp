@@ -301,6 +301,7 @@ int CDialog1Dlg::AVThread(int droneNumber)
 	BYTE field1, field2, field3, field4;
 	AVPacket *packet = nullptr;
 	uint8_t* buffer = nullptr;
+	struct SwsContext* pSwsCtx = nullptr;
 	void* pAVStore[2] = { nullptr, nullptr };
 	void* pTelemetry[2] = { nullptr, nullptr };
 
@@ -488,9 +489,16 @@ int CDialog1Dlg::AVThread(int droneNumber)
 		{
 			// Anything other than the video stream is incoming Telemetry data!
 			telemetryData[droneNumber - 1].SetString(reinterpret_cast<const char*>(packet->data), packet->size);
-			pTelemetry[0] = telemetryData[droneNumber - 1].GetBuffer();
-			pTelemetry[1] = &droneNumber;
-			PostMessage(WM_THREAD_DATA, (WPARAM)pTelemetry, (LPARAM)telemetryData[droneNumber - 1].GetLength());
+			// Only the selected drone's telemetry is rendered — post only for
+			// it. HandleTelemetryData drops the others anyway, and with many
+			// drones the useless posts back up the one UI pump the wrapper's
+			// busy-waited requests also go through.
+			if (droneNum == droneNumber)
+			{
+				pTelemetry[0] = telemetryData[droneNumber - 1].GetBuffer();
+				pTelemetry[1] = &droneNumber;
+				PostMessage(WM_THREAD_DATA, (WPARAM)pTelemetry, (LPARAM)telemetryData[droneNumber - 1].GetLength());
+			}
 			continue;
 		}
 
@@ -507,14 +515,14 @@ int CDialog1Dlg::AVThread(int droneNumber)
 		// Did we get a video frame?
 		if (frameFinished == 0 && droneNum == droneNumber && pFrame->linesize[0] > 0)
 		{
-			// Convert the image from its native format to RGB
-			struct SwsContext* context = sws_getContext(pCodecCtx->width, pCodecCtx->height,
+			// Convert the image from its native format to RGB. The cached
+			// context is reused across frames (recreated only on a format/
+			// size change) instead of an alloc+free per frame.
+			pSwsCtx = sws_getCachedContext(pSwsCtx, pCodecCtx->width, pCodecCtx->height,
 				pCodecCtx->pix_fmt, pCodecCtx->width, pCodecCtx->height,
 				AV_PIX_FMT_BGR24, SWS_FAST_BILINEAR, NULL, NULL, NULL);
-		
-			sws_scale(context, pFrame->data, pFrame->linesize, 0, pCodecCtx->height, pFrameRGB->data, pFrameRGB->linesize);
 
-			sws_freeContext(context);
+			sws_scale(pSwsCtx, pFrame->data, pFrame->linesize, 0, pCodecCtx->height, pFrameRGB->data, pFrameRGB->linesize);
 
 			pFrameRGB->flags = pFrame->flags;
 			pFrameRGB->repeat_pict = pFrame->repeat_pict;
@@ -533,6 +541,8 @@ end:
 		av_free(pFrameRGB);
 	if (buffer)
 		av_free(buffer);
+	if (pSwsCtx)
+		sws_freeContext(pSwsCtx);
 	if (pCodecCtx)
 		avcodec_free_context(&pCodecCtx);
 	if (pFormatCtx)

@@ -4,11 +4,16 @@
 #include "framework.h"
 #include "DroneSwarm_Wrapper.h"
 
-#include <windows.h> 
+#include <windows.h>
 #include <memory.h>
+#include <string>
 
 #define SHMEMSIZE 130000000
 #define SHMEMSLOTSIZE 12500000
+// The mapping holds exactly this many 1-based drone slots (10). The offset
+// math on a number outside 1..MAXDRONESLOTS silently addresses memory past
+// the arena, so every entry point rejects it up front.
+#define MAXDRONESLOTS (SHMEMSIZE / SHMEMSLOTSIZE)
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
@@ -161,8 +166,24 @@ __declspec(dllexport) void InitWrapper(HWND dialog)
     memcpy(lpvMem, &intp, sizeof(uint64_t));
 }
 
+// Validate a 1-based drone number and return its slot offset; raises a
+// Python ValueError on the pybind entry points instead of letting the caller
+// read/write outside the shared-memory arena.
+static int slotOffset(int DroneNumber)
+{
+    if (DroneNumber < 1 || DroneNumber > MAXDRONESLOTS)
+        throw py::value_error("DroneNumber must be 1.." +
+                              std::to_string(MAXDRONESLOTS) + ", got " +
+                              std::to_string(DroneNumber));
+    return (DroneNumber - 1) * SHMEMSLOTSIZE;
+}
+
 __declspec(dllexport) void* data2Server(int DroneNumber)
 {
+    // Called from DroneSwarmServer (no Python exception machinery there):
+    // out-of-range gets a null pointer rather than an out-of-arena one.
+    if (DroneNumber < 1 || DroneNumber > MAXDRONESLOTS)
+        return nullptr;
     int offset = (DroneNumber - 1) * SHMEMSLOTSIZE;
     return (uint8_t*)lpvMem + offset;
 }
@@ -202,7 +223,7 @@ int sendWayPointData(const char* data, int DroneNumber)
 {
     int ret;
     MSG msg = { 0 };
-    int slot_offset = (DroneNumber - 1) * SHMEMSLOTSIZE;
+    int slot_offset = slotOffset(DroneNumber);
     uint64_t len = CString(data).GetLength();
 
     if (len <= 0)
@@ -246,7 +267,7 @@ py::array getImageAndTelemetryData(int DroneNumber)
 {
     bool status = true;
     uint64_t temp;
-    int slot_offset = (DroneNumber - 1) * SHMEMSLOTSIZE;
+    int slot_offset = slotOffset(DroneNumber);
 
     memcpy(&temp, lpvMem, sizeof(uint64_t));
     const uint64_t intp = temp;
@@ -290,7 +311,7 @@ py::array getEncodedImageData(const char* data, int DroneNumber)
 #define MEMOFFSETIMG 4000000
     bool status = true;
     uint64_t temp;
-    int slot_offset = (DroneNumber - 1) * SHMEMSLOTSIZE;
+    int slot_offset = slotOffset(DroneNumber);
     uint64_t len = CString(data).GetLength();
 
     memcpy(&temp, lpvMem, sizeof(uint64_t));
