@@ -15,6 +15,8 @@ import at.jku.icg.aos_dji_sdkv5.core.DroneSwarmStreamData;
 import at.jku.icg.aos_dji_sdkv5.core.MQTTEmbedded;
 import at.jku.icg.aos_dji_sdkv5.dji.DJIManager;
 
+import dji.sdk.keyvalue.key.AirLinkKey;
+import dji.sdk.keyvalue.key.BatteryKey;
 import dji.sdk.keyvalue.key.FlightControllerKey;
 import dji.sdk.keyvalue.key.GimbalKey;
 import dji.sdk.keyvalue.key.KeyTools;
@@ -93,6 +95,8 @@ public class SwarmActivity extends Activity {
     private volatile double telemGimbalPitch = 0, telemGimbalRoll = 0, telemGimbalYaw = 0;
     private volatile double telemVx = 0, telemVy = 0, telemVz = 0;
     private volatile int telemSatCount = 0;
+    private volatile int telemBatteryPercent = -1;   // -1 = not yet reported
+    private volatile int telemSignalQuality = -1;     // 0-100, -1 = not yet reported
 
     // Video
     private SurfaceView surfaceVideo;
@@ -106,6 +110,8 @@ public class SwarmActivity extends Activity {
     private TextView tvTelemAttitude;
     private TextView tvTelemGimbal;
     private TextView tvTelemVelocity;
+    private TextView tvBattery;
+    private TextView tvLink;
     private Button btnStartRtsp;
     private Button btnEnableVs;
     private Button btnDisableVs;
@@ -135,6 +141,8 @@ public class SwarmActivity extends Activity {
         tvTelemAttitude = findViewById(R.id.tv_telem_attitude);
         tvTelemGimbal = findViewById(R.id.tv_telem_gimbal);
         tvTelemVelocity = findViewById(R.id.tv_telem_velocity);
+        tvBattery = findViewById(R.id.tv_battery);
+        tvLink = findViewById(R.id.tv_link);
         btnStartRtsp = findViewById(R.id.btn_start_rtsp);
         btnEnableVs = findViewById(R.id.btn_enable_vs);
         btnDisableVs = findViewById(R.id.btn_disable_vs);
@@ -342,6 +350,20 @@ public class SwarmActivity extends Activity {
             (Integer oldVal, Integer newVal) -> {
                 if (newVal != null) telemSatCount = newVal;
             });
+
+        // Battery charge remaining (percent)
+        KeyManager.getInstance().listen(
+            KeyTools.createKey(BatteryKey.KeyChargeRemainingInPercent), this,
+            (Integer oldVal, Integer newVal) -> {
+                if (newVal != null) telemBatteryPercent = newVal;
+            });
+
+        // Air link signal quality (0-100), i.e. connection quality to the RC
+        KeyManager.getInstance().listen(
+            KeyTools.createKey(AirLinkKey.KeySignalQuality), this,
+            (Integer oldVal, Integer newVal) -> {
+                if (newVal != null) telemSignalQuality = newVal;
+            });
     }
 
     /**
@@ -353,6 +375,16 @@ public class SwarmActivity extends Activity {
             @Override
             public void run() {
                 uiHandler.post(() -> {
+                    tvBattery.setText(telemBatteryPercent < 0
+                        ? "BAT: --%"
+                        : String.format(Locale.US, "BAT: %d%%", telemBatteryPercent));
+                    tvBattery.setTextColor(batteryColor(telemBatteryPercent));
+
+                    tvLink.setText(telemSignalQuality < 0
+                        ? "LINK: --"
+                        : String.format(Locale.US, "LINK: %d%%", telemSignalQuality));
+                    tvLink.setTextColor(signalColor(telemSignalQuality));
+
                     tvTelemGps.setText(String.format(Locale.US,
                         "GPS: %.6f, %.6f  Alt:%.1fm\nHdg:%.1f  Sat:%d",
                         telemLat, telemLon, telemAlt, telemHeading, telemSatCount));
@@ -522,6 +554,22 @@ public class SwarmActivity extends Activity {
     private void updateStatus(String msg) {
         Log.i(TAG, msg);
         uiHandler.post(() -> tvStatus.setText(msg));
+    }
+
+    /** Green >50%, amber 20-50%, red <20%, grey if unknown. */
+    private static int batteryColor(int percent) {
+        if (percent < 0) return 0xFFCCCCCC;
+        if (percent < 20) return 0xFFFF4444;
+        if (percent < 50) return 0xFFFFCC00;
+        return 0xFF00FF00;
+    }
+
+    /** Green >70, amber 40-70, red <40 (0-100 signal quality), grey if unknown. */
+    private static int signalColor(int quality) {
+        if (quality < 0) return 0xFFCCCCCC;
+        if (quality < 40) return 0xFFFF4444;
+        if (quality < 70) return 0xFFFFCC00;
+        return 0xFF00FF00;
     }
 
     /**

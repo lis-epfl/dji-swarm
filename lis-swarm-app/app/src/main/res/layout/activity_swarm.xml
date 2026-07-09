@@ -43,14 +43,40 @@
                 android:textSize="12sp"/>
         </LinearLayout>
 
-        <TextView
-            android:id="@+id/tv_vs_state"
-            android:layout_width="wrap_content"
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="VS: -- | Auth: --"
-            android:textColor="#ffcc00"
-            android:textSize="12sp"
-            android:layout_marginTop="2dp"/>
+            android:orientation="horizontal"
+            android:layout_marginTop="2dp">
+
+            <TextView
+                android:id="@+id/tv_vs_state"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="VS: -- | Auth: --"
+                android:textColor="#ffcc00"
+                android:textSize="12sp"/>
+
+            <TextView
+                android:id="@+id/tv_battery"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="BAT: --%"
+                android:textColor="#cccccc"
+                android:textSize="12sp"
+                android:textStyle="bold"
+                android:layout_marginEnd="12dp"/>
+
+            <TextView
+                android:id="@+id/tv_link"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="LINK: --"
+                android:textColor="#cccccc"
+                android:textSize="12sp"
+                android:textStyle="bold"/>
+        </LinearLayout>
     </LinearLayout>
 
     <!-- Right-side telemetry panel -->
