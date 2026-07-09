@@ -250,7 +250,14 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   construction. The old AOS broker was immune for the same reason — it used the slot for
   both directions.
 - **Fresh telemetry is only ~5 Hz per drone** even though the fetch loop runs at 20 Hz —
-  ~75% of fetches return the same sample (app-side update rate; not yet investigated).
+  ~60% of fetches return a byte-identical repeat of the previous sample (measured across
+  2026-07 flight logs). Per-field fresh rates: GPS lat/lon ~5 Hz, heading/attitude ~4–5 Hz,
+  gimbal ~5–6 Hz, and velocity `vx/vy/vz` only ~1–2 Hz — near-useless for control; derive
+  velocity from GPS positions instead (as `response_monitor.py` does). Root cause is
+  app-side: `DroneSwarmStreamData.getTelemetryData()` runs once per video frame but fires
+  *async* `KeyManager.getValue()` reads and immediately publishes the previous cached
+  values, so freshness is capped by the DJI SDK key-update rate, not the sampling loop
+  (switching to `KeyManager.listen()` push listeners is the fix if more is ever needed).
   Budget control gains accordingly: at the current 40 °/s yaw-rate clamp a drone turns up
   to 8° between fresh heading samples. Don't raise `MAX_YAW_RATE_DEG_S`/`KP_YAW` without
   checking this rate first.
@@ -275,9 +282,15 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   `joystick_controller.DroneController.start` are drift-compensated for the same reason —
   a naive `sleep(interval)` after a ~30 ms blocking fetch can't hold 20 Hz.
 - The `joystick_controller.py` "VS_Send" thread relays at 20 Hz; the app re-sends to DJI
-  at its own 20 Hz. Telemetry/image fetches run at 20 Hz per drone (video arrives at
-  ~30 Hz, so that's comfortably under the ceiling). Stale-command handling matters — see
-  the UDP staleness window in `udp_joystick_receiver.py`.
+  at its own 20 Hz. Telemetry/image fetches run at 20 Hz per drone. **Video is NOT a
+  uniform 30 fps** — the app never sets a frame rate; each aircraft streams at whatever
+  its camera's recording frame rate is configured to in the DJI menus, and the 2026-07
+  fleet measured a mix of ~24 / 25 / ~30 fps per aircraft. All rates are still above the
+  20 Hz fetch loop so nothing starves, but standardize the camera settings if the stitcher
+  needs uniform frame ages. (The live stream codec is H.265 end-to-end regardless of the
+  camera's recording-codec setting — the server's decoder options are `hevc_cuvid`/`hevc`
+  only.) Stale-command handling matters — see the UDP staleness window in
+  `udp_joystick_receiver.py`.
 - **The `.ps1` launchers are the real entry points — keep them in sync.** The operator does
   not run `python …` by hand; they run `.\dji-joystick.ps1` / `.\dji-flocking.ps1` /
   `.\dji-gui.ps1` (all in `AOS server/`). Each launcher hard-codes the `python` command line
