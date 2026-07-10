@@ -71,6 +71,11 @@ import java.util.TimerTask;
  *   "AIRLINK:band:channel:res@fps" — one-shot radio/camera-stream setup
  *     (see applyAirlinkSettings; sent by the PC after its command channel
  *     connects so per-drone radio config lives in the PC's flocking config)
+ *
+ * Operator lockout: the on-screen Disable VS button latches out ALL PC motion
+ * commands (VS:, ENABLE_VS, TAKEOFF, LAND) until the on-screen Enable VS
+ * button is pressed. Only AIRLINK: and DISABLE_VS pass through while latched.
+ * PC-sent DISABLE_VS does NOT latch (GUI Stop→Start keeps working).
  */
 public class SwarmActivity extends Activity {
 
@@ -93,7 +98,24 @@ public class SwarmActivity extends Activity {
     private volatile double cmdGimbalYaw = 0;
     private volatile boolean vsActive = false;
 
-    private VirtualStickState currentVsState;
+    // Operator lockout latch: set by the local Disable VS button, cleared ONLY
+    // by the local Enable VS button. While set, PC motion commands (VS:,
+    // ENABLE_VS, TAKEOFF, LAND) are ignored — the PC streams VS: at 20 Hz for
+    // the life of its controller and its QoS-1 one-shots can arrive late after
+    // a link blip, so a plain disableVirtualStick() call is not an operator
+    // override (the next incoming message re-fills the command cache within
+    // 50 ms, and a queued ENABLE_VS can silently re-arm). PC-initiated
+    // DISABLE_VS never sets this latch, so normal GUI Stop→Start is unaffected.
+    private volatile boolean pcLockout = false;
+    private long lockoutDropCount = 0;              // MQTT thread ++, UI thread resets; log-only
+    private volatile long lastLockoutLogMs = 0;
+    private volatile long lastLockoutDisableRetryMs = 0;
+    private static final long LOCKOUT_LOG_INTERVAL_MS = 2000;
+    private static final long LOCKOUT_DISABLE_RETRY_MS = 1000;
+
+    // volatile: written by DJI's state listener, read by the VS send timer
+    // (the lockout retry checks it cross-thread)
+    private volatile VirtualStickState currentVsState;
     private Timer vsSendTimer;
     private Timer telemUiTimer;
 
@@ -158,8 +180,8 @@ public class SwarmActivity extends Activity {
         surfaceVideo = findViewById(R.id.surface_video);
 
         btnStartRtsp.setOnClickListener(v -> onStartRtspClicked());
-        btnEnableVs.setOnClickListener(v -> enableVirtualStick());
-        btnDisableVs.setOnClickListener(v -> disableVirtualStick());
+        btnEnableVs.setOnClickListener(v -> onLocalEnableClicked());
+        btnDisableVs.setOnClickListener(v -> onLocalDisableClicked());
 
         // Create DJI VideoDecoder once the surface is available
         surfaceVideo.getHolder().addCallback(new SurfaceHolder.Callback() {
@@ -273,6 +295,22 @@ public class SwarmActivity extends Activity {
         // DIAGNOSTIC: log every MQTT command landing on the app
         Log.v(TAG, "MQTT recv: " + command + "  ts=" + System.currentTimeMillis());
         if (command == null || command.isEmpty()) return;
+
+        // Operator lockout: drop every motion command from the PC (VS: stream,
+        // ENABLE_VS, TAKEOFF, LAND). DISABLE_VS stays honored (redundant but
+        // harmless, and it never clears the latch); AIRLINK: stays honored
+        // (radio/camera config, no motion).
+        if (pcLockout && (command.startsWith("VS:") || command.equals("ENABLE_VS")
+                || command.equals("TAKEOFF") || command.equals("LAND"))) {
+            lockoutDropCount++;
+            long now = System.currentTimeMillis();
+            if (now - lastLockoutLogMs >= LOCKOUT_LOG_INTERVAL_MS) {
+                lastLockoutLogMs = now;
+                Log.i(TAG, "PC lockout: dropped " + lockoutDropCount
+                    + " PC motion commands (latest: " + command + ")");
+            }
+            return;
+        }
 
         if (command.startsWith("VS:")) {
             String[] parts = command.substring(3).split(":");
@@ -562,8 +600,7 @@ public class SwarmActivity extends Activity {
                     currentVsState = state;
                     vsActive = state.isVirtualStickEnable();
                     droneSwarmStreamData.virtualstickonoff = vsActive ? 1.0 : 0.0;
-                    uiHandler.post(() -> tvVsState.setText(String.format("VS: %s",
-                        vsActive ? "ENABLED" : "DISABLED")));
+                    refreshVsStateLabel();
                 }
 
                 @Override
@@ -571,6 +608,38 @@ public class SwarmActivity extends Activity {
                     Log.i(TAG, "Flight authority change: " + reason.name());
                 }
             });
+    }
+
+    // ========== Local operator buttons (RC screen) ==========
+
+    /**
+     * Disable VS button: engage the PC lockout latch, close the send-loop gate
+     * immediately (waiting for DJI's async state listener would let PC commands
+     * keep reaching the FC for a beat after the press), then disable VS. The
+     * latch stays on until the local Enable VS button is pressed — a PC GUI
+     * Start will NOT re-arm this aircraft while latched.
+     */
+    private void onLocalDisableClicked() {
+        pcLockout = true;
+        lockoutDropCount = 0;
+        vsActive = false;   // eager; onVirtualStickStateUpdate stays the source of truth
+        disableVirtualStick();
+        updateStatus("PC LOCKOUT ON — ignoring PC motion commands until Enable VS");
+        refreshVsStateLabel();
+    }
+
+    /** Enable VS button: clear the lockout latch and re-enable VS. */
+    private void onLocalEnableClicked() {
+        pcLockout = false;
+        refreshVsStateLabel();
+        enableVirtualStick();
+    }
+
+    private void refreshVsStateLabel() {
+        final String text = String.format("VS: %s%s",
+            vsActive ? "ENABLED" : "DISABLED",
+            pcLockout ? " | PC LOCKED OUT" : "");
+        uiHandler.post(() -> tvVsState.setText(text));
     }
 
     private void enableVirtualStick() {
@@ -607,6 +676,7 @@ public class SwarmActivity extends Activity {
                 @Override
                 public void onFailure(IDJIError error) {
                     Log.e(TAG, "Disable VS failed: " + error.description());
+                    updateStatus("VS disable FAILED: " + error.description());
                 }
             });
     }
@@ -616,6 +686,22 @@ public class SwarmActivity extends Activity {
         vsSendTimer.scheduleAtFixedRate(new TimerTask() {
             @Override
             public void run() {
+                if (pcLockout) {
+                    // Belt-and-braces while latched: if VS somehow reports
+                    // enabled again (initial disable failed silently, or a
+                    // stray external re-enable), keep re-issuing the disable
+                    // at ~1 Hz until the FC confirms it is off.
+                    VirtualStickState s = currentVsState;
+                    if (s != null && s.isVirtualStickEnable()) {
+                        long now = System.currentTimeMillis();
+                        if (now - lastLockoutDisableRetryMs >= LOCKOUT_DISABLE_RETRY_MS) {
+                            lastLockoutDisableRetryMs = now;
+                            Log.w(TAG, "PC lockout: VS still enabled, retrying disable");
+                            disableVirtualStick();
+                        }
+                    }
+                    return;
+                }
                 if (!vsActive) return;
 
                 VirtualStickFlightControlParam param = new VirtualStickFlightControlParam();

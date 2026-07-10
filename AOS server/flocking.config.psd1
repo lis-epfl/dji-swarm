@@ -30,7 +30,6 @@
     # the server's slot order for that session instead of the switch ports.
     # @('server') = force the legacy command path via DroneSwarmServer (~4.5 Hz).
     # CLI: -DroneIPs 192.168.100.173,192.168.100.176  /  -DroneIPs server
-    # DroneIPs = @('192.168.100.150', '192.168.100.173', '192.168.100.176', '192.168.100.247', '192.168.100.211')
     DroneIPs = @()
 
     # Browser GUI (swarm_gui.py) HTTP port. CLI: -HttpPort

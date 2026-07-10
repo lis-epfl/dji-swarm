@@ -188,6 +188,11 @@ camera cap. Every set is read back and shown on the RC status line; a rejected M
 channel reverts that RC to AUTO. The AirLink keys are inherited from MSDK 5.3.0's internal
 `co_b` base class (not on the public `AirLinkKey` docs for 5.3) — bench-verify on the
 Mini 3 Pro before relying on them in the field.
+**RC-side operator lockout:** the app's on-screen **Disable VS** button latches out all PC
+motion commands (`VS:`/`ENABLE_VS`/`TAKEOFF`/`LAND` are dropped) until the on-screen
+Enable VS button clears it; only `AIRLINK:` and `DISABLE_VS` pass through while latched.
+PC-sent `DISABLE_VS` (GUI Stop, min-sep/geofence failsafes) does NOT latch — see the
+[lockout gotcha](#critical-gotchas).
 
 **Telemetry string** (app → Python; travels inside the drone's RTSP session as a
 non-video data stream — NOT over MQTT — then lands in shared memory appended after the
@@ -239,6 +244,16 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   revert the app to `ANGLE`, also send absolute heading again and drop the heading-hold helper.
 - **Gimbal needs VS enabled.** The app only sends gimbal commands inside the 20 Hz VS
   timer (`startVsSendLoop`). Gimbal moves do nothing unless VS is ENABLED.
+- **The app's Disable VS button is a PC lockout latch.** Pressing it on the RC drops every
+  PC motion command (`VS:`, `ENABLE_VS`, `TAKEOFF`, `LAND`) and keeps re-disabling VS at
+  1 Hz until the RC's Enable VS button is pressed (`SwarmActivity.pcLockout`). It exists
+  because the PC streams `VS:` at 20 Hz for the controller's lifetime and a QoS-1
+  `ENABLE_VS` queued during a link blip can re-arm VS *after* an operator disable — a bare
+  `disableVirtualStick()` was not an override. Consequences: a GUI **Start won't re-arm a
+  latched drone** (its GUI card shows VS off) and the rotation probe reports VS FAIL for
+  it — both correct; clear the latch on the RC. PC-sent `DISABLE_VS` (GUI Stop,
+  min-separation/geofence failsafes) never latches, so Stop→Start cycles are unaffected.
+  `AIRLINK:` and `DISABLE_VS` still pass through while latched.
 - **Multi-drone = 1-based `drone_id`** everywhere, mapping to `DroneSwarmServer` shared-memory slots.
 - **Drone identity has TWO independent sources when `DroneIPs` is an explicit list — keep
   them reconciled.** Commands go to the N-th `DroneIPs` entry (RC/switch-port = the
