@@ -154,6 +154,10 @@ no video.
 
 ### 2. `lis-swarm-app/` — Android app (the drone-side controller)
 Runs on the DJI RC (RC Pro). Package `com.lisswarm`, DJI SDK v5 (`5.3.0`), arm64-v8a only.
+> **Force-stop DJI Fly first.** On each RC, force-stop the stock **DJI Fly** app before
+> launching this app — if DJI Fly is running it holds the drone/SDK connection and this
+> app fails to connect (SDK registration/aircraft link never comes up). Force-stop it in
+> Android Settings → Apps → DJI Fly (not just background it).
 - `com.lisswarm.ConnectionActivity` — launcher; permissions + DJI SDK registration, then opens SwarmActivity.
 - `com.lisswarm.SwarmActivity` — the real workhorse. Embedded MQTT broker, command parsing,
   DJI VirtualStick send loop (20 Hz), telemetry listeners, and the video surface.
