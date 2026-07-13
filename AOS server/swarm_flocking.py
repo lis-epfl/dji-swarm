@@ -988,12 +988,29 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         js = receiver.get_state()
 
         # Swarming edge → arm/disarm VS. Done here (not in the listener thread)
-        # so every ds_wrapper poke stays on this control-loop thread, and so the
-        # GUI can Start/Stop even with no joystick connected. The joystick s1/s2
-        # switches are intentionally NOT wired to swarming/LAND — Start/Stop is
-        # GUI-only, so a switch left 'on' at connect can't auto-arm the swarm.
+        # so every ds_wrapper poke stays on this control-loop thread. Stop (and
+        # 'q') work with no joystick connected; Start is gated on a live one
+        # below. The joystick s1/s2 switches are intentionally NOT wired to
+        # swarming/LAND — Start/Stop is GUI-only, so a switch left 'on' at
+        # connect can't auto-arm the swarm.
         sw = swarming.is_set()
         if sw and not last_swarming:
+            # Joystick gate: refuse to arm without a live joystick feed. js is
+            # None when nothing fresh arrived on :5055 inside the receiver's
+            # staleness window (readController.py not running, or the physical
+            # controller unplugged) — armed drones would flock with zero
+            # operator input and no way to steer them clear of trouble.
+            # --dry-run skips the gate (desk testing, nothing flies).
+            if js is None and not dry_run:
+                print("[swarm] REFUSING TO ARM: no joystick input — start "
+                      "readController.py / reconnect the controller, then "
+                      "press Start again")
+                if logger:
+                    logger.log_drone_command(0, "EVENT",
+                                             cmd="START_REFUSED_NO_JOYSTICK")
+                swarming.clear()
+                time.sleep(0.02)
+                continue
             # A running rotation check must not overlap the swarm arming
             # (Start wins; the probe's partial results stay in the GUI).
             if probe is not None and probe.active:
@@ -1054,6 +1071,10 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
 
         if meta is not None:
             meta["swarming"] = sw
+            # Joystick feed health for the GUI: False greys out the Start
+            # button and shows a NO JOYSTICK chip (the arm gate above is the
+            # authoritative check — this is just the operator-visible mirror).
+            meta["joystick"] = js is not None
             # Live list of geofence-breached (VS-disabled) drone ids for the
             # GUI's FENCED OUT badges; refreshed every tick, also while held,
             # so a Stop→Start visibly clears it.

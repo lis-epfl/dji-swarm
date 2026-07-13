@@ -288,6 +288,12 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 - **Min-separation failsafe:** `swarm_flocking.py` auto-STOPs swarming (zero velocities →
   brake → DISABLE_VS, same as GUI Stop) when any pair with a GPS fix gets closer than
   `--min-separation` (default 3 m, `MinSeparation` config key, 0 disables).
+- **Joystick arm gate:** swarming Start refuses to arm unless a fresh joystick packet
+  arrived on :5055 inside the receiver's staleness window (readController.py running +
+  controller connected). The GUI mirrors it via `meta["joystick"]`: Start greys out and a
+  NO JOYSTICK banner chip shows. Stop / 'q' still work with no joystick; `--dry-run`
+  skips the gate. A joystick lost *mid-flight* does NOT auto-stop — flocking continues
+  with zero stick input.
 - **Python must be 3.7.** The wrapper is built as `ds_wrapper.cp37-win_amd64.pyd`; a
   different Python won't load it. Run scripts from `AOS server/` so the `.pyd` and
   `python37.dll` resolve.

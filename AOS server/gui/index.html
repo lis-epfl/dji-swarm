@@ -145,6 +145,7 @@
   #banner .chip.swarm-on  { background: rgba(63,185,80,.18);  color: #7ee787; border-color: rgba(63,185,80,.45); }
   #banner .chip.swarm-off { background: rgba(139,148,158,.16); color: var(--muted); }
   #banner .chip.fence-warn { background: rgba(248,81,73,.18); color: #ff938c; border-color: rgba(248,81,73,.45); }
+  #banner .chip.joy-bad    { background: rgba(248,81,73,.18); color: #ff938c; border-color: rgba(248,81,73,.45); }
   /* Rotation-check chip + per-drone response colors */
   #banner .chip.rot-run  { background: rgba(63,192,255,.16);  color: #7cd6ff; border-color: rgba(63,192,255,.45); }
   #banner .chip.rot-ok   { background: rgba(63,185,80,.18);   color: #7ee787; border-color: rgba(63,185,80,.45); }
@@ -205,6 +206,7 @@
     <span class="chip" id="dref-chip" style="display:none"></span>
     <span class="chip" id="heading-chip" style="display:none"></span>
     <span class="chip" id="swarm-chip" style="display:none"></span>
+    <span class="chip" id="joy-chip" style="display:none"></span>
     <span class="chip" id="fence-chip" style="display:none"></span>
     <span class="chip" id="rotcheck-chip" style="display:none"></span>
   </div>
@@ -583,9 +585,28 @@ function render(data) {
   } else {
     swarmChip.style.display = 'none';
   }
+  // ----- joystick feed health -----
+  // The flocking controller publishes meta.joystick = false when no fresh
+  // packet has arrived on :5055 (readController.py down / controller
+  // unplugged). It refuses to arm in that state, so mirror it here: grey out
+  // Start and show a chip. A missing key (older controller, or the
+  // single-drone joystick_controller.py feed) means unknown — don't block.
+  const joyLost = feedLive && !!(data.meta) && data.meta.joystick === false;
+  const joyChip = document.getElementById('joy-chip');
+  if (joyLost) {
+    joyChip.style.display = '';
+    joyChip.className = 'chip joy-bad';
+    joyChip.textContent = 'NO JOYSTICK';
+  } else {
+    joyChip.style.display = 'none';
+  }
   // Grey out the button for the state we're already in: Start is dead while
   // swarming, Stop is dead while held (and until Start is first pressed).
-  bStart.disabled = swarming;
+  // Start is also dead with no joystick feed (the controller would refuse).
+  bStart.disabled = swarming || joyLost;
+  bStart.title = joyLost
+    ? 'No joystick input — start readController.py / reconnect the controller'
+    : 'Start sending swarming commands (arms Virtual Stick)';
   bStop.disabled = !swarming;
 
   // ----- rotation check (open-loop actuation probe) -----
