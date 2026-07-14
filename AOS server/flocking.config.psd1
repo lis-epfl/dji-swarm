@@ -12,7 +12,7 @@
 
 @{
     # Number of drones in the swarm (creates IDs 1..N). CLI: -Drones
-    Drones = 1
+    Drones = 3
 
     # RC/broker IP addresses in DRONE-ID ORDER (index 1 = drone 1, ...). When
     # listed, swarm_flocking.py publishes commands DIRECTLY to each RC's MQTT
@@ -48,12 +48,21 @@
     #   'manual'     - stick angular.z steers one shared target heading
     #   'convexhull' - GLOBAL_CONVEXHULL: hull drones face outward, interior
     #                  drones hold heading, stick yaw ignored
-    # CLI: -ConvexHull forces 'convexhull' for that run.
+    #   'demostitch' - the laterally-middle drone points at the stick-steered
+    #                  heading; each neighbour fans out by StitchOffset deg per
+    #                  rank, keeping adjacent camera views overlapped for
+    #                  image stitching
+    # CLI: -ConvexHull / -DemoStitch force the respective mode for that run.
     Heading = 'manual'
 
     # convexhull mode only: boundary drones face the swarm centroid instead of
     # outward. Ignored in manual mode. CLI: -PointInwards
     PointInwards = $false
+
+    # demostitch mode only: per-rank heading offset between laterally adjacent
+    # drones (deg), live-adjustable in the GUI afterwards. Range [5, 90].
+    # CLI: -StitchOffset
+    StitchOffset = 30.0
 
     # Verify at startup and on every swarming Start that the DroneIPs order
     # matches DroneSwarmServer's slot order (an inert MQTT marker probe;

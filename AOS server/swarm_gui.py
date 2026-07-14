@@ -48,6 +48,10 @@ from olfati_saber import (
     save_shapes,
 )
 
+# Demostitch offset bounds shared with the controller (heading_demostitch.py
+# is pure stdlib, no ds_wrapper — safe to import here too).
+from heading_demostitch import OFFSET_MIN_DEG, OFFSET_MAX_DEG
+
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui")
 
@@ -264,15 +268,27 @@ def make_handler(state, cmd_sock=None, cmd_addr=None, shapes=None):
                     self._send(400, b'{"ok":false,"error":"bad value"}', "application/json")
                     return
             elif action == "heading":
-                # Heading-mode selector (manual | convexhull).
+                # Heading-mode selector (manual | convexhull | demostitch).
                 value = (str(msg.get("value") or "")).lower()
-                if value not in ("manual", "convexhull"):
+                if value not in ("manual", "convexhull", "demostitch"):
                     self._send(400, b'{"ok":false,"error":"bad value"}', "application/json")
                     return
                 out = {"action": "heading", "value": value}
             elif action == "point_inwards":
                 # Convex-hull facing toggle: boundary drones face the centroid.
                 out = {"action": "point_inwards", "value": bool(msg.get("value"))}
+            elif action == "stitch_offset":
+                # Demostitch per-rank fan offset (deg), from the GUI's number
+                # input; bounds shared with the controller's CLI validation.
+                try:
+                    v = float(msg.get("value"))
+                except (TypeError, ValueError):
+                    self._send(400, b'{"ok":false,"error":"bad value"}', "application/json")
+                    return
+                if not (OFFSET_MIN_DEG <= v <= OFFSET_MAX_DEG):
+                    self._send(400, b'{"ok":false,"error":"out of range"}', "application/json")
+                    return
+                out = {"action": "stitch_offset", "value": v}
             elif action == "rotation_check":
                 # Open-loop actuation probe: forwarded as a plain request; the
                 # controller runs it only while swarming is held and reports

@@ -228,16 +228,21 @@
     <button id="btn-rotcheck"
             title="Open-loop actuation check (run while HOLDING, drones well separated): each drone in turn flies a short pulse north then east at its current altitude; the GPS track gives a per-drone rotation/gain verdict (OK / SKEWED / ROTATED / SWAPPED / DEAD). Any verdict other than OK means the drone executes commands in the wrong direction — do NOT start swarming with it.">&#10227; Rotation check</button>
     <label id="heading-ctl"
-           title="Heading control: Manual = joystick yaw steers a shared target heading; Convex hull = drones on the swarm's outer ring face outward (GLOBAL_CONVEXHULL), interior drones hold heading, stick yaw is ignored">
+           title="Heading control: Manual = joystick yaw steers a shared target heading; Convex hull = drones on the swarm's outer ring face outward (GLOBAL_CONVEXHULL), interior drones hold heading, stick yaw is ignored; Demo stitch = the laterally-middle drone points at the stick-steered heading and each neighbour fans out by the offset per rank, keeping adjacent camera views overlapped for stitching">
       Heading
       <select id="heading-select">
         <option value="manual">Manual</option>
         <option value="convexhull">Convex hull</option>
+        <option value="demostitch">Demo stitch</option>
       </select>
     </label>
     <label id="inwards-ctl" style="display:none"
            title="Boundary drones face the swarm centroid instead of outward">
       <input type="checkbox" id="chk-inwards" /> Point inwards
+    </label>
+    <label id="stitch-ctl" style="display:none"
+           title="Demo stitch: heading offset between laterally adjacent drones (deg) — the middle drone points at the stick yaw, each neighbour fans out by this much per rank">
+      Offset <input type="number" id="stitch-offset" min="5" max="90" step="5" value="30" style="width:4.5em" />&deg;
     </label>
     <label id="gimbal-ctl" title="Gimbal pitch (tilt) for all drones — DJI Mini 3 Pro range -90° to +60°">
       Gimbal <input type="range" id="gimbal-slider" min="-90" max="60" step="1" value="-10" />
@@ -376,7 +381,7 @@ function rotClass(rot, verdict) {
   return Math.abs(rot) <= 25 ? 'rot-ok' : (Math.abs(rot) <= 60 ? 'rot-warn' : 'rot-bad');
 }
 
-function renderCard(id, rec, status, onHull, fenced, resp, rotRes) {
+function renderCard(id, rec, status, onHull, centre, fenced, resp, rotRes) {
   const t = rec.telem || {};
   const age = rec.age;
   const color = colorFor(id);
@@ -413,8 +418,9 @@ function renderCard(id, rec, status, onHull, fenced, resp, rotRes) {
       <span class="name">Drone ${id}</span>
       ${fenced ? '<span class="pill fenced" style="margin-left:auto" title="Crossed outside the geofence — VS disabled, out of the flock; Stop then Start swarming to re-admit">FENCED OUT</span>' : ''}
       ${onHull ? `<span class="pill hull" ${fenced ? '' : 'style="margin-left:auto"'} title="On the swarm\'s convex hull — hull heading control is steering this drone">HULL</span>` : ''}
+      ${centre ? `<span class="pill hull" ${fenced ? '' : 'style="margin-left:auto"'} title="Demo-stitch centre drone — pointing exactly at the stick-steered heading">CENTRE</span>` : ''}
       ${rotPill}
-      <span class="pill ${pill[0]}" ${(onHull || fenced || rotPill) ? 'style="margin-left:0"' : ''}>${pill[1]}</span>
+      <span class="pill ${pill[0]}" ${(onHull || centre || fenced || rotPill) ? 'style="margin-left:0"' : ''}>${pill[1]}</span>
     </div>
     <div class="grid">
       <span class="k">Alt</span>     <span class="v">${fmt(t.alt, 1, ' m')}</span>
@@ -508,23 +514,38 @@ function render(data) {
   // 200 ms poll doesn't flip it back before the controller echoes the change.
   const meta = data.meta || {};
   if (Date.now() > headingPendingUntil) {
-    if (meta.heading_mode === 'manual' || meta.heading_mode === 'convexhull') {
+    if (meta.heading_mode === 'manual' || meta.heading_mode === 'convexhull'
+        || meta.heading_mode === 'demostitch') {
       headingSelect.value = meta.heading_mode;
     }
     if ('point_inwards' in meta) chkInwards.checked = !!meta.point_inwards;
+    // Don't fight the operator mid-edit: only reflect the controller's
+    // offset when the number input isn't focused.
+    if (Number.isFinite(meta.stitch_offset)
+        && document.activeElement !== stitchInput) {
+      stitchInput.value = meta.stitch_offset;
+    }
   }
   const hullMode = headingSelect.value === 'convexhull';
+  const stitchMode = headingSelect.value === 'demostitch';
   inwardsCtl.style.display = hullMode ? '' : 'none';
+  stitchCtl.style.display = stitchMode ? '' : 'none';
   const headingChip = document.getElementById('heading-chip');
   if (hullMode) {
     headingChip.style.display = '';
     headingChip.textContent = 'Hull heading' + (chkInwards.checked ? ' (inwards)' : '');
+  } else if (stitchMode) {
+    headingChip.style.display = '';
+    headingChip.textContent = `Stitch heading ±${stitchInput.value}°`;
   } else {
     headingChip.style.display = 'none';
   }
   // Boundary drones (hull vertices) currently being steered by the hull.
   const hullSet = new Set(hullMode && Array.isArray(meta.hull_boundary)
                           ? meta.hull_boundary.map(String) : []);
+  // Demo-stitch centre drone (odd drone counts only), for the CENTRE pill.
+  const stitchCentre = stitchMode && meta.stitch_centre != null
+                       ? String(meta.stitch_centre) : null;
 
   // ----- geofence-breached drones (VS disabled, out of the flock) -----
   const fencedSet = new Set(Array.isArray(meta.removed) ? meta.removed.map(String) : []);
@@ -681,7 +702,8 @@ function render(data) {
 
     // Status card for everything the controller still knows about.
     if (age <= DRONE_STALE_S) cards.appendChild(
-      renderCard(id, rec, status, hullSet.has(id), fencedSet.has(id),
+      renderCard(id, rec, status, hullSet.has(id), stitchCentre === id,
+                 fencedSet.has(id),
                  respMap[id] || null, rotResults[id] || null));
   }
 
@@ -751,21 +773,35 @@ document.getElementById('btn-start').addEventListener('click', () => postCommand
 document.getElementById('btn-stop').addEventListener('click', () => postCommand({ action: 'stop' }));
 document.getElementById('btn-rotcheck').addEventListener('click', () => postCommand({ action: 'rotation_check' }));
 
-// Heading mode (manual / convex hull) + point-inwards. The controller owns the
-// live value (meta.heading_mode / meta.point_inwards); render() reflects it
-// back into these controls except during a short post-change window.
+// Heading mode (manual / convex hull / demo stitch) + point-inwards + stitch
+// offset. The controller owns the live values (meta.heading_mode /
+// meta.point_inwards / meta.stitch_offset); render() reflects them back into
+// these controls except during a short post-change window.
 const headingSelect = document.getElementById('heading-select');
 const inwardsCtl    = document.getElementById('inwards-ctl');
 const chkInwards    = document.getElementById('chk-inwards');
+const stitchCtl     = document.getElementById('stitch-ctl');
+const stitchInput   = document.getElementById('stitch-offset');
 let headingPendingUntil = 0;
 headingSelect.addEventListener('change', () => {
   headingPendingUntil = Date.now() + 1500;
   inwardsCtl.style.display = headingSelect.value === 'convexhull' ? '' : 'none';
+  stitchCtl.style.display = headingSelect.value === 'demostitch' ? '' : 'none';
   postCommand({ action: 'heading', value: headingSelect.value });
 });
 chkInwards.addEventListener('change', () => {
   headingPendingUntil = Date.now() + 1500;
   postCommand({ action: 'point_inwards', value: chkInwards.checked });
+});
+// 'change' (not 'input') so typing doesn't POST per keystroke; clamp to the
+// server's accepted range so an out-of-range entry is corrected, not 400'd.
+stitchInput.addEventListener('change', () => {
+  let v = Number(stitchInput.value);
+  if (!Number.isFinite(v)) v = 30;
+  v = Math.max(5, Math.min(90, v));
+  stitchInput.value = v;
+  headingPendingUntil = Date.now() + 1500;
+  postCommand({ action: 'stitch_offset', value: v });
 });
 
 // Gimbal pitch slider: retargets every drone's gimbal tilt. Forwarded to the

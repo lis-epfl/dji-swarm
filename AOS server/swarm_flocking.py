@@ -90,6 +90,12 @@ from swarm_telemetry_feed import (
     DEFAULT_GUI_PORT,
 )
 from heading_convexhull import ConvexHullHeading, _wrap180
+from heading_demostitch import (
+    DemoStitchHeading,
+    DEFAULT_OFFSET_DEG,
+    OFFSET_MIN_DEG,
+    OFFSET_MAX_DEG,
+)
 from olfati_saber import (
     OlfatiSaber,
     ObstacleAvoidance,
@@ -766,7 +772,8 @@ DEFAULT_CMD_PORT = 5098
 
 def command_listener(swarming, meta, host, port, shapes_path=None):
     """Receive GUI command datagrams (Start/Stop, gimbal slider, heading
-    mode + point-inwards toggles, obstacle/geofence edits) over UDP.
+    mode + point-inwards + stitch-offset controls, obstacle/geofence edits)
+    over UDP.
 
     This thread NEVER touches ds_wrapper — it only mutates the shared `swarming`
     Event and the shared `meta` dict. The control loop (run) detects the edge /
@@ -811,9 +818,9 @@ def command_listener(swarming, meta, host, port, shapes_path=None):
                 print(f"[gui] gimbal pitch -> {v:+.1f}°")
             elif action == "heading":
                 # GUI heading-mode selector. run() reads meta["heading_mode"]
-                # each tick and handles the manual↔convexhull transition.
+                # each tick and handles the mode transition.
                 v = (str(msg.get("value") or "")).lower()
-                if v in ("manual", "convexhull") and meta is not None:
+                if v in ("manual", "convexhull", "demostitch") and meta is not None:
                     meta["heading_mode"] = v
                     print(f"[gui] heading mode -> {v}")
             elif action == "point_inwards":
@@ -822,6 +829,17 @@ def command_listener(swarming, meta, host, port, shapes_path=None):
                 if meta is not None:
                     meta["point_inwards"] = bool(msg.get("value"))
                     print(f"[gui] point inwards -> {meta['point_inwards']}")
+            elif action == "stitch_offset":
+                # GUI number input: per-rank fan offset for demostitch mode
+                # (deg). run() reads meta["stitch_offset"] live each tick.
+                try:
+                    v = float(msg.get("value"))
+                except (TypeError, ValueError):
+                    continue
+                v = max(OFFSET_MIN_DEG, min(OFFSET_MAX_DEG, v))
+                if meta is not None:
+                    meta["stitch_offset"] = v
+                    print(f"[gui] stitch offset -> {v:.0f}°")
             elif action == "rotation_check":
                 # GUI button: open-loop actuation probe (RotationProbe). Only
                 # a request marker — run() starts/ticks the probe on the
@@ -899,7 +917,7 @@ def command_listener(swarming, meta, host, port, shapes_path=None):
 
 def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         logger=None, speed_scale=1.0, meta=None, heading_ctrl=None,
-        cmd_sender=None, identity_check=True,
+        stitch_ctrl=None, cmd_sender=None, identity_check=True,
         min_separation=DEFAULT_MIN_SEPARATION_M, avoid=None):
     print("\n--- Olfati-Saber Swarm Mode ---")
     print(f"  Drones: {sorted(swarm.drones.keys())}")
@@ -913,7 +931,10 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
           f"manual = stick yaw steers a shared target heading; "
           f"convexhull = GLOBAL_CONVEXHULL (boundary drones face outward, "
           f"interior drones hold heading; stick yaw rotates the command "
-          f"reference frame instead of steering the drones)")
+          f"reference frame instead of steering the drones); "
+          f"demostitch = the laterally-middle drone points at the stick yaw, "
+          f"neighbours fan out by meta['stitch_offset']° per rank (camera "
+          f"overlap for stitching)")
     print(f"  Telemetry velocity frame: {vel_frame}  "
           f"(switch via --vel-frame if consensus oscillates)")
     if speed_scale != 1.0:
@@ -1113,15 +1134,21 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                         0, "EVENT", cmd=f"GIMBAL_PITCH:{gp:+.1f}")
                 last_gimbal = gp
 
-        # Heading mode + point-inwards are runtime-switchable from the GUI
-        # (command_listener writes meta["heading_mode"]/meta["point_inwards"];
-        # --heading/--point-inwards just seed them). Applied here, outside the
-        # swarming gate, so the operator can preselect the mode while held.
+        # Heading mode + point-inwards + stitch offset are runtime-switchable
+        # from the GUI (command_listener writes meta["heading_mode"]/
+        # meta["point_inwards"]/meta["stitch_offset"]; the CLI flags just seed
+        # them). Applied here, outside the swarming gate, so the operator can
+        # preselect the mode while held.
         hull_mode = False
+        stitch_mode = False
         if meta is not None and heading_ctrl is not None:
-            hull_mode = meta.get("heading_mode") == "convexhull"
-            mode = "convexhull" if hull_mode else "manual"
+            mode = meta.get("heading_mode")
+            if mode not in ("manual", "convexhull", "demostitch"):
+                mode = "manual"
+            hull_mode = mode == "convexhull"
+            stitch_mode = mode == "demostitch" and stitch_ctrl is not None
             if mode != last_heading_mode:
+                mh = swarm_mean_heading(swarm)
                 if hull_mode:
                     # Fresh activation: stale debounce timers / held targets
                     # from a previous stint must not leak in.
@@ -1129,15 +1156,21 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                     # Seed the command reference frame from where the swarm
                     # currently points, so stick-forward starts out matching
                     # the swarm's mean heading before the operator rotates it.
-                    mh = swarm_mean_heading(swarm)
                     cmd_frame_yaw = mh if mh is not None else 0.0
                 else:
-                    # Back to manual: re-seed the shared target from the live
-                    # mean heading so drones don't snap to a stale target_yaw.
-                    mh = swarm_mean_heading(swarm)
+                    # Manual or demostitch: re-seed the shared target from the
+                    # live mean heading so drones don't snap to a stale
+                    # target_yaw. For demostitch that means the fan builds out
+                    # around wherever the swarm already points — the initial
+                    # fan-out is the only motion.
+                    if stitch_mode:
+                        stitch_ctrl.reset()
                     if mh is not None:
                         target_yaw = mh
+                if not hull_mode:
                     meta["hull_boundary"] = []   # nothing is hull-steered now
+                if not stitch_mode:
+                    meta["stitch_centre"] = None
                 print(f"[heading] mode -> {mode}")
                 if logger:
                     logger.log_drone_command(0, "EVENT", cmd=f"HEADING_MODE:{mode}")
@@ -1198,6 +1231,9 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         # integration steers the shared target heading, lead-clamped against the
         # swarm's mean heading (anti-windup — see integrate_target_heading) so
         # releasing the stick leaves at most MAX_TARGET_LEAD_DEG of catch-up turn.
+        # Demostitch shares the manual path exactly: the stick steers the same
+        # target_yaw (= the fan's centre direction); each drone's per-rank
+        # offset rides on top of it (below).
         ff_yaw_rate = ang_z * YAW_RATE_DEG_S * speed_scale
         if not hull_mode:
             target_yaw = integrate_target_heading(
@@ -1221,6 +1257,10 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             v_n_des, v_e_des = body_to_world(
                 lin_x * MAX_PITCH_MPS, lin_y * MAX_ROLL_MPS, cmd_frame_yaw)
         else:
+            # Manual AND demostitch: raw world frame (forward = north).
+            # Demostitch deliberately shares this — rotating translation by
+            # target_yaw ("fly along the view direction") is a possible future
+            # variant, not done.
             v_n_des = lin_x * MAX_PITCH_MPS    # north (m/s)
             v_e_des = lin_y * MAX_ROLL_MPS     # east  (m/s)
 
@@ -1359,6 +1399,25 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             if meta is not None:
                 meta["hull_boundary"] = heading_ctrl.boundary_ids()
 
+        # Demo-stitch heading control: the laterally-middle drone points at
+        # the shared target_yaw, neighbours fan out by stitch_offset per rank
+        # (adjacent camera views keep partial overlap for the stitcher).
+        # Geofence-breached drones must not occupy a rank in the fan.
+        stitch_targets = None
+        stitch_off = None
+        if stitch_mode:
+            try:
+                stitch_off = float((meta or {}).get("stitch_offset",
+                                                    DEFAULT_OFFSET_DEG))
+            except (TypeError, ValueError):
+                stitch_off = DEFAULT_OFFSET_DEG
+            stitch_targets = stitch_ctrl.update(
+                {did: pos for did, (pos, _, _) in snap.items()
+                 if did not in removed},
+                target_yaw, stitch_off, dt)
+            if meta is not None:
+                meta["stitch_centre"] = stitch_ctrl.centre_id
+
         # Per-drone flocking command. The joystick's desired velocity goes
         # straight through (DJI VS already runs a velocity tracker); the swarm
         # algorithm only contributes a correction (neighbour-velocity consensus
@@ -1385,6 +1444,13 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                         # flight still yawed at the full clamp).
                         cmd_yaw_rate = heading_hold_rate(
                             drone_target, hdg, p_scale=speed_scale)
+                elif stitch_targets is not None:
+                    # Demostitch: like manual (shared stick feed-forward, the
+                    # whole fan rotates rigidly with target_yaw) but each
+                    # drone servos onto its own rank-offset target.
+                    drone_target = stitch_targets.get(did, target_yaw)
+                    cmd_yaw_rate = heading_hold_rate(
+                        drone_target, hdg, ff_yaw_rate, p_scale=speed_scale)
                 else:
                     # Smooth yaw RATE for this drone: shared stick feed-forward
                     # plus a P term holding its own heading on the shared
@@ -1456,6 +1522,10 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 yaw_desc = ("cmdframe=%+6.1f°  hull-boundary=%s"
                             % (cmd_frame_yaw,
                                ",".join(map(str, heading_ctrl.boundary_ids())) or "none"))
+            elif stitch_mode:
+                yaw_desc = (f"yaw={target_yaw:+6.1f}°  "
+                            f"stitch ±{stitch_off:.0f}°/rank  "
+                            f"centre={stitch_ctrl.centre_id or '-'}")
             else:
                 yaw_desc = f"yaw={target_yaw:+6.1f}°"
             print(f"  v_des=({v_n_des:+5.2f}N,{v_e_des:+5.2f}E) world  "
@@ -1519,7 +1589,8 @@ def main():
                          f"and the GUI slider's starting position; used on Start. "
                          f"Range [{GIMBAL_PITCH_MIN:.0f}, {GIMBAL_PITCH_MAX:.0f}] "
                          f"(DJI Mini 3 Pro). Default {DEFAULT_GIMBAL_PITCH:.0f}.")
-    ap.add_argument("--heading", choices=["manual", "convexhull"], default="manual",
+    ap.add_argument("--heading", choices=["manual", "convexhull", "demostitch"],
+                    default="manual",
                     help="Initial heading-control mode (live-switchable from the "
                          "GUI afterwards): 'manual' (default) integrates a shared "
                          "target heading from the stick's angular.z; 'convexhull' "
@@ -1528,11 +1599,22 @@ def main():
                          "outward along their vertex bisector, interior drones "
                          "hold heading; the stick yaw then rotates the "
                          "operator's command reference frame instead of "
-                         "steering the drones.")
+                         "steering the drones. 'demostitch' points the "
+                         "laterally-middle drone at the stick-steered yaw and "
+                         "fans each neighbour out by --stitch-offset per rank, "
+                         "keeping adjacent camera views overlapped for "
+                         "stitching.")
     ap.add_argument("--point-inwards", action="store_true",
                     help="Seed the point-inwards toggle (live-switchable from "
                          "the GUI): in convexhull mode, boundary drones face "
                          "the swarm centroid instead of outward.")
+    ap.add_argument("--stitch-offset", type=float, default=DEFAULT_OFFSET_DEG,
+                    metavar="DEG",
+                    help="demostitch mode: per-rank heading offset between "
+                         "laterally adjacent drones (deg). Seeds "
+                         "meta['stitch_offset']; live-adjustable from the GUI. "
+                         f"Range [{OFFSET_MIN_DEG:.0f}, {OFFSET_MAX_DEG:.0f}], "
+                         f"default {DEFAULT_OFFSET_DEG:.0f}.")
     ap.add_argument("--vel-frame", choices=["ned", "body"], default="ned",
                     help="Frame of telemetry vx/vy. Default 'ned' assumes DJI "
                          "reports ground-frame velocity; switch to 'body' if "
@@ -1641,6 +1723,9 @@ def main():
     if not (GIMBAL_PITCH_MIN <= args.gimbal_pitch <= GIMBAL_PITCH_MAX):
         ap.error(f"--gimbal-pitch must be in "
                  f"[{GIMBAL_PITCH_MIN:.0f}, {GIMBAL_PITCH_MAX:.0f}] (DJI Mini 3 Pro)")
+    if not (OFFSET_MIN_DEG <= args.stitch_offset <= OFFSET_MAX_DEG):
+        ap.error(f"--stitch-offset must be in "
+                 f"[{OFFSET_MIN_DEG:.0f}, {OFFSET_MAX_DEG:.0f}]")
 
     def per_drone_list(raw, flag):
         """Expand a comma list to one token per drone (a single token fans
@@ -1875,10 +1960,11 @@ def main():
           f"geofence {'with ' + str(len(geofence)) + ' vertices' if geofence else 'none'} "
           f"({shapes_path})")
 
-    # Always instantiated: the GUI can switch heading modes at runtime, so the
-    # hull controller must exist even when starting in manual mode. run() only
-    # consults it while meta["heading_mode"] == "convexhull".
+    # Always instantiated: the GUI can switch heading modes at runtime, so
+    # both controllers must exist even when starting in manual mode. run()
+    # only consults each while meta["heading_mode"] selects it.
     heading_ctrl = ConvexHullHeading(point_inwards=args.point_inwards)
+    stitch_ctrl = DemoStitchHeading()
 
     receiver = JoystickReceiver(port=args.port, logger=logger)
     receiver.start()
@@ -1902,6 +1988,11 @@ def main():
         "heading_mode": args.heading,
         "point_inwards": args.point_inwards,
         "hull_boundary": [],
+        # Demostitch fan offset (deg/rank), seeded from --stitch-offset and
+        # then owned by the GUI; stitch_centre is the live centre drone id
+        # (odd drone counts only) for the GUI's CENTRE pill.
+        "stitch_offset": args.stitch_offset,
+        "stitch_centre": None,
         # Live gimbal pitch target (deg): seeded from --gimbal-pitch, then driven
         # by the GUI slider via command_listener. Published so the slider can
         # seed its starting position.
@@ -1952,7 +2043,8 @@ def main():
         run(swarm, receiver, olfati, swarming,
             dry_run=args.dry_run, vel_frame=args.vel_frame, logger=logger,
             speed_scale=args.slow, meta=swarm_meta, heading_ctrl=heading_ctrl,
-            cmd_sender=cmd_sender, identity_check=identity_check,
+            stitch_ctrl=stitch_ctrl, cmd_sender=cmd_sender,
+            identity_check=identity_check,
             min_separation=args.min_separation, avoid=avoid)
     except KeyboardInterrupt:
         print("\nInterrupted.")

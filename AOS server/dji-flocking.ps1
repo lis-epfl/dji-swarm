@@ -25,6 +25,10 @@
 #   .\dji-flocking.ps1 -ConvexHull    # start in GLOBAL_CONVEXHULL heading mode (boundary
 #                                     # drones face outward); -PointInwards faces the centroid.
 #                                     # Both are just seeds — switchable live from the GUI.
+#   .\dji-flocking.ps1 -DemoStitch -StitchOffset 20   # start in demostitch heading mode:
+#                                     # the laterally-middle drone points at the stick yaw,
+#                                     # neighbours fan out by StitchOffset deg per rank
+#                                     # (camera overlap for stitching); both seeds, live in GUI.
 #   .\dji-flocking.ps1 -ImageStream   # stream frames to the stitcher (in-process)
 #   .\dji-flocking.ps1 -DroneIPs 192.168.100.173,192.168.100.176   # direct-MQTT command
 #                                     # path to these RC brokers (order = drone id);
@@ -64,6 +68,8 @@ param(
     [double]$CObs,
     [switch]$ConvexHull,
     [switch]$PointInwards,
+    [switch]$DemoStitch,
+    [double]$StitchOffset,
     [switch]$NoGui,
     [switch]$ImageStream,
     [switch]$NoIdentityCheck,
@@ -79,7 +85,7 @@ param(
 # file, so a stale/partial config can never resolve a setting to $null/0.
 $settings = @{
     Drones = 3; HttpPort = 8000; Slow = 1.0; GimbalPitch = -10.0
-    Heading = 'manual'; PointInwards = $false; NoGui = $false
+    Heading = 'manual'; PointInwards = $false; StitchOffset = 30.0; NoGui = $false
     ImageStream = $false
     Cvm = 0.0; R0 = 150.0; Scale = 10.0
     DObs = 5.0; R0Obs = 6.0; CObs = 4.3
@@ -107,6 +113,7 @@ if ($PSBoundParameters.ContainsKey('Scale'))        { $settings.Scale = $Scale }
 if ($PSBoundParameters.ContainsKey('NoGui'))        { $settings.NoGui = [bool]$NoGui }
 if ($PSBoundParameters.ContainsKey('ImageStream'))  { $settings.ImageStream = [bool]$ImageStream }
 if ($PSBoundParameters.ContainsKey('PointInwards')) { $settings.PointInwards = [bool]$PointInwards }
+if ($PSBoundParameters.ContainsKey('StitchOffset')) { $settings.StitchOffset = $StitchOffset }
 if ($PSBoundParameters.ContainsKey('DroneIPs'))     { $settings.DroneIPs = $DroneIPs }
 if ($PSBoundParameters.ContainsKey('AirlinkBands'))    { $settings.AirlinkBands = $AirlinkBands }
 if ($PSBoundParameters.ContainsKey('AirlinkChannels')) { $settings.AirlinkChannels = $AirlinkChannels }
@@ -115,8 +122,10 @@ if ($PSBoundParameters.ContainsKey('MinSeparation')){ $settings.MinSeparation = 
 if ($PSBoundParameters.ContainsKey('DObs'))         { $settings.DObs = $DObs }
 if ($PSBoundParameters.ContainsKey('R0Obs'))        { $settings.R0Obs = $R0Obs }
 if ($PSBoundParameters.ContainsKey('CObs'))         { $settings.CObs = $CObs }
-# -ConvexHull is a convenience alias that forces convexhull heading mode.
+# -ConvexHull / -DemoStitch are convenience aliases that force a heading mode.
+if ($ConvexHull -and $DemoStitch) { throw "-ConvexHull and -DemoStitch are mutually exclusive" }
 if ($ConvexHull)                                    { $settings.Heading = 'convexhull' }
+if ($DemoStitch)                                    { $settings.Heading = 'demostitch' }
 # -NoIdentityCheck disables the command<->telemetry identity probe for one run.
 if ($NoIdentityCheck)                               { $settings.IdentityCheck = $false }
 
@@ -130,6 +139,7 @@ $Scale        = [double]$settings.Scale
 $NoGui        = [bool]$settings.NoGui
 $ImageStream  = [bool]$settings.ImageStream
 $PointInwards = [bool]$settings.PointInwards
+$StitchOffset = [double]$settings.StitchOffset
 $Heading      = ("$($settings.Heading)").ToLower()
 $DroneIPs     = @($settings.DroneIPs | Where-Object { "$_".Trim() -ne '' })
 $IdentityCheck = [bool]$settings.IdentityCheck
@@ -156,8 +166,11 @@ if ($Slow -le 0) { throw "Slow must be > 0 (e.g. 0.3 for 30% speed) (got $Slow)"
 if ($GimbalPitch -lt -90.0 -or $GimbalPitch -gt 60.0) {
     throw "GimbalPitch must be in [-90, 60] (DJI Mini 3 Pro tilt range) (got $GimbalPitch)"
 }
-if ($Heading -ne 'manual' -and $Heading -ne 'convexhull') {
-    throw "Heading must be 'manual' or 'convexhull' (got '$Heading')"
+if (@('manual', 'convexhull', 'demostitch') -notcontains $Heading) {
+    throw "Heading must be 'manual', 'convexhull' or 'demostitch' (got '$Heading')"
+}
+if ($StitchOffset -lt 5 -or $StitchOffset -gt 90) {
+    throw "StitchOffset must be in [5, 90] degrees (got $StitchOffset)"
 }
 if ($CmdMode -eq 'explicit' -and $DroneIPs.Count -lt $Drones) {
     throw ("DroneIPs lists only $($DroneIPs.Count) address(es) but Drones is $Drones " +
@@ -177,7 +190,8 @@ $AirlinkDesc = if ($AirlinkBands.Count -or $AirlinkChannels.Count -or $VideoMode
     "bands=[$($AirlinkBands -join ',')] channels=[$($AirlinkChannels -join ',')] video=$VideoMode"
 } else { "unmanaged (DJI auto)" }
 Write-Host ("[dji-flocking] config $Config -> drones=$Drones slow=$Slow gimbal=$GimbalPitch " +
-            "heading=$Heading pointInwards=$PointInwards noGui=$NoGui imageStream=$ImageStream " +
+            "heading=$Heading pointInwards=$PointInwards stitchOffset=$StitchOffset " +
+            "noGui=$NoGui imageStream=$ImageStream " +
             "c_vm=$Cvm r0=$R0 scale=$Scale minSep=$MinSeparation identityCheck=$IdentityCheck " +
             "dObs=$DObs r0Obs=$R0Obs cObs=$CObs " +
             "httpPort=$HttpPort cmdPath=$CmdPathDesc airlink=$AirlinkDesc")
@@ -194,12 +208,18 @@ $CvmArg    = if ($Cvm -ne 0.0)          { " --c-vm " + (Inv $Cvm) }             
 $R0Arg     = if ($R0 -ne 150.0)         { " --r0 " + (Inv $R0) }                   else { "" }
 $ScaleArg  = if ($Scale -ne 10.0)       { " --scale " + (Inv $Scale) }             else { "" }
 
-# GLOBAL_CONVEXHULL heading control (heading_convexhull.py): convexhull seeds
-# the mode (boundary drones face outward; -PointInwards flips to the centroid),
-# default is manual stick yaw. Both settings stay switchable from the GUI.
+# Heading control seed: convexhull = GLOBAL_CONVEXHULL (heading_convexhull.py;
+# boundary drones face outward, -PointInwards flips to the centroid);
+# demostitch = stitch fan (heading_demostitch.py; middle drone on the stick
+# yaw, neighbours offset by StitchOffset deg per rank). Default is manual
+# stick yaw. All settings stay switchable from the GUI; the offset is
+# forwarded whenever it differs from the script default so a live GUI switch
+# into demostitch starts from the configured value.
 $HeadingArg = ""
 if ($Heading -eq 'convexhull') { $HeadingArg += " --heading convexhull" }
+if ($Heading -eq 'demostitch') { $HeadingArg += " --heading demostitch" }
 if ($PointInwards)             { $HeadingArg += " --point-inwards" }
+if ($StitchOffset -ne 30.0)    { $HeadingArg += " --stitch-offset " + (Inv $StitchOffset) }
 
 # In-process image streaming to the stitcher pipeline (replaces the old
 # standalone image_stream.py pane, which starved the controller's ds_wrapper
