@@ -169,6 +169,13 @@ DEFAULT_MIN_SEPARATION_M = 3.0
 # (connect -> publish -> disconnect); 2 s absorbs a slow broker comfortably.
 IDCHECK_TIMEOUT_S = 2.0
 
+# Pre-flight link scan: how long to wait for every RC's LINKDIAG answer. Longer
+# than the identity probe because the app answers only after five separate
+# KeyManager.getValue() round-trips to the aircraft (band, channel mode,
+# bandwidth, frequency point, interference sweep), any of which the firmware
+# may leave hanging until it times out on its side.
+LINK_SCAN_TIMEOUT_S = 5.0
+
 # ---- Rotation check (open-loop actuation probe; GUI "Rotation check") ----
 # One drone at a time: enable VS, fly a short pulse NORTH then EAST at the
 # drone's current altitude, measure the GPS displacement of each pulse, and
@@ -1090,7 +1097,21 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 meta["resp"] = {}   # live rotation fits are meaningless held
         last_swarming = sw
 
+        # RF link quality pushed by the app, for EVERY drone. Built here rather
+        # than in the command loop below for two reasons: that loop is behind
+        # `if not sw: continue`, and pre-flight (held) is exactly when the
+        # operator wants to see the radio, and it also skips drones with no GPS
+        # fix and geofence-removed ones — precisely the drones whose link is
+        # worth looking at. None per drone on the server command path (no
+        # app->PC diagnostic channel) or once its feed goes stale.
+        link_map = {
+            str(did): (cmd_sender.link_of(did) if cmd_sender is not None
+                       else None)
+            for did in swarm.drones
+        }
+
         if meta is not None:
+            meta["link"] = link_map
             meta["swarming"] = sw
             # Joystick feed health for the GUI: False greys out the Start
             # button and shows a NO JOYSTICK chip (the arm gate above is the
@@ -1488,13 +1509,20 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 resp_map[str(did)] = (
                     None if resp is None
                     else {"rot": round(resp[0], 1), "gain": round(resp[1], 2)})
+                # Logging the link next to the control terms is the point: it
+                # makes "the link was bad" checkable against the same timeline
+                # as the commands that were sent.
+                link = link_map[str(did)]
                 if logger:
                     logger.log_swarm_debug(
                         did, v_n_des, v_e_des, v_n_corr, v_e_corr,
                         v_n_total, v_e_total, d_ref, len(neighbours),
                         v_n_obs=o_n, v_e_obs=o_e,
                         resp_rot_deg=None if resp is None else round(resp[0], 2),
-                        resp_gain=None if resp is None else round(resp[1], 3))
+                        resp_gain=None if resp is None else round(resp[1], 3),
+                        link_sq=None if link is None else link["sq"],
+                        link_down=None if link is None else link["down"],
+                        link_up=None if link is None else link["up"])
                 # DJI VS is in GROUND/VELOCITY mode (SwarmActivity sets
                 # FlightCoordinateSystem.GROUND), so pitch = north m/s and
                 # roll = east m/s. We send world-frame velocities directly —
@@ -1648,13 +1676,21 @@ def main():
                          "drone. Empty (default) sends nothing. With many "
                          "co-located OcuSync links, splitting the fleet "
                          "across 2.4/5.8 GHz halves the contenders per band.")
-    ap.add_argument("--airlink-channels", default="", metavar="LIST",
-                    help="Per-drone manual channel numbers (comma list in "
-                         "drone-id order; -1 = auto channel selection, '-' = "
-                         "leave unchanged; a single value applies to all). "
-                         "The app sets ChannelSelectionMode MANUAL and falls "
-                         "back to AUTO — reported on the RC screen — if the "
-                         "firmware rejects it. Empty (default) sends nothing.")
+    ap.add_argument("--airlink-bandwidth", default="", metavar="LIST",
+                    help="Per-drone AirLink channel bandwidth in MHz (comma "
+                         "list in drone-id order of 40 | 20 | 10 | 5 | '-'; a "
+                         "single value applies to every drone). Narrower = "
+                         "less spectrum occupied per link and a lower data "
+                         "rate, which is the main lever when many co-located "
+                         "links share the band — and unlike manual channel "
+                         "pinning it works with DJI's AUTO channel selection. "
+                         "Empty (default) sends nothing.")
+    ap.add_argument("--no-link-scan", action="store_true",
+                    help="Skip the read-only pre-flight link scan (the "
+                         "LINKDIAG round-trip that reports each RC's radio "
+                         "config and the aircraft's own interference sweep). "
+                         "The scan never changes a setting; skipping it only "
+                         f"saves the {LINK_SCAN_TIMEOUT_S:.0f} s wait.")
     ap.add_argument("--video-mode", default="", metavar="WxH@FPS",
                     help="Camera stream cap applied on every RC at startup, "
                          "e.g. 1920x1080@24 (lower encoded bitrate = more "
@@ -1746,13 +1782,11 @@ def main():
         if b not in ("2G4", "5G8", "DUAL", "-"):
             ap.error(f"--airlink-bands: unknown band '{b}' "
                      "(expected 2G4, 5G8, DUAL or -)")
-    airlink_channels = per_drone_list(args.airlink_channels, "airlink-channels")
-    for c in airlink_channels:
-        if c != "-":
-            try:
-                int(c)
-            except ValueError:
-                ap.error(f"--airlink-channels: '{c}' is not an integer or '-'")
+    airlink_bw = per_drone_list(args.airlink_bandwidth, "airlink-bandwidth")
+    for b in airlink_bw:
+        if b not in ("40", "20", "10", "5", "-"):
+            ap.error(f"--airlink-bandwidth: '{b}' is not one of "
+                     "40, 20, 10, 5 or '-' (MHz)")
     video_mode = args.video_mode.strip()
     if video_mode and not re.match(r"^\d+x\d+@\d+$", video_mode):
         ap.error("--video-mode must look like 1920x1080@24")
@@ -1846,7 +1880,7 @@ def main():
             "d_obs": args.d_obs, "r0_obs": args.r0_obs, "c_obs": args.c_obs,
             "shapes_file": args.shapes_file,
             "airlink_bands": airlink_bands,
-            "airlink_channels": airlink_channels,
+            "airlink_bandwidth": airlink_bw,
             "video_mode": video_mode,
         })
         swarm.attach_logger(logger)
@@ -1867,7 +1901,7 @@ def main():
             except Exception as e:
                 print(f"FAIL: {e}", flush=True)
 
-    # One-shot AirLink / camera-stream setup ("AIRLINK:<band>:<channel>:<res>",
+    # One-shot AirLink / camera-stream setup ("AIRLINK:band=..:bw=..:video=..",
     # parsed by SwarmActivity.applyAirlinkSettings). Per-drone radio config
     # lives HERE — the RCs run identical APKs, and addressing follows the
     # command channel (drone id), the same identity commands use. QoS 1 on the
@@ -1875,13 +1909,65 @@ def main():
     # RC shows the applied/rejected result on its own status line. Placed
     # after the synchronous probe so a missing server slot surfaces there
     # first (on the server path this send blocks in the wrapper too).
-    if (airlink_bands or airlink_channels or video_mode) and not args.dry_run:
+    #
+    # Fields are named, so only what was configured is sent — an RC running an
+    # older APK reports an unknown field instead of silently applying a value
+    # to whatever used to occupy that position.
+    if (airlink_bands or airlink_bw or video_mode) and not args.dry_run:
         for did in sorted(swarm.drones):
-            band = airlink_bands[did - 1] if airlink_bands else "-"
-            chan = airlink_channels[did - 1] if airlink_channels else "-"
-            cmd = "AIRLINK:{}:{}:{}".format(band, chan, video_mode or "-")
+            fields = []
+            if airlink_bands and airlink_bands[did - 1] != "-":
+                fields.append("band=" + airlink_bands[did - 1])
+            if airlink_bw and airlink_bw[did - 1] != "-":
+                fields.append("bw=" + airlink_bw[did - 1])
+            if video_mode:
+                fields.append("video=" + video_mode)
+            if not fields:
+                continue     # this drone was explicitly skipped with '-'
+            cmd = "AIRLINK:" + ":".join(fields)
             print(f"  AirLink setup -> drone {did}: {cmd}", flush=True)
             swarm.drones[did].send_command(cmd)
+
+    # Pre-flight link scan. DJI's auto channel selection is per-link and has no
+    # view of the fleet, so the useful question before flying is what the
+    # aircraft themselves see: KeyFrequencyInterference gives an RSSI per
+    # frequency bucket, i.e. a band scan from the antenna that matters. Purely
+    # read-only, and only available on the direct MQTT path (the app answers on
+    # its own broker, which is what cmd_sender is subscribed to).
+    if cmd_sender is not None and not args.dry_run and not args.no_link_scan:
+        print("  Requesting link scan from each RC (read-only)...", flush=True)
+        cmd_sender.clear_scans()
+        for did in sorted(swarm.drones):
+            cmd_sender.request_scan(did)
+        # One shared window rather than per-drone waits: the requests all went
+        # out already, so the answers come back in parallel.
+        deadline = time.monotonic() + LINK_SCAN_TIMEOUT_S
+        pending = set(swarm.drones)
+        while pending and time.monotonic() < deadline:
+            for did in sorted(pending):
+                if cmd_sender.scan_of(did) is not None:
+                    pending.discard(did)
+            if pending:
+                time.sleep(0.1)
+        scans = {}
+        for did in sorted(swarm.drones):
+            scan = cmd_sender.scan_of(did)
+            scans[did] = scan
+            if scan is None:
+                print(f"    drone {did}: no answer "
+                      f"(older APK, or RC not connected yet)", flush=True)
+            else:
+                print(f"    drone {did}: {scan}", flush=True)
+        if logger:
+            # A one-shot pre-flight fact, so it belongs in session.json next to
+            # the rest of the run config — not in a per-tick CSV.
+            logger.update_meta({"link_scan": scans})
+    elif cmd_sender is None and not args.dry_run and not args.no_link_scan:
+        # Say so rather than silently skipping: the launcher banner prints
+        # linkScan=True, which would otherwise look like it ran and found
+        # nothing.
+        print("  Link scan n/a: the server command path has no app->PC "
+              "return channel (needs DroneIPs auto or an explicit IP list)")
 
     # Start background threads one drone at a time, with a brief sleep so each
     # thread can do its first iteration and surface any error before we move on.

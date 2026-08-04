@@ -61,7 +61,12 @@ no video.
   `PostMessage` calls target this app's `WM_PYWRAPPER_*` message handlers.
 - **Python control scripts** (run against the built `ds_wrapper.*.pyd`):
   - `joystick_controller.py` — primary single-drone joystick driver (UDP joystick or `--cli`).
-  - `swarm_flocking.py` — multi-drone Olfati-Saber flocking from one joystick. Also
+  - `swarm_flocking.py` — multi-drone Olfati-Saber flocking from one joystick. Runs a
+    **read-only pre-flight link scan** at startup (`LINKDIAG` per RC, `--no-link-scan` /
+    `LinkScan` config key to skip): each aircraft reports its live radio config plus its own
+    per-frequency interference sweep, printed to the console and stored in the flight log's
+    `session.json`. It changes nothing — it is the band scan DJI's per-link AUTO channel
+    selection is silently working against. Also
     hosts `RotationProbe` — the GUI's **Rotation check** button: while swarming is HELD,
     each drone in turn is VS-armed and flies a 0.6 m/s open-loop pulse north then east
     at its current altitude; the GPS displacement gives a per-drone rotation/gain
@@ -119,7 +124,9 @@ no video.
   - `joyreporter.py` — pygame joystick debug readout.
   - `swarm_gui.py` — browser GUI server: a satellite map (default EPFL Lausanne) showing
     each drone's position + heading, a complete graph of inter-drone distance lines
-    (metres labelled), and a per-drone status panel. **Does NOT import `ds_wrapper`** — it
+    (metres labelled), and a per-drone status panel (including an **RF link** row fed by
+    `meta["link"]` — see the [link diagnostics protocol](#two-protocols-you-will-touch-constantly)).
+    **Does NOT import `ds_wrapper`** — it
     only LISTENS on UDP :5099 for telemetry pushed by a running controller (so it runs
     unprivileged, in its own terminal, on any Python ≥3.7; it does import the pure
     `olfati_saber` module for the shared shapes helpers, and owns a `ShapesStore` that
@@ -158,6 +165,12 @@ no video.
     the per-IP connections subscribe to `MQTTWayPoints` so
     `swarm_flocking.run_identity_check` can see which RC each server slot's marker lands
     on (see the [drone-identity gotcha](#critical-gotchas)).
+    The same connections are the **app→PC return path for link diagnostics**: each
+    permanently subscribes to `LISSwarmDiag` (resubscribed in `on_connect`, so it survives
+    an RC power-cycle) and keeps the latest `LINK:`/`LINKSCAN:` per drone —
+    `link_of()` (age-limited, `LINK_STALE_S`), `scan_of()`, `request_scan()`,
+    `clear_scans()`. Messages are routed by topic, so diagnostics never pollute the
+    identity-probe buffer.
   - `image_stream.py` — **standalone debug tool only; never run alongside a live
     controller.** It polls the wrapper from its own process, and the shared-memory
     protocol (one status byte per drone slot, no mutex) lets a second process starve a
@@ -197,26 +210,55 @@ stream / QoS 1 for one-shots) or via `sendWayPointData` → `DroneSwarmServer` (
 ```
 VS:pitch:roll:yaw:throttle:gimbal_pitch:gimbal_yaw
 ENABLE_VS | DISABLE_VS | TAKEOFF | LAND
-AIRLINK:band:channel:res@fps
+AIRLINK:band=<2G4|5G8|DUAL>:bw=<40|20|10|5>:video=<WxH@fps>   (named, any subset)
+LINKDIAG                                                       (read-only)
 ```
 Parsed in `SwarmActivity.onCommandReceived`. Fields: `pitch`/`roll` = velocity m/s,
 `yaw` = **yaw RATE deg/s** (DJI VS angular-velocity mode; + = clockwise),
 `throttle` = **absolute altitude m**, gimbal angles abs deg. The PC keeps an absolute
 target heading and runs a heading-hold P controller (`joystick_controller.heading_hold_rate`)
 that emits this rate — see the [yaw gotcha](#critical-gotchas).
+
 `AIRLINK:` is a one-shot radio/camera-stream setup (`SwarmActivity.applyAirlinkSettings`)
-sent per drone by `swarm_flocking.py` at startup when `AirlinkBands`/`AirlinkChannels`/
-`VideoMode` (config) or the matching `--airlink-*`/`--video-mode` flags are set: band
-`2G4|5G8|DUAL|-`, channel int (`-1` = auto mode, `-` = skip), optional `1920x1080@24`-style
-camera cap. Every set is read back and shown on the RC status line; a rejected MANUAL
-channel reverts that RC to AUTO. The AirLink keys are inherited from MSDK 5.3.0's internal
-`co_b` base class (not on the public `AirLinkKey` docs for 5.3) — bench-verify on the
-Mini 3 Pro before relying on them in the field.
+sent per drone by `swarm_flocking.py` at startup when `AirlinkBands`/`AirlinkBandwidth`/
+`VideoMode` (config) or the matching `--airlink-*`/`--video-mode` flags are set. Its fields
+are **named, not positional**, and any subset may be sent (`-` = leave unchanged) — so an RC
+left on an older APK reports an unknown field instead of silently applying a new value to
+whatever used to occupy that slot. `bw=` (`AirLinkKey.KeyBandwidth`) is the highest-value
+knob for a crowded site: it narrows the spectrum each link **occupies**, whereas `video=`
+only lowers the bitrate carried inside the existing channel width — and it works under DJI's
+AUTO channel selection. There is deliberately **no manual-channel field** — see the
+[AirLink gotcha](#critical-gotchas). Every set is read back onto the RC status line.
+The AirLink keys are inherited from MSDK 5.3.0's internal `co_b` base class (not on the
+public `AirLinkKey` docs for 5.3); `KeyBandwidth`/`KeyFrequencyBand`/`KeyFrequencyInterference`
+etc. are all verified present in the 5.3.0 jar and the app compiles against them, but
+whether the *aircraft* accepts a given set is firmware-dependent — read the RC status line.
+
+`LINKDIAG` asks the RC for one `LINKSCAN:` reply and changes nothing.
+
+**Link diagnostics** (app → Python; MQTT, topic `LISSwarmDiag` = `MQTTEmbedded.DIAG_TOPIC`)
+are the **only** app→PC channel besides the RTSP telemetry string, which cannot carry new
+fields — its producer is the native `setTelemetryData()` whose 17-argument signature is fixed
+and has no source in-tree. The app publishes onto its own embedded broker via Moquette's
+`Server.internalPublish`; `mqtt_command_sender.py` subscribes on every (re)connect:
+```
+LINK:<signal>:<down>:<up>              1 Hz, unsolicited, -1 = not reported yet
+LINKSCAN:band=..:mode=..:bw=..:freq=..:sq=..:down=..:up=..:if=<from>-<to>@<rssi>,...
+```
+`LINK:` is served purely from the app's `KeyManager.listen()` cache (**no** `getValue()`
+round-trips — that polling is what got removed from `DroneSwarmStreamData`); `LINKSCAN:` is
+on-demand only and does five one-shot reads, with `?` for any key the firmware locks.
+Quality scales are 0-100, DJI's reading: **<40 poor, 40-60 normal, >60 good**. Available
+only on the direct MQTT command path (the server path has no return channel).
+Surfaced as `meta["link"]` → the GUI's per-drone **RF link** row, logged to
+`swarm_debug.csv` (`link_sq`/`link_down`/`link_up`), and the startup scan lands in
+`session.json` under `link_scan`.
+
 **RC-side operator lockout:** the app's on-screen **Disable VS** button latches out all PC
 motion commands (`VS:`/`ENABLE_VS`/`TAKEOFF`/`LAND` are dropped) until the on-screen
-Enable VS button clears it; only `AIRLINK:` and `DISABLE_VS` pass through while latched.
-PC-sent `DISABLE_VS` (GUI Stop, min-sep/geofence failsafes) does NOT latch — see the
-[lockout gotcha](#critical-gotchas).
+Enable VS button clears it; only `AIRLINK:`, `LINKDIAG` and `DISABLE_VS` pass through while
+latched (none move the aircraft). PC-sent `DISABLE_VS` (GUI Stop, min-sep/geofence
+failsafes) does NOT latch — see the [lockout gotcha](#critical-gotchas).
 
 **Telemetry string** (app → Python; travels inside the drone's RTSP session as a
 non-video data stream — NOT over MQTT — then lands in shared memory appended after the
@@ -278,6 +320,24 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   it — both correct; clear the latch on the RC. PC-sent `DISABLE_VS` (GUI Stop,
   min-separation/geofence failsafes) never latches, so Stop→Start cycles are unaffected.
   `AIRLINK:` and `DISABLE_VS` still pass through while latched.
+- **AirLink settings are STICKY, and "send nothing" ≠ "restore defaults".** An empty
+  `AirlinkBands`/`AirlinkBandwidth`/`VideoMode` means no `AIRLINK:` is sent at all — the
+  radios keep whatever a *previous* run (or a bench test) last wrote, because band,
+  bandwidth and camera mode all persist in the RC/aircraft/camera firmware. Blanking the
+  config does NOT undo an experiment; you must explicitly set the value back
+  (`AirlinkBands = @('DUAL')` is the DJI default). This is the first thing to check when
+  the link "got worse" after an AirLink change. `LINKDIAG`/the startup link scan reports
+  what is actually in force per RC.
+- **No manual channel selection on the Mini 3 Pro.** DJI does not support manual
+  image-transmission channel selection on this airframe — the RC always picks the channel.
+  The `AIRLINK:` protocol therefore has no channel field (the old `AirlinkChannels` config
+  key and `channel=`/`KeyChannelNumber` path were removed; the key still exists in the SDK
+  and still compiles, it is the *aircraft* that refuses). Band, bandwidth and the camera cap
+  are the levers that remain. Note DJI documents `KeyFrequencyBand` as "only available in
+  manual mode", but DJI Fly exposes 2.4/5.8/dual on this airframe with channel selection on
+  auto, so `applyAirlinkSettings` sets band directly and does **not** force
+  `ChannelSelectionMode.MANUAL` first — forcing a mode the aircraft rejects would leave the
+  link half-configured. A rejected band shows up on the RC status line.
 - **Multi-drone = 1-based `drone_id`** everywhere, mapping to `DroneSwarmServer` shared-memory slots.
 - **Drone identity has TWO independent sources when `DroneIPs` is an explicit list — keep
   them reconciled.** Commands go to the N-th `DroneIPs` entry (RC/switch-port = the
@@ -370,7 +430,7 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 | Launcher | Starts | Params → script flags |
 | --- | --- | --- |
 | `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
-| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-DemoStitch`→`--heading demostitch` / `-StitchOffset`→`--stitch-offset` (demostitch fan offset deg/rank, config key `StitchOffset`), `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-DObs`→`--d-obs` / `-R0Obs`→`--r0-obs` / `-CObs`→`--c-obs` (virtual-obstacle/geofence repulsion cutoff, detection radius [physical m] and gain; config keys `DObs`/`R0Obs`/`CObs`; the shapes themselves are drawn in the GUI and persist in `shapes.json`), `-AirlinkBands`→`--airlink-bands` / `-AirlinkChannels`→`--airlink-channels` / `-VideoMode`→`--video-mode` (per-drone RF band/channel assignment + camera-stream cap, sent to each RC as an `AIRLINK:` one-shot at startup; config keys `AirlinkBands`/`AirlinkChannels`/`VideoMode`; empty = leave the radios on DJI auto), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
+| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-DemoStitch`→`--heading demostitch` / `-StitchOffset`→`--stitch-offset` (demostitch fan offset deg/rank, config key `StitchOffset`), `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-DObs`→`--d-obs` / `-R0Obs`→`--r0-obs` / `-CObs`→`--c-obs` (virtual-obstacle/geofence repulsion cutoff, detection radius [physical m] and gain; config keys `DObs`/`R0Obs`/`CObs`; the shapes themselves are drawn in the GUI and persist in `shapes.json`), `-AirlinkBands`→`--airlink-bands` / `-AirlinkBandwidth`→`--airlink-bandwidth` / `-VideoMode`→`--video-mode` (per-drone RF band + channel bandwidth in MHz `40\|20\|10\|5` + camera-stream cap, sent to each RC as an `AIRLINK:` one-shot at startup; config keys `AirlinkBands`/`AirlinkBandwidth`/`VideoMode`; empty = send nothing, which leaves whatever was last applied — **not** a reset, see the [AirLink gotcha](#critical-gotchas)), `-NoLinkScan`→`--no-link-scan` (skip the read-only pre-flight link/interference scan; config key `LinkScan`), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
 | `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
 
 `dji-flocking.ps1`'s launch settings live in **`AOS server/flocking.config.psd1`** (a

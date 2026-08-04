@@ -78,24 +78,47 @@
     # --- AirLink / RF management (sent once per drone at controller startup ---
     # --- as an "AIRLINK:" MQTT one-shot; the RC shows applied/rejected on   ---
     # --- its status line — bench-test before relying on it in the field)    ---
+    #
+    # IMPORTANT: @() / '' means "send nothing", NOT "restore DJI defaults".
+    # Band and bandwidth persist in the RC/aircraft firmware, so whatever a
+    # previous run applied stays in force until it is explicitly overwritten.
+    # To undo an earlier experiment you must set the value back, not blank it.
+    #
+    # There is deliberately no manual-channel setting: DJI does not support
+    # manual image-transmission channel selection on the Mini 3 Pro, so the
+    # old AirlinkChannels key could only ever be rejected by the aircraft.
+
     # Per-drone RF band in drone-id order: '2G4' | '5G8' | 'DUAL' | '-' (leave
-    # unchanged). ONE value applies to every drone; @() sends nothing and all
-    # links stay on DJI auto selection. With ~10 co-located OcuSync links,
-    # splitting the fleet across the two bands halves the contenders per band,
-    # e.g. @('2G4','2G4','2G4','2G4','2G4','5G8','5G8','5G8','5G8','5G8').
-    # CLI: -AirlinkBands 2G4,2G4,5G8
+    # unchanged). ONE value applies to every drone; @() sends nothing. With
+    # ~10 co-located OcuSync links, splitting the fleet across the two bands
+    # halves the contenders per band, e.g.
+    # @('2G4','2G4','2G4','2G4','2G4','5G8','5G8','5G8','5G8','5G8').
+    # 'DUAL' is the DJI default (firmware picks per packet) — use it to undo an
+    # earlier band pin. CLI: -AirlinkBands 2G4,2G4,5G8
     AirlinkBands = @()
 
-    # Per-drone manual channel numbers in drone-id order (-1 = auto channel
-    # selection, '-' = leave unchanged; one value = all drones). Consumer
-    # firmware may lock manual selection — the app then reverts that RC to
-    # AUTO and says so on-screen. @() sends nothing. CLI: -AirlinkChannels
-    AirlinkChannels = @()
+    # Per-drone AirLink channel bandwidth in MHz, drone-id order:
+    # '40' | '20' | '10' | '5' | '-' (leave unchanged); one value = all drones.
+    # This is the highest-value knob for a crowded site: it narrows how much
+    # spectrum each link actually OCCUPIES, whereas VideoMode below only lowers
+    # the bitrate carried inside whatever channel width is in use. It also
+    # works with DJI's AUTO channel selection, so it is not blocked by the
+    # Mini 3 Pro's lack of manual channel support. Narrower = more robust link,
+    # lower video data rate. @() sends nothing. CLI: -AirlinkBandwidth 10
+    AirlinkBandwidth = @()
 
     # Camera stream cap applied on every RC, e.g. '1920x1080@24' — a lower
     # encoded bitrate leaves more airlink headroom per link (and less RTSP
     # load on the PC). '' leaves the camera as-is. CLI: -VideoMode
     VideoMode = ''
+
+    # Read-only pre-flight link scan: ask every RC for its current radio config
+    # (band / channel mode / bandwidth / frequency point) plus the aircraft's
+    # own per-frequency interference measurement, and print + log the answers
+    # before anything flies. Changes no setting; costs a few seconds at
+    # startup. Needs the direct MQTT command path (DroneIPs @() or an IP list).
+    # CLI: -NoLinkScan disables for one run.
+    LinkScan = $true
 
     # Skip the browser-GUI map pane and pass --no-gui to the controller so it
     # does not push telemetry. CLI: -NoGui

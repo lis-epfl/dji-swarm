@@ -381,7 +381,27 @@ function rotClass(rot, verdict) {
   return Math.abs(rot) <= 25 ? 'rot-ok' : (Math.abs(rot) <= 60 ? 'rot-warn' : 'rot-bad');
 }
 
-function renderCard(id, rec, status, onHull, centre, fenced, resp, rotRes) {
+// RF link quality classes. DJI's own reading of these 0-100 scales is
+// <40 poor, 40-60 normal, >60 good — matched here and in the app's RC readout.
+function linkClass(q) {
+  if (!Number.isFinite(q)) return '';
+  return q > 60 ? 'rot-ok' : (q >= 40 ? 'rot-warn' : 'rot-bad');
+}
+
+// "sq (down/up)" with the worst of the three driving the colour: the combined
+// signal quality can look fine while the video downlink is the one collapsing.
+function linkCell(link) {
+  if (!link) return '<span class="v" title="No link report — needs the direct MQTT command path and a current APK">—</span>';
+  const parts = ['sq', 'down', 'up'].map(k => link[k]).filter(Number.isFinite);
+  if (!parts.length) return '<span class="v" title="RC connected but the aircraft has not reported link quality yet">—</span>';
+  const worst = Math.min(...parts);
+  const txt = (Number.isFinite(link.sq) ? link.sq : '—')
+            + ' (' + (Number.isFinite(link.down) ? link.down : '—')
+            + '/' + (Number.isFinite(link.up) ? link.up : '—') + ')';
+  return `<span class="v ${linkClass(worst)}" title="AirLink quality %: overall signal (downlink/uplink). DJI: &lt;40 poor, 40-60 normal, &gt;60 good">${txt}</span>`;
+}
+
+function renderCard(id, rec, status, onHull, centre, fenced, resp, rotRes, link) {
   const t = rec.telem || {};
   const age = rec.age;
   const color = colorFor(id);
@@ -432,7 +452,8 @@ function renderCard(id, rec, status, onHull, centre, fenced, resp, rotRes) {
       <span class="k">Cmd&rarr;resp</span> ${respCell}
       <span class="k">Cmd rate</span>   ${hzCell(rec.send_hz, 20)}
       <span class="k">Telem rate</span> ${hzCell(rec.recv_hz, 10)}
-      <span class="k">Link</span>    <span class="v">${fmt(age, 1, ' s')}</span>
+      <span class="k">RF link</span>  ${linkCell(link)}
+      <span class="k">Feed age</span> <span class="v">${fmt(age, 1, ' s')}</span>
     </div>`;
   return card;
 }
@@ -659,6 +680,7 @@ function render(data) {
   }
   // Per-drone data for the cards: live fit while swarming, probe verdicts after.
   const respMap = meta.resp || {};
+  const linkMap = meta.link || {};
   const rotResults = (rc && rc.results) || {};
 
   const drones = data.drones || {};
@@ -704,7 +726,8 @@ function render(data) {
     if (age <= DRONE_STALE_S) cards.appendChild(
       renderCard(id, rec, status, hullSet.has(id), stitchCentre === id,
                  fencedSet.has(id),
-                 respMap[id] || null, rotResults[id] || null));
+                 respMap[id] || null, rotResults[id] || null,
+                 linkMap[id] || null));
   }
 
   document.getElementById('drone-count').textContent =

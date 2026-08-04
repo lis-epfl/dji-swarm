@@ -21,8 +21,9 @@ import dji.sdk.keyvalue.key.DJIKeyInfo;
 import dji.sdk.keyvalue.key.FlightControllerKey;
 import dji.sdk.keyvalue.key.GimbalKey;
 import dji.sdk.keyvalue.key.KeyTools;
-import dji.sdk.keyvalue.value.airlink.ChannelSelectionMode;
+import dji.sdk.keyvalue.value.airlink.Bandwidth;
 import dji.sdk.keyvalue.value.airlink.FrequencyBand;
+import dji.sdk.keyvalue.value.airlink.FrequencyInterferenceInfo;
 import dji.sdk.keyvalue.value.camera.VideoFrameRate;
 import dji.sdk.keyvalue.value.camera.VideoResolution;
 import dji.sdk.keyvalue.value.camera.VideoResolutionFrameRate;
@@ -54,6 +55,7 @@ import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.util.Collections;
 import java.util.Enumeration;
+import java.util.List;
 import java.util.Locale;
 import java.util.Timer;
 import java.util.TimerTask;
@@ -68,13 +70,21 @@ import java.util.TimerTask;
  *     throttle = absolute altitude m, gimbal angles = absolute deg.
  *   "ENABLE_VS" / "DISABLE_VS"
  *   "TAKEOFF" / "LAND"
- *   "AIRLINK:band:channel:res@fps" — one-shot radio/camera-stream setup
- *     (see applyAirlinkSettings; sent by the PC after its command channel
- *     connects so per-drone radio config lives in the PC's flocking config)
+ *   "AIRLINK:band=..:bw=..:video=.." — one-shot radio/camera-stream setup,
+ *     NAMED fields, any subset (see applyAirlinkSettings; sent by the PC after
+ *     its command channel connects so per-drone radio config lives in the PC's
+ *     flocking config)
+ *   "LINKDIAG" — read-only: publish one LINKSCAN: line back to the PC
+ *
+ * Published back to the PC on MQTTEmbedded.DIAG_TOPIC (the only app->PC path
+ * besides the RTSP telemetry string, whose native 17-field signature is fixed):
+ *   "LINK:sq:down:up"       — cached link quality, 1 Hz, unsolicited
+ *   "LINKSCAN:band=..:..."  — full radio config + interference sweep, on demand
  *
  * Operator lockout: the on-screen Disable VS button latches out ALL PC motion
  * commands (VS:, ENABLE_VS, TAKEOFF, LAND) until the on-screen Enable VS
- * button is pressed. Only AIRLINK: and DISABLE_VS pass through while latched.
+ * button is pressed. AIRLINK:, LINKDIAG and DISABLE_VS pass through while
+ * latched (none of them move the aircraft).
  * PC-sent DISABLE_VS does NOT latch (GUI Stop→Start keeps working).
  */
 public class SwarmActivity extends Activity {
@@ -128,6 +138,14 @@ public class SwarmActivity extends Activity {
     private volatile int telemSatCount = 0;
     private volatile int telemBatteryPercent = -1;   // -1 = not yet reported
     private volatile int telemSignalQuality = -1;     // 0-100, -1 = not yet reported
+    private volatile int telemDownLinkQuality = -1;   // 0-100, -1 = not yet reported
+    private volatile int telemUpLinkQuality = -1;     // 0-100, -1 = not yet reported
+
+    // Link diagnostics published back to the PC on MQTTEmbedded.DIAG_TOPIC.
+    private static final String LINK_STATUS_PREFIX = "LINK:";
+    private static final String LINK_SCAN_PREFIX = "LINKSCAN:";
+    private static final long LINK_STATUS_INTERVAL_MS = 1000;   // 1 Hz
+    private Timer linkStatusTimer;
 
     // Video
     private SurfaceView surfaceVideo;
@@ -161,6 +179,7 @@ public class SwarmActivity extends Activity {
         startVsSendLoop();
         startTelemetryListeners();
         startTelemUiLoop();
+        startLinkStatusLoop();
     }
 
     private void initUI() {
@@ -296,6 +315,14 @@ public class SwarmActivity extends Activity {
         Log.v(TAG, "MQTT recv: " + command + "  ts=" + System.currentTimeMillis());
         if (command == null || command.isEmpty()) return;
 
+        // Moquette's intercept handler fires for ANY publish including our own
+        // broker-internal ones, so the link diagnostics we publish come straight
+        // back here. Drop them before anything else looks at them.
+        if (command.startsWith(LINK_STATUS_PREFIX)
+                || command.startsWith(LINK_SCAN_PREFIX)) {
+            return;
+        }
+
         // Operator lockout: drop every motion command from the PC (VS: stream,
         // ENABLE_VS, TAKEOFF, LAND). DISABLE_VS stays honored (redundant but
         // harmless, and it never clears the latch); AIRLINK: stays honored
@@ -332,32 +359,55 @@ public class SwarmActivity extends Activity {
             performLanding();
         } else if (command.startsWith("AIRLINK:")) {
             applyAirlinkSettings(command.substring("AIRLINK:".length()));
+        } else if (command.equals("LINKDIAG")) {
+            publishLinkScan();
         }
     }
 
     // ========== AirLink management ==========
 
     /**
-     * "AIRLINK:&lt;band&gt;:&lt;channel&gt;:&lt;res@fps&gt;" — with ten aircraft/RC links
-     * sharing the spectrum, DJI's per-link auto channel selection has no view
-     * of the whole fleet, so the PC assigns bands/channels deterministically.
-     * Fields ('-' or empty = leave unchanged):
-     *   band     2G4 | 5G8 | DUAL (firmware picks per packet)
-     *   channel  &gt;=0 = ChannelSelectionMode MANUAL + that channel number;
-     *            -1  = back to ChannelSelectionMode AUTO
-     *   res@fps  camera stream cap, e.g. 1920x1080@24 — lowers the encoded
-     *            bitrate and thus the per-link airtime
+     * "AIRLINK:band=&lt;b&gt;:bw=&lt;MHz&gt;:video=&lt;WxH@fps&gt;" — with ten aircraft/RC
+     * links sharing the spectrum, DJI's per-link auto selection has no view of
+     * the whole fleet, so the PC assigns radio settings deterministically.
+     *
+     * Fields are NAMED, not positional, and any subset may be sent; '-' or
+     * absent = leave unchanged. Named fields matter here because this command
+     * evolves: an RC still running an older APK parses an unknown name as an
+     * unknown field and says so, instead of silently applying a new value to
+     * whatever used to sit in that position.
+     *   band   2G4 | 5G8 | DUAL — splitting the fleet across the two bands
+     *          halves the number of contenders per band
+     *   bw     40 | 20 | 10 | 5 — AirLink channel bandwidth in MHz. THE most
+     *          useful knob for a crowded site: it narrows the spectrum each
+     *          link actually occupies (video=... only lowers the encoded
+     *          bitrate inside whatever channel width is in use), and unlike
+     *          channel pinning it works in AUTO channel-selection mode.
+     *   video  camera stream cap, e.g. 1920x1080@24
+     *
+     * There is deliberately NO manual-channel field: DJI does not support
+     * manual image-transmission channel selection on the Mini 3 Pro, so the
+     * old channel= path could only ever report a rejection. Use bw + band, and
+     * LINKDIAG to see the interference picture the aircraft's own auto
+     * selection is working against.
+     *
      * Every set is read back and surfaced via updateStatus/logcat, so firmware
-     * that locks a key (likely for manual channels on consumer aircraft) is
-     * visible on the RC screen during a bench test; a rejected MANUAL channel
-     * falls back to AUTO rather than leaving the link half-configured.
+     * that locks a key is visible on the RC screen during a bench test.
      */
     private void applyAirlinkSettings(String spec) {
         try {
-            String[] parts = spec.split(":");
-            String bandTok = parts.length >= 1 ? parts[0].trim() : "";
-            String chanTok = parts.length >= 2 ? parts[1].trim() : "";
-            String resTok = parts.length >= 3 ? parts[2].trim() : "";
+            String bandTok = "", bwTok = "", videoTok = "";
+            for (String field : spec.split(":")) {
+                field = field.trim();
+                int eq = field.indexOf('=');
+                if (eq < 0) continue;              // ignore unknown/legacy tokens
+                String key = field.substring(0, eq).trim();
+                String val = field.substring(eq + 1).trim();
+                if (key.equals("band"))       bandTok = val;
+                else if (key.equals("bw"))    bwTok = val;
+                else if (key.equals("video")) videoTok = val;
+                else updateStatus("AIRLINK: ignoring unknown field '" + key + "'");
+            }
 
             if (!bandTok.isEmpty() && !bandTok.equals("-")) {
                 FrequencyBand band =
@@ -367,72 +417,46 @@ public class SwarmActivity extends Activity {
                 if (band == null) {
                     updateStatus("AIRLINK: unknown band '" + bandTok + "'");
                 } else {
+                    // Set straight through, WITHOUT forcing ChannelSelectionMode
+                    // MANUAL first. DJI's docs say KeyFrequencyBand is "only
+                    // available in manual mode", but the Mini 3 Pro does not
+                    // support manual channel selection at all while DJI Fly
+                    // still offers it 2.4/5.8/dual — i.e. band is settable in
+                    // AUTO on this airframe. Forcing MANUAL here would try to
+                    // enter a mode the aircraft rejects and could leave the
+                    // link half-configured; a rejected band is reported on the
+                    // status line instead, which is the honest outcome.
                     setAirlinkKeyAndVerify("band", AirLinkKey.KeyFrequencyBand, band);
                 }
             }
 
-            if (!chanTok.isEmpty() && !chanTok.equals("-")) {
-                int channel = Integer.parseInt(chanTok);
-                if (channel < 0) {
-                    setAirlinkKeyAndVerify("channel mode",
-                        AirLinkKey.KeyChannelSelectionMode, ChannelSelectionMode.AUTO);
+            if (!bwTok.isEmpty() && !bwTok.equals("-")) {
+                Bandwidth bw =
+                    bwTok.equals("40") ? Bandwidth.BANDWIDTH_40MHZ :
+                    bwTok.equals("20") ? Bandwidth.BANDWIDTH_20MHZ :
+                    bwTok.equals("10") ? Bandwidth.BANDWIDTH_10MHZ :
+                    bwTok.equals("5")  ? Bandwidth.BANDWIDTH_5MHZ : null;
+                if (bw == null) {
+                    updateStatus("AIRLINK: unknown bandwidth '" + bwTok + "' MHz");
                 } else {
-                    setManualChannel(channel);
+                    setAirlinkKeyAndVerify("bandwidth", AirLinkKey.KeyBandwidth, bw);
                 }
             }
 
-            if (!resTok.isEmpty() && !resTok.equals("-")) {
-                int at = resTok.indexOf('@');
+            if (!videoTok.isEmpty() && !videoTok.equals("-")) {
+                int at = videoTok.indexOf('@');
                 VideoResolution res = VideoResolution.valueOf(
-                    "RESOLUTION_" + resTok.substring(0, at));
+                    "RESOLUTION_" + videoTok.substring(0, at));
                 VideoFrameRate rate = VideoFrameRate.valueOf(
-                    "RATE_" + resTok.substring(at + 1) + "FPS");
+                    "RATE_" + videoTok.substring(at + 1) + "FPS");
                 droneSwarmStreamData.setVideoResolution(
                     new VideoResolutionFrameRate(res, rate));
-                updateStatus("AIRLINK video -> " + resTok);
+                updateStatus("AIRLINK video -> " + videoTok);
             }
         } catch (Exception e) {
             // Never let a malformed one-shot kill the command listener
             updateStatus("AIRLINK parse failed for '" + spec + "': " + e);
         }
-    }
-
-    /** MANUAL selection mode first, then the channel number; either rejection
-     *  reverts to AUTO so the link is never left half-configured. */
-    private void setManualChannel(int channel) {
-        KeyManager.getInstance().setValue(
-            KeyTools.createKey(AirLinkKey.KeyChannelSelectionMode),
-            ChannelSelectionMode.MANUAL,
-            new CommonCallbacks.CompletionCallback() {
-                @Override
-                public void onSuccess() {
-                    KeyManager.getInstance().setValue(
-                        KeyTools.createKey(AirLinkKey.KeyChannelNumber),
-                        channel,
-                        new CommonCallbacks.CompletionCallback() {
-                            @Override
-                            public void onSuccess() {
-                                readBackAirlinkKey("channel", AirLinkKey.KeyChannelNumber);
-                            }
-
-                            @Override
-                            public void onFailure(IDJIError error) {
-                                updateStatus("AIRLINK channel=" + channel
-                                    + " REJECTED (" + error.description()
-                                    + ") — reverting to AUTO");
-                                setAirlinkKeyAndVerify("channel mode",
-                                    AirLinkKey.KeyChannelSelectionMode,
-                                    ChannelSelectionMode.AUTO);
-                            }
-                        });
-                }
-
-                @Override
-                public void onFailure(IDJIError error) {
-                    updateStatus("AIRLINK MANUAL mode REJECTED ("
-                        + error.description() + ") — staying AUTO");
-                }
-            });
     }
 
     private <T> void setAirlinkKeyAndVerify(String what, DJIKeyInfo<T> keyInfo, T value) {
@@ -541,12 +565,160 @@ public class SwarmActivity extends Activity {
                 if (newVal != null) telemBatteryPercent = newVal;
             });
 
-        // Air link signal quality (0-100), i.e. connection quality to the RC
+        // Air link signal quality (0-100), i.e. connection quality to the RC.
+        // DJI's own reading of this scale: <40 poor, 40-60 normal, >60 good.
         KeyManager.getInstance().listen(
             KeyTools.createKey(AirLinkKey.KeySignalQuality), this,
             (Integer oldVal, Integer newVal) -> {
                 if (newVal != null) telemSignalQuality = newVal;
             });
+
+        // Directional link quality (0-100). Worth having separately from the
+        // combined signal quality: the video downlink and the command uplink
+        // degrade independently, and with ten co-located links it is the
+        // downlink that saturates first.
+        KeyManager.getInstance().listen(
+            KeyTools.createKey(AirLinkKey.KeyDownLinkQuality), this,
+            (Integer oldVal, Integer newVal) -> {
+                if (newVal != null) telemDownLinkQuality = newVal;
+            });
+        KeyManager.getInstance().listen(
+            KeyTools.createKey(AirLinkKey.KeyUpLinkQuality), this,
+            (Integer oldVal, Integer newVal) -> {
+                if (newVal != null) telemUpLinkQuality = newVal;
+            });
+    }
+
+    // ========== Link diagnostics (read-only, app -> PC) ==========
+
+    /**
+     * Publish the cached link-quality numbers to the PC at 1 Hz.
+     *
+     * Reads ONLY the cached values the listeners above already maintain — no
+     * KeyManager.getValue() round-trips — because per-frame key polling is
+     * exactly what was removed from DroneSwarmStreamData for adding RF chatter
+     * without adding freshness. Payload:
+     *   LINK:&lt;signalQuality&gt;:&lt;downLinkQuality&gt;:&lt;upLinkQuality&gt;
+     * with -1 for "not reported yet".
+     */
+    private void startLinkStatusLoop() {
+        linkStatusTimer = new Timer("LinkStatus");
+        linkStatusTimer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                MQTTEmbedded.publishDiagnostic(String.format(Locale.US,
+                    LINK_STATUS_PREFIX + "%d:%d:%d",
+                    telemSignalQuality, telemDownLinkQuality, telemUpLinkQuality));
+            }
+        }, LINK_STATUS_INTERVAL_MS, LINK_STATUS_INTERVAL_MS);
+    }
+
+    /**
+     * One-shot answer to the PC's "LINKDIAG" command: read the current radio
+     * configuration plus the aircraft's own interference measurement and
+     * publish it as one line.
+     *
+     * This is the band scan that DJI's auto channel selection is silently
+     * working against — KeyFrequencyInterference returns an RSSI per frequency
+     * bucket, which is the only way to tell "the site is noisy" apart from
+     * "our config is wrong" without external spectrum kit.
+     *
+     * getValue() is used here (not listeners) precisely because it is a
+     * one-shot: the operator asks, the aircraft answers once. Each read is
+     * independent and best-effort, so a key the firmware locks just reports
+     * "?" for that field rather than failing the whole scan. Field order:
+     *   LINKSCAN:band=..:mode=..:bw=..:freq=..:sq=..:down=..:up=..:if=..
+     * where if= is a comma list of &lt;fromMHz&gt;-&lt;toMHz&gt;@&lt;rssi&gt;.
+     */
+    private void publishLinkScan() {
+        // One shared buffer filled by several async callbacks, then published
+        // once when the last one lands. StringBuilder is not thread-safe and
+        // the callbacks arrive on SDK threads, so the parts array + a counter
+        // guarded by the activity monitor does the assembly instead.
+        final String[] parts = new String[4];    // band, mode, bw, freq
+        final int[] remaining = {4};
+
+        readScanField(parts, remaining, 0, "band", AirLinkKey.KeyFrequencyBand);
+        readScanField(parts, remaining, 1, "mode", AirLinkKey.KeyChannelSelectionMode);
+        readScanField(parts, remaining, 2, "bw", AirLinkKey.KeyBandwidth);
+        readScanField(parts, remaining, 3, "freq", AirLinkKey.KeyFrequencyPoint);
+    }
+
+    /** Read one scan field; when the last outstanding read lands, publish. */
+    private <T> void readScanField(final String[] parts, final int[] remaining,
+                                   final int slot, final String name,
+                                   DJIKeyInfo<T> keyInfo) {
+        KeyManager.getInstance().getValue(
+            KeyTools.createKey(keyInfo),
+            new CommonCallbacks.CompletionCallbackWithParam<T>() {
+                @Override
+                public void onSuccess(T value) {
+                    finish(name + "=" + value);
+                }
+
+                @Override
+                public void onFailure(IDJIError error) {
+                    // Locked/unsupported key: report it as unknown rather than
+                    // losing the whole scan.
+                    Log.i(TAG, "LINKDIAG " + name + " read failed: "
+                        + error.description());
+                    finish(name + "=?");
+                }
+
+                private void finish(String text) {
+                    boolean last;
+                    synchronized (SwarmActivity.this) {
+                        parts[slot] = text;
+                        last = (--remaining[0] == 0);
+                    }
+                    if (last) readInterferenceAndPublish(parts);
+                }
+            });
+    }
+
+    /** Final step of a scan: append the interference sweep and publish. */
+    private void readInterferenceAndPublish(final String[] parts) {
+        final String head = LINK_SCAN_PREFIX
+            + parts[0] + ":" + parts[1] + ":" + parts[2] + ":" + parts[3]
+            + String.format(Locale.US, ":sq=%d:down=%d:up=%d",
+                telemSignalQuality, telemDownLinkQuality, telemUpLinkQuality);
+
+        KeyManager.getInstance().getValue(
+            KeyTools.createKey(AirLinkKey.KeyFrequencyInterference),
+            new CommonCallbacks.CompletionCallbackWithParam<List<FrequencyInterferenceInfo>>() {
+                @Override
+                public void onSuccess(List<FrequencyInterferenceInfo> infos) {
+                    StringBuilder sb = new StringBuilder(head).append(":if=");
+                    if (infos != null) {
+                        boolean first = true;
+                        for (FrequencyInterferenceInfo info : infos) {
+                            if (info == null) continue;
+                            if (!first) sb.append(',');
+                            first = false;
+                            sb.append(String.format(Locale.US, "%.0f-%.0f@%d",
+                                nz(info.getFrequencyFrom()), nz(info.getFrequencyTo()),
+                                info.getRssi() == null ? 0 : info.getRssi()));
+                        }
+                    }
+                    emit(sb.toString());
+                }
+
+                @Override
+                public void onFailure(IDJIError error) {
+                    Log.i(TAG, "LINKDIAG interference read failed: "
+                        + error.description());
+                    emit(head + ":if=?");
+                }
+
+                private void emit(String payload) {
+                    MQTTEmbedded.publishDiagnostic(payload);
+                    updateStatus("LINKDIAG -> " + payload);
+                }
+            });
+    }
+
+    private static double nz(Double v) {
+        return v == null ? 0.0 : v;
     }
 
     /**
@@ -795,11 +967,12 @@ public class SwarmActivity extends Activity {
         return 0xFF00FF00;
     }
 
-    /** Green >70, amber 40-70, red <40 (0-100 signal quality), grey if unknown. */
+    /** DJI's own reading of KeySignalQuality: <40 poor, 40-60 normal, >60
+     *  good. Grey if not reported yet. */
     private static int signalColor(int quality) {
         if (quality < 0) return 0xFFCCCCCC;
         if (quality < 40) return 0xFFFF4444;
-        if (quality < 70) return 0xFFFFCC00;
+        if (quality <= 60) return 0xFFFFCC00;
         return 0xFF00FF00;
     }
 
@@ -837,6 +1010,7 @@ public class SwarmActivity extends Activity {
     protected void onDestroy() {
         if (vsSendTimer != null) vsSendTimer.cancel();
         if (telemUiTimer != null) telemUiTimer.cancel();
+        if (linkStatusTimer != null) linkStatusTimer.cancel();
 
         if (vsActive) {
             vsPitch = 0; vsRoll = 0;

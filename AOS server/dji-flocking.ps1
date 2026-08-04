@@ -45,8 +45,10 @@
 #   .\dji-flocking.ps1 -AirlinkBands 2G4,2G4,5G8   # per-drone RF band split (2G4|5G8|DUAL|-),
 #                                     # one value = all drones; sent as a one-shot AIRLINK
 #                                     # command to each RC at startup (results on the RC screen)
-#   .\dji-flocking.ps1 -AirlinkChannels 1,6,11     # per-drone manual channels (-1 = auto, - = skip)
+#   .\dji-flocking.ps1 -AirlinkBandwidth 10        # narrow every link to 10 MHz (40|20|10|5|-);
+#                                     # the main lever when many links share the site
 #   .\dji-flocking.ps1 -VideoMode 1920x1080@24     # cap the camera stream on every RC
+#   .\dji-flocking.ps1 -NoLinkScan    # skip the read-only pre-flight link/interference scan
 #   .\dji-flocking.ps1 -Config .\my-other.psd1   # use a different config file
 #
 # If PowerShell blocks the script, either run once with:
@@ -75,8 +77,9 @@ param(
     [switch]$NoIdentityCheck,
     [string[]]$DroneIPs,
     [string[]]$AirlinkBands,
-    [string[]]$AirlinkChannels,
+    [string[]]$AirlinkBandwidth,
     [string]$VideoMode,
+    [switch]$NoLinkScan,
     [string]$Config = "$PSScriptRoot\flocking.config.psd1"
 )
 
@@ -91,7 +94,8 @@ $settings = @{
     DObs = 5.0; R0Obs = 6.0; CObs = 4.3
     DroneIPs = @()
     IdentityCheck = $true; MinSeparation = 3.0
-    AirlinkBands = @(); AirlinkChannels = @(); VideoMode = ''
+    AirlinkBands = @(); AirlinkBandwidth = @(); VideoMode = ''
+    LinkScan = $true
 }
 
 if (-not (Test-Path $Config)) {
@@ -115,9 +119,9 @@ if ($PSBoundParameters.ContainsKey('ImageStream'))  { $settings.ImageStream = [b
 if ($PSBoundParameters.ContainsKey('PointInwards')) { $settings.PointInwards = [bool]$PointInwards }
 if ($PSBoundParameters.ContainsKey('StitchOffset')) { $settings.StitchOffset = $StitchOffset }
 if ($PSBoundParameters.ContainsKey('DroneIPs'))     { $settings.DroneIPs = $DroneIPs }
-if ($PSBoundParameters.ContainsKey('AirlinkBands'))    { $settings.AirlinkBands = $AirlinkBands }
-if ($PSBoundParameters.ContainsKey('AirlinkChannels')) { $settings.AirlinkChannels = $AirlinkChannels }
-if ($PSBoundParameters.ContainsKey('VideoMode'))       { $settings.VideoMode = $VideoMode }
+if ($PSBoundParameters.ContainsKey('AirlinkBands'))     { $settings.AirlinkBands = $AirlinkBands }
+if ($PSBoundParameters.ContainsKey('AirlinkBandwidth')) { $settings.AirlinkBandwidth = $AirlinkBandwidth }
+if ($PSBoundParameters.ContainsKey('VideoMode'))        { $settings.VideoMode = $VideoMode }
 if ($PSBoundParameters.ContainsKey('MinSeparation')){ $settings.MinSeparation = $MinSeparation }
 if ($PSBoundParameters.ContainsKey('DObs'))         { $settings.DObs = $DObs }
 if ($PSBoundParameters.ContainsKey('R0Obs'))        { $settings.R0Obs = $R0Obs }
@@ -128,6 +132,8 @@ if ($ConvexHull)                                    { $settings.Heading = 'conve
 if ($DemoStitch)                                    { $settings.Heading = 'demostitch' }
 # -NoIdentityCheck disables the command<->telemetry identity probe for one run.
 if ($NoIdentityCheck)                               { $settings.IdentityCheck = $false }
+# -NoLinkScan skips the read-only pre-flight link/interference scan for one run.
+if ($NoLinkScan)                                    { $settings.LinkScan = $false }
 
 $Drones       = [int]$settings.Drones
 $HttpPort     = [int]$settings.HttpPort
@@ -147,9 +153,10 @@ $MinSeparation = [double]$settings.MinSeparation
 $DObs          = [double]$settings.DObs
 $R0Obs         = [double]$settings.R0Obs
 $CObs          = [double]$settings.CObs
-$AirlinkBands    = @($settings.AirlinkBands | Where-Object { "$_".Trim() -ne '' })
-$AirlinkChannels = @($settings.AirlinkChannels | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne '' })
-$VideoMode       = "$($settings.VideoMode)".Trim()
+$AirlinkBands     = @($settings.AirlinkBands | Where-Object { "$_".Trim() -ne '' })
+$AirlinkBandwidth = @($settings.AirlinkBandwidth | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne '' })
+$VideoMode        = "$($settings.VideoMode)".Trim()
+$LinkScan         = [bool]$settings.LinkScan
 
 # Command-path mode from the DroneIPs value:
 #   @()                     -> 'auto'    (swarm_flocking.py discovers the RC IPs from
@@ -180,21 +187,28 @@ if ($MinSeparation -lt 0) { throw "MinSeparation must be >= 0 (0 disables) (got 
 if ($DObs -le 0) { throw "DObs must be > 0 (physical metres) (got $DObs)" }
 if ($R0Obs -lt $DObs) { throw "R0Obs must be >= DObs (detect at least as far as the repulsion reaches) (got R0Obs=$R0Obs, DObs=$DObs)" }
 if ($CObs -lt 0) { throw "CObs must be >= 0 (got $CObs)" }
+# Fail here rather than letting swarm_flocking.py reject it after the panes open.
+foreach ($bw in $AirlinkBandwidth) {
+    if ($bw -notin @('40', '20', '10', '5', '-')) {
+        throw "AirlinkBandwidth entries must be 40, 20, 10, 5 or '-' (MHz) (got '$bw')"
+    }
+}
 
 $CmdPathDesc = switch ($CmdMode) {
     'auto'     { "auto-discover RC IPs from DroneSwarmServer (drone id = server slot)" }
     'server'   { "via DroneSwarmServer (legacy, ~4.5 Hz, forced)" }
     'explicit' { "direct MQTT [$($DroneIPs -join ', ')]" }
 }
-$AirlinkDesc = if ($AirlinkBands.Count -or $AirlinkChannels.Count -or $VideoMode) {
-    "bands=[$($AirlinkBands -join ',')] channels=[$($AirlinkChannels -join ',')] video=$VideoMode"
+$AirlinkDesc = if ($AirlinkBands.Count -or $AirlinkBandwidth.Count -or $VideoMode) {
+    "bands=[$($AirlinkBands -join ',')] bw=[$($AirlinkBandwidth -join ',')]MHz video=$VideoMode"
 } else { "unmanaged (DJI auto)" }
 Write-Host ("[dji-flocking] config $Config -> drones=$Drones slow=$Slow gimbal=$GimbalPitch " +
             "heading=$Heading pointInwards=$PointInwards stitchOffset=$StitchOffset " +
             "noGui=$NoGui imageStream=$ImageStream " +
             "c_vm=$Cvm r0=$R0 scale=$Scale minSep=$MinSeparation identityCheck=$IdentityCheck " +
             "dObs=$DObs r0Obs=$R0Obs cObs=$CObs " +
-            "httpPort=$HttpPort cmdPath=$CmdPathDesc airlink=$AirlinkDesc")
+            "httpPort=$HttpPort cmdPath=$CmdPathDesc airlink=$AirlinkDesc " +
+            "linkScan=$LinkScan")
 
 # --- Build the swarm_flocking.py CLI -----------------------------------------
 # Format doubles invariantly so the decimal point survives locales that use a
@@ -246,13 +260,17 @@ $R0ObsArg = if ($R0Obs -ne 6.0) { " --r0-obs " + (Inv $R0Obs) } else { "" }
 $CObsArg  = if ($CObs -ne 4.3)  { " --c-obs " + (Inv $CObs) }   else { "" }
 
 # One-shot AirLink / camera-stream setup at startup (empty = send nothing,
-# leaving every link on DJI's own auto selection).
+# leaving every link on DJI's own auto selection). NOTE: "send nothing" is not
+# "restore defaults" — band/bandwidth persist in the RC/aircraft firmware, so a
+# setting applied on a previous run stays until it is explicitly overwritten.
 $AirlinkArg = ""
-if ($AirlinkBands.Count)    { $AirlinkArg += " --airlink-bands " + ($AirlinkBands -join ',') }
-if ($AirlinkChannels.Count) { $AirlinkArg += " --airlink-channels " + ($AirlinkChannels -join ',') }
-if ($VideoMode)             { $AirlinkArg += " --video-mode $VideoMode" }
+if ($AirlinkBands.Count)     { $AirlinkArg += " --airlink-bands " + ($AirlinkBands -join ',') }
+if ($AirlinkBandwidth.Count) { $AirlinkArg += " --airlink-bandwidth " + ($AirlinkBandwidth -join ',') }
+if ($VideoMode)              { $AirlinkArg += " --video-mode $VideoMode" }
+# Read-only pre-flight link/interference scan (on by default; forward the opt-out).
+$LinkScanArg = if (-not $LinkScan) { " --no-link-scan" } else { "" }
 
-$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg$IdentityArg$MinSepArg$DObsArg$R0ObsArg$CObsArg$AirlinkArg"
+$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg$IdentityArg$MinSepArg$DObsArg$R0ObsArg$CObsArg$AirlinkArg$LinkScanArg"
 
 # The readController pane sources the conda hook and activates this env
 # before launching the script. Edit if your miniconda lives elsewhere.

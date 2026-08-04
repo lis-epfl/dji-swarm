@@ -73,6 +73,7 @@ _SWARM_COLS = [
     'v_n_obs', 'v_e_obs',
     'v_n_total', 'v_e_total', 'd_ref', 'n_neighbours',
     'resp_rot_deg', 'resp_gain',
+    'link_sq', 'link_down', 'link_up',
 ]
 
 # Stream name -> (filename, column list).
@@ -125,12 +126,30 @@ class FlightLogger:
             self._files[stream] = f
             self._writers[stream] = wr
 
-        self._write_session_json(meta)
+        self._meta = dict(meta or {})
+        self._write_session_json(self._meta)
 
         self._running = True
         self._thread = threading.Thread(
             target=self._writer_loop, daemon=True, name="FlightLogger")
         self._thread.start()
+
+    def update_meta(self, extra):
+        """Merge `extra` into the session metadata and rewrite session.json.
+
+        For one-shot facts that are only known after construction — e.g. the
+        pre-flight link scan, which needs the RCs connected first. Not for
+        time series: those belong in a stream. Called from the startup path,
+        so a plain rewrite (no queue) is fine.
+        """
+        if not extra:
+            return
+        self._meta.update(extra)
+        try:
+            self._write_session_json(self._meta)
+        except OSError as e:
+            print("[FlightLogger] session.json update failed: {}".format(e),
+                  flush=True)
 
     # ------------------------------------------------------------------ #
     # Producer API (called from control threads; must not block)
@@ -179,12 +198,16 @@ class FlightLogger:
     def log_swarm_debug(self, drone_id, v_n_des, v_e_des, v_n_corr, v_e_corr,
                         v_n_total, v_e_total, d_ref, n_neighbours,
                         v_n_obs=0.0, v_e_obs=0.0,
-                        resp_rot_deg=None, resp_gain=None):
+                        resp_rot_deg=None, resp_gain=None,
+                        link_sq=None, link_down=None, link_up=None):
         """Log the Olfati-Saber decomposition for one drone (swarm mode only).
         v_n_obs/v_e_obs is the virtual-obstacle + geofence repulsion term
         (optional, defaults 0 so callers without obstacles stay unchanged).
         resp_rot_deg/resp_gain is the ResponseMonitor's live command->response
-        rotation fit (blank while there is not enough commanded motion)."""
+        rotation fit (blank while there is not enough commanded motion).
+        link_sq/link_down/link_up are the RC's AirLink quality percentages
+        pushed by the app (blank on the server command path, which has no
+        app->PC diagnostic channel)."""
         self._enqueue('swarm', {
             'drone_id': drone_id,
             'v_n_des': v_n_des,
@@ -199,6 +222,9 @@ class FlightLogger:
             'n_neighbours': n_neighbours,
             'resp_rot_deg': resp_rot_deg,
             'resp_gain': resp_gain,
+            'link_sq': link_sq,
+            'link_down': link_down,
+            'link_up': link_up,
         })
 
     # ------------------------------------------------------------------ #

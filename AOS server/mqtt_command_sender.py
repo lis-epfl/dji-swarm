@@ -12,9 +12,16 @@ TCP connect -> publish -> waitForCompletion -> disconnect x2 -> destroy,
 drone with three. A persistent connection pays the connect cost once; each
 publish is then a sub-millisecond socket write, so 20 Hz per drone is trivial.
 
-The app side needs no changes: its Moquette intercept handler fires
-onCommandReceived for ANY publish from ANY client regardless of topic
+The app side needs no changes for commands: its Moquette intercept handler
+fires onCommandReceived for ANY publish from ANY client regardless of topic
 (MQTTEmbedded.java), and the payload is the same raw command string.
+
+The same connections are also the app->PC return path for link diagnostics.
+Each client permanently subscribes to DIAG_TOPIC, where SwarmActivity pushes
+"LINK:" (1 Hz radio quality) and "LINKSCAN:" (on-demand radio config +
+interference sweep, requested with request_scan()). That path exists because
+the RTSP telemetry string cannot carry new fields — its producer is the native
+setTelemetryData() with a fixed 17-argument signature and no source in-tree.
 
 Design notes:
 - paho-mqtt 2.x API (CallbackAPIVersion.VERSION2), already installed for the
@@ -43,8 +50,17 @@ import paho.mqtt.client as mqtt
 # Topic the server's send path also uses (Dialog1Dlg.cpp TOPIC). The app's
 # intercept handler ignores the topic, but keeping it consistent aids sniffing.
 COMMAND_TOPIC = "MQTTWayPoints"
+# Topic the APP publishes its read-only link diagnostics on
+# (MQTTEmbedded.DIAG_TOPIC). Separate from COMMAND_TOPIC so these never land in
+# the identity probe's capture buffer — the broker routes real subscriptions by
+# topic even though the app's own intercept handler ignores it.
+DIAG_TOPIC = "LISSwarmDiag"
 BROKER_PORT = 1883
 KEEPALIVE_S = 10
+
+# A LINK: sample older than this is reported as unavailable. The app publishes
+# at 1 Hz, so this tolerates a few consecutive misses before the GUI blanks.
+LINK_STALE_S = 5.0
 
 # Minimum seconds between repeated "publish failed" warnings per drone.
 _WARN_INTERVAL_S = 1.0
@@ -73,10 +89,16 @@ class MqttCommandSender:
         self._stopping = False
 
         # Identity-probe capture: while _probe_msgs is a list, every message
-        # received on any per-IP connection is appended as (drone_id, payload).
-        # None = capture off (the steady state; on_message then does nothing).
+        # received on COMMAND_TOPIC on any per-IP connection is appended as
+        # (drone_id, payload). None = capture off (the steady state).
         self._probe_lock = threading.Lock()
         self._probe_msgs = None
+
+        # Link diagnostics pushed by the app on DIAG_TOPIC. _link holds the
+        # 1 Hz quality snapshot, _scan the last on-demand LINKDIAG answer.
+        self._diag_lock = threading.Lock()
+        self._link = {}    # drone_id -> (monotonic_ts, {"sq":, "down":, "up":})
+        self._scan = {}    # drone_id -> (monotonic_ts, raw scan string)
 
         for did, ip in self._ips.items():
             client = mqtt.Client(
@@ -97,6 +119,14 @@ class MqttCommandSender:
             self._connected[drone_id] = True
             print("[mqtt-cmd {}] connected to {} ({})".format(
                 drone_id, self._ips[drone_id], reason_code), flush=True)
+            # (Re)subscribe here rather than once after construction: paho
+            # drops server-side subscriptions on every reconnect, so doing it
+            # in the connect callback is what makes the diagnostic feed
+            # survive an RC power-cycle or cable pull.
+            try:
+                client.subscribe(DIAG_TOPIC, qos=0)
+            except Exception as e:
+                self._warn(drone_id, "diag subscribe failed: {}".format(e))
         return on_connect
 
     def _make_on_disconnect(self, drone_id):
@@ -111,12 +141,68 @@ class MqttCommandSender:
 
     def _make_on_message(self, drone_id):
         def on_message(client, userdata, msg):
+            payload = msg.payload.decode("utf-8", "replace")
+            if msg.topic == DIAG_TOPIC:
+                self._on_diag(drone_id, payload)
+                return
             with self._probe_lock:
                 if (self._probe_msgs is not None
                         and len(self._probe_msgs) < _PROBE_BUFFER_MAX):
-                    self._probe_msgs.append(
-                        (drone_id, msg.payload.decode("utf-8", "replace")))
+                    self._probe_msgs.append((drone_id, payload))
         return on_message
+
+    def _on_diag(self, drone_id, payload):
+        """Store a link diagnostic pushed by the app. Never raises: this runs
+        on paho's network thread, where an exception would kill the client."""
+        try:
+            if payload.startswith("LINK:"):
+                # LINK:<signal>:<down>:<up>, each 0-100 or -1 = not reported.
+                parts = payload[len("LINK:"):].split(":")
+                if len(parts) < 3:
+                    return
+                vals = {}
+                for name, tok in zip(("sq", "down", "up"), parts):
+                    v = int(tok)
+                    vals[name] = None if v < 0 else v
+                with self._diag_lock:
+                    self._link[drone_id] = (time.monotonic(), vals)
+            elif payload.startswith("LINKSCAN:"):
+                with self._diag_lock:
+                    self._scan[drone_id] = (time.monotonic(), payload)
+        except Exception:
+            pass
+
+    def link_of(self, drone_id, max_age=LINK_STALE_S):
+        """Latest {"sq","down","up"} for drone_id, or None if stale/absent.
+
+        Values are individually None when the aircraft has not reported that
+        field yet, so a caller must handle a dict of Nones.
+        """
+        with self._diag_lock:
+            entry = self._link.get(drone_id)
+        if entry is None:
+            return None
+        ts, vals = entry
+        if time.monotonic() - ts > max_age:
+            return None
+        return dict(vals)
+
+    def scan_of(self, drone_id):
+        """Last raw LINKSCAN: string for drone_id, or None. Not age-limited —
+        a scan is an explicit one-shot and stays valid until re-requested."""
+        with self._diag_lock:
+            entry = self._scan.get(drone_id)
+        return None if entry is None else entry[1]
+
+    def request_scan(self, drone_id):
+        """Ask one RC for a full link scan (read-only; the app answers on
+        DIAG_TOPIC). QoS 1 so it survives an RC still settling its link."""
+        return self.send(drone_id, "LINKDIAG", qos=1)
+
+    def clear_scans(self):
+        """Forget stored scans so a new request cannot read back a stale one."""
+        with self._diag_lock:
+            self._scan.clear()
 
     def connected(self, drone_id):
         return self._connected.get(drone_id, False)
