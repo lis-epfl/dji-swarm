@@ -139,6 +139,15 @@ no video.
     mailbox, and does the convert/resize/handshake on per-drone worker threads so it
     can never slow the cmd/telem rates. (In real-drone mode the Unity component's
     `enableImageWriting` must be off — its writer would fight this one.)
+    The block header it writes is the **12-byte v1** `flag|droneId|heading`, and that is
+    structural, not a version lag: the pose header (v2, 48 bytes) carries a per-frame
+    *camera* position + rotation, which the DJI telemetry string simply does not contain
+    (it has GPS + aircraft/gimbal angles, not an optical-centre pose). Consequence: the
+    sim's **`PLANAR` stitcher cannot run on real drones** — it is pose-driven, so it needs
+    v2. `StitcherThreading.planar_inputs_ready()` detects the v1 producer, prints one
+    `[PLANAR] unavailable: …` line and falls back to the individual feeds; the symptom is a
+    blank panorama, not a crash. Use `STABSTITCH` here. Making `PLANAR` work with real
+    drones is not a wiring change — it needs a camera-pose source that does not exist yet.
   - `mqtt_command_sender.py` — `MqttCommandSender`, used by `swarm_flocking.py` when
     `DroneIPs`/`--drone-ips` is set: one **persistent** paho-mqtt connection per RC broker
     (`tcp://<rc-ip>:1883`), publishing the command strings directly (the app's Moquette
