@@ -72,8 +72,50 @@
     IdentityCheck = $true
 
     # Minimum-separation failsafe (physical metres): swarming auto-STOPs if
-    # any drone pair gets closer than this. 0 disables. CLI: -MinSeparation
+    # any drone pair gets closer than this, measured in 3D (horizontal + the
+    # altitude difference). 0 disables. CLI: -MinSeparation
     MinSeparation = 2.0
+
+    # --- Vertical-plane ("wall") swarming --------------------------------- ---
+    # Port of the Unity sim's SwarmPlaneController: the swarm re-forms as a
+    # VERTICAL wall facing the stick-steered heading, so the operator looks at a
+    # billboard of drones instead of standing inside a ring of them. The
+    # cohesion law is unchanged — only the plane it is constrained to swaps —
+    # but the vertical part of the in-plane force becomes a PER-DRONE altitude
+    # setpoint (DJI VS gives absolute-altitude control and no vertical velocity
+    # channel). Toggleable live from the GUI; this key only seeds the toggle.
+    #
+    # SAFETY, read before flying it:
+    #   - A wall stacks drones vertically, so the upper one's rotor downwash
+    #     lands on the lower one. Nothing in the sim models this. The GUI shows
+    #     a DOWNWASH advisory; the 3D MinSeparation above is the hard failsafe.
+    #   - Altitude is takeoff-relative PER AIRCRAFT, so a wall built in altitude
+    #     space is skewed by launch-pad height differences (and 3D separation is
+    #     wrong by the same amount). Launch from one flat pad. Entry is refused
+    #     if the reported altitudes disagree by more than 3 m.
+    #   - Heading is forced to 'manual' while a wall is up (convexhull's hull
+    #     collapses to a line and demostitch's lateral ranking degenerates).
+    # CLI: -PlaneMode
+    PlaneMode = $false
+
+    # Restoring pull onto the plane: m/s of horizontal command per metre a drone
+    # sits off the wall. Range [0.02, 1.0], live-tunable in the GUI. The term is
+    # clamped internally so obstacle/geofence repulsion always outranks it.
+    # Higher = a crisper wall but more sensitivity to the ~5 Hz GPS.
+    # CLI: -PlaneGain
+    PlaneGain = 0.25
+
+    # How far one drone's altitude setpoint may sit from the wall's reference
+    # altitude (metres). Bounds the wall's vertical extent and stops a runaway
+    # climb or descent. CLI: -PlaneLeash
+    PlaneLeash = 12.0
+
+    # Ceiling for every commanded altitude (metres), horizontal or wall. Raise
+    # it for a tall wall: N drones at d_ref spacing need roughly (N-1)*d_ref of
+    # vertical room, centred well above the 1 m floor (5 drones at 8 m ~= 32 m,
+    # so ~20 m of centre altitude). CHECK THE SITE'S LEGAL CEILING FIRST.
+    # CLI: -MaxAlt
+    MaxAlt = 30.0
 
     # --- AirLink / RF management (sent once per drone at controller startup ---
     # --- as an "AIRLINK:" MQTT one-shot; the RC shows applied/rejected on   ---

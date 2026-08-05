@@ -207,7 +207,9 @@
     <span class="chip" id="heading-chip" style="display:none"></span>
     <span class="chip" id="swarm-chip" style="display:none"></span>
     <span class="chip" id="joy-chip" style="display:none"></span>
+    <span class="chip" id="plane-chip" style="display:none"></span>
     <span class="chip" id="fence-chip" style="display:none"></span>
+    <span class="chip" id="downwash-chip" style="display:none"></span>
     <span class="chip" id="rotcheck-chip" style="display:none"></span>
   </div>
 
@@ -243,6 +245,14 @@
     <label id="stitch-ctl" style="display:none"
            title="Demo stitch: heading offset between laterally adjacent drones (deg) — the middle drone points at the stick yaw, each neighbour fans out by this much per rank">
       Offset <input type="number" id="stitch-offset" min="5" max="90" step="5" value="30" style="width:4.5em" />&deg;
+    </label>
+    <label id="plane-ctl"
+           title="Vertical-plane (wall) swarming: the swarm re-forms as a vertical wall facing the stick-steered heading, on per-drone altitude setpoints instead of one shared altitude. The yaw stick re-aims the wall; all noses stay on its normal (heading is forced to Manual — hull and demo stitch both degenerate on a wall). Refused if the drones' reported altitudes disagree by more than 3 m, since altitude is takeoff-relative per aircraft — launch from one flat pad. Watch the 3D distance labels: a wall stacks drones vertically, and the upper one's downwash lands on the lower.">
+      <input type="checkbox" id="chk-plane" /> Vertical plane
+    </label>
+    <label id="plane-gain-ctl" style="display:none"
+           title="Restoring pull onto the plane: m/s of horizontal command per metre a drone sits off the wall. Higher = a crisper wall but more fight against obstacle/geofence repulsion (which always outranks it) and more sensitivity to the ~5 Hz GPS. Start low.">
+      Gain <input type="number" id="plane-gain" min="0.02" max="1" step="0.02" value="0.25" style="width:4.5em" />
     </label>
     <label id="gimbal-ctl" title="Gimbal pitch (tilt) for all drones — DJI Mini 3 Pro range -90° to +60°">
       Gimbal <input type="range" id="gimbal-slider" min="-90" max="60" step="1" value="-10" />
@@ -328,6 +338,16 @@ function distMeters(a, b) {
   return Math.sqrt(x * x + y * y) * R;
 }
 
+// True 3D separation in metres between two placed drones ({lat, lon, alt}).
+// Matches swarm_plane.separation_3d — the measure the controller's
+// min-separation failsafe uses. Falls back to the horizontal distance when
+// either altitude is missing.
+function sep3d(a, b) {
+  const dh = distMeters(a, b);
+  const dv = (Number.isFinite(a.alt) && Number.isFinite(b.alt)) ? a.alt - b.alt : 0;
+  return Math.sqrt(dh * dh + dv * dv);
+}
+
 function hasValidCoords(t) {
   return t && typeof t.lat === 'number' && typeof t.lon === 'number'
            && !(Math.abs(t.lat) < 1e-6 && Math.abs(t.lon) < 1e-6)
@@ -401,7 +421,8 @@ function linkCell(link) {
   return `<span class="v ${linkClass(worst)}" title="AirLink quality %: overall signal (downlink/uplink). DJI: &lt;40 poor, 40-60 normal, &gt;60 good">${txt}</span>`;
 }
 
-function renderCard(id, rec, status, onHull, centre, fenced, resp, rotRes, link) {
+function renderCard(id, rec, status, onHull, centre, fenced, resp, rotRes, link,
+                    planeInfo) {
   const t = rec.telem || {};
   const age = rec.age;
   const color = colorFor(id);
@@ -432,6 +453,19 @@ function renderCard(id, rec, status, onHull, centre, fenced, resp, rotRes, link)
     rotPill = `<span class="pill ${rotClass(rr.rot, rr.verdict)}" style="margin-left:0" title="Rotation check: this drone did not fly its commands correctly — do not start swarming with it">${rr.verdict}</span>`;
   }
 
+  // Vertical-plane rows: only while a wall is up. "Alt cmd" is the per-drone
+  // altitude setpoint actually being sent (in horizontal mode every drone
+  // shares one, so there is nothing per-drone to show), and "Off plane" is how
+  // far the drone still is from the wall — it should decay toward 0.
+  let planeRows = '';
+  if (planeInfo) {
+    const off = planeInfo.off;
+    const offCls = Number.isFinite(off) && Math.abs(off) > 3.0 ? 'warn-v' : '';
+    planeRows =
+      `<span class="k">Alt cmd</span> <span class="v">${fmt(planeInfo.alt, 1, ' m')}</span>
+       <span class="k">Off plane</span> <span class="v ${offCls}" title="Distance from the swarming plane along its normal — the restoring term is pulling this to 0">${Number.isFinite(off) ? (off > 0 ? '+' : '') + off.toFixed(1) + ' m' : '—'}</span>`;
+  }
+
   card.innerHTML = `
     <div class="hdr">
       <span class="badge" style="background:${color}">${id}</span>
@@ -444,6 +478,7 @@ function renderCard(id, rec, status, onHull, centre, fenced, resp, rotRes, link)
     </div>
     <div class="grid">
       <span class="k">Alt</span>     <span class="v">${fmt(t.alt, 1, ' m')}</span>
+      ${planeRows}
       <span class="k">Heading</span> <span class="v">${fmt(t.heading, 0, '°')}</span>
       <span class="k">Gnd spd</span> <span class="v">${fmt(spd, 2, ' m/s')}</span>
       <span class="k">Climb</span>   <span class="v">${fmt(t.vz, 2, ' m/s')}</span>
@@ -456,6 +491,17 @@ function renderCard(id, rec, status, onHull, centre, fenced, resp, rotRes, link)
       <span class="k">Feed age</span> <span class="v">${fmt(age, 1, ' s')}</span>
     </div>`;
   return card;
+}
+
+// Per-drone slice of meta.plane for the card rows; null when no wall is up (or
+// this drone isn't in it), which keeps the extra rows out of horizontal mode.
+function planeInfoFor(plane, id) {
+  if (!plane || !(plane.on || plane.ramping)) return null;
+  const alt = plane.alt_cmd ? plane.alt_cmd[id] : undefined;
+  const off = plane.offsets ? plane.offsets[id] : undefined;
+  if (!Number.isFinite(alt) && !Number.isFinite(off)) return null;
+  return { alt: Number.isFinite(alt) ? alt : null,
+           off: Number.isFinite(off) ? off : null };
 }
 
 // ---- Olfati-Saber parameter footer ----
@@ -547,6 +593,42 @@ function render(data) {
       stitchInput.value = meta.stitch_offset;
     }
   }
+  // ----- vertical plane (wall) -----
+  // meta.plane is the live wall state; meta.plane_mode is the requested toggle
+  // (the controller clears it back to false when it refuses entry).
+  const plane = meta.plane || {};
+  const planeOn = !!(plane.on || plane.ramping);
+  if (Date.now() > planePendingUntil) {
+    if ('plane_mode' in meta) chkPlane.checked = !!meta.plane_mode;
+    if (Number.isFinite(meta.plane_gain)
+        && document.activeElement !== planeGainInput) {
+      planeGainInput.value = meta.plane_gain;
+    }
+  }
+  planeGainCtl.style.display = chkPlane.checked ? '' : 'none';
+  const planeChip = document.getElementById('plane-chip');
+  if (planeOn) {
+    planeChip.style.display = '';
+    planeChip.className = 'chip ' + (plane.ramping ? 'rot-run' : 'swarm-on');
+    planeChip.textContent = plane.ramping
+      ? 'WALL off — levelling altitudes'
+      : `WALL ${Number.isFinite(plane.az) ? (plane.az > 0 ? '+' : '') + plane.az.toFixed(0) + '°' : ''}`
+        + (Number.isFinite(plane.alt_ref) ? ` @ ${plane.alt_ref.toFixed(1)} m` : '');
+  } else {
+    planeChip.style.display = 'none';
+  }
+  // On a wall the hull collapses to a line and lateral ranking has no meaning,
+  // so the controller forces manual heading — disable the options that can't
+  // apply rather than letting the operator pick one that gets overridden.
+  const planeReq = chkPlane.checked;
+  for (const opt of headingSelect.options) {
+    if (opt.value !== 'manual') opt.disabled = planeReq;
+  }
+  headingSelect.title = planeReq
+    ? 'Forced to Manual while vertical-plane swarming is on — Manual points '
+      + 'every nose along the wall normal.'
+    : '';
+
   const hullMode = headingSelect.value === 'convexhull';
   const stitchMode = headingSelect.value === 'demostitch';
   inwardsCtl.style.display = hullMode ? '' : 'none';
@@ -577,6 +659,21 @@ function render(data) {
     fenceChip.textContent = `${fencedSet.size} fenced out — Stop/Start to re-admit`;
   } else {
     fenceChip.style.display = 'none';
+  }
+
+  // ----- downwash advisory -----
+  // meta.downwash lists [upper, lower] pairs stacked closer than ~2 m
+  // horizontally with an altitude gap: the upper drone's prop wash is landing
+  // on the lower one. Advisory only — the controller never stops for it.
+  const dw = Array.isArray(meta.downwash) ? meta.downwash : [];
+  const dwChip = document.getElementById('downwash-chip');
+  if (dw.length > 0) {
+    dwChip.style.display = '';
+    dwChip.className = 'chip fence-warn';
+    dwChip.textContent = 'DOWNWASH: '
+      + dw.map(p => `${p[0]} over ${p[1]}`).join(', ');
+  } else {
+    dwChip.style.display = 'none';
   }
 
   // ----- obstacles + geofence -----
@@ -708,7 +805,12 @@ function render(data) {
 
     // Place on the map when we have coordinates and the link is alive.
     if (age <= DRONE_STALE_S && hasValidCoords(t)) {
-      placed.push({ id, lat: t.lat, lon: t.lon });
+      // alt rides along so the distance lines can report TRUE 3D separation —
+      // the same measure the controller's min-separation failsafe uses. On a
+      // vertical wall the horizontal distance is near zero and would read as an
+      // imminent collision that isn't one.
+      placed.push({ id, lat: t.lat, lon: t.lon,
+                    alt: Number.isFinite(t.alt) ? t.alt : null });
       const weak = status === 'weak';
       const icon = droneIcon(id, t.heading, colorFor(id), weak, fencedSet.has(id));
       if (markers[id]) {
@@ -727,7 +829,7 @@ function render(data) {
       renderCard(id, rec, status, hullSet.has(id), stitchCentre === id,
                  fencedSet.has(id),
                  respMap[id] || null, rotResults[id] || null,
-                 linkMap[id] || null));
+                 linkMap[id] || null, planeInfoFor(plane, id)));
   }
 
   document.getElementById('drone-count').textContent =
@@ -738,7 +840,9 @@ function render(data) {
   for (let i = 0; i < placed.length; i++) {
     for (let j = i + 1; j < placed.length; j++) {
       const a = placed[i], b = placed[j];
-      const d = distMeters(a, b);
+      const dh = distMeters(a, b);
+      const dv = (a.alt !== null && b.alt !== null) ? (a.alt - b.alt) : 0;
+      const d = Math.sqrt(dh * dh + dv * dv);   // 3D, matches the failsafe
       // When the target spacing is known, tint each line by how close the pair
       // is to it: green within tolerance, amber when off-target.
       let lineColor = '#9fd8ff', labelCls = 'dist-label';
@@ -749,7 +853,12 @@ function render(data) {
       const poly = L.polyline([[a.lat, a.lon], [b.lat, b.lon]],
         { color: lineColor, weight: 1.8, opacity: 0.8,
           dashArray: dref !== null ? null : '4 4' });
-      poly.bindTooltip(`${d.toFixed(1)} m`,
+      // Show the vertical split too when it is a real part of the separation:
+      // on the map (a top-down view) a wall's pairs look coincident, so the
+      // number alone would be unexplainable.
+      poly.bindTooltip(Math.abs(dv) >= 0.5
+          ? `${d.toFixed(1)} m (${dh.toFixed(1)}h / ${Math.abs(dv).toFixed(1)}v)`
+          : `${d.toFixed(1)} m`,
         { permanent: true, direction: 'center', className: labelCls });
       linesLayer.addLayer(poly);
     }
@@ -825,6 +934,29 @@ stitchInput.addEventListener('change', () => {
   stitchInput.value = v;
   headingPendingUntil = Date.now() + 1500;
   postCommand({ action: 'stitch_offset', value: v });
+});
+
+// Vertical-plane ("wall") toggle + restoring gain. Same ownership pattern: the
+// controller owns meta.plane_mode / meta.plane_gain and can REFUSE the toggle
+// (altitudes too far apart, fewer than 2 fixes), in which case its echo turns
+// the checkbox back off once the pending window expires — so the operator sees
+// the refusal reflected instead of a checkbox that lies.
+const chkPlane      = document.getElementById('chk-plane');
+const planeGainCtl  = document.getElementById('plane-gain-ctl');
+const planeGainInput= document.getElementById('plane-gain');
+let planePendingUntil = 0;
+chkPlane.addEventListener('change', () => {
+  planePendingUntil = Date.now() + 1500;
+  planeGainCtl.style.display = chkPlane.checked ? '' : 'none';
+  postCommand({ action: 'plane', value: chkPlane.checked });
+});
+planeGainInput.addEventListener('change', () => {
+  let v = Number(planeGainInput.value);
+  if (!Number.isFinite(v)) v = 0.25;
+  v = Math.max(0.02, Math.min(1, v));
+  planeGainInput.value = v;
+  planePendingUntil = Date.now() + 1500;
+  postCommand({ action: 'plane_gain', value: v });
 });
 
 // Gimbal pitch slider: retargets every drone's gimbal tilt. Forwarded to the
@@ -1115,7 +1247,9 @@ function renderCohesionPlot(o, drefM, placed) {
   ctx.fillStyle = '#ffd23f';
   for (let i = 0; i < placed.length; i++) {
     for (let j = i + 1; j < placed.length; j++) {
-      const dPhys = distMeters(placed[i], placed[j]);
+      // 3D, like the map labels: on a vertical wall the cohesion potential is
+      // evaluated in the plane, where the pair really is d apart.
+      const dPhys = sep3d(placed[i], placed[j]);
       if (dPhys < 0 || dPhys > maxD) continue;
       pairCount++;
       const x = x2px(dPhys);

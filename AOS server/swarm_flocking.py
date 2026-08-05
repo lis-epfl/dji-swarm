@@ -19,7 +19,9 @@ Architecture (mirrors the Unity sim's SwarmAlgorithm + VelocityControl pair):
 Joystick → swarm mapping:
     linear.x   → desired north velocity   (m/s, world frame)
     linear.y   → desired east  velocity   (m/s, world frame)
-    linear.z   → climb (integrated into shared target altitude)
+    linear.z   → climb (integrated into the shared target altitude; in
+                 vertical-plane mode it raises/lowers the whole wall instead —
+                 see swarm_plane.py)
     angular.z  → yaw rate (feed-forward; a shared target heading is held per
                  drone via heading_hold_rate → smooth yaw RATE to the DJI VS).
                  With --heading convexhull the per-drone heading comes from the
@@ -37,6 +39,12 @@ Joystick → swarm mapping:
                  s1/s2 switches unwired means a switch left 'on' at connect can
                  never auto-start the swarm.
     PC key 'q' → zero velocities, hold current position, disable VS, exit
+
+Vertical-plane ("wall") swarming is ported in swarm_plane.py: a GUI toggle that
+swaps the plane the cohesion law is constrained to, from horizontal to a
+vertical wall facing the stick-steered heading. It is the only path in this
+script that commands a PER-DRONE altitude — everywhere else the swarm shares
+one absolute altitude target.
 
 Obstacle avoidance from the C# original is ported in olfati_saber.py
 (ObstacleAvoidance): 2D rectangular virtual obstacles plus one geofence
@@ -59,6 +67,7 @@ Usage:
     python swarm_flocking.py --drones 3 --slow 0.5     # slow test mode at 50% speed
     python swarm_flocking.py --drones 3 --dry-run      # print VS commands, do not transmit
     python swarm_flocking.py --drones 3 --heading convexhull   # hull-facing headings
+    python swarm_flocking.py --drones 3 --plane-mode --max-alt 40  # vertical wall
 """
 
 import argparse
@@ -78,9 +87,17 @@ import ds_wrapper as w
 # Force line-buffered stdout so we actually see startup prints in the PowerShell
 # launcher (block-buffered stdout has made debug sessions painful before).
 try:
-    sys.stdout.reconfigure(line_buffering=True)
-except AttributeError:
-    pass  # Python <3.7
+    # errors='replace': the console codepage is often cp1252, which cannot
+    # encode characters like U+2192. Without this, ONE such character in a
+    # status line raises UnicodeEncodeError mid-print — inside the per-drone
+    # try/except that turns into "flocking error" on every drone every tick,
+    # with no other symptom. Degrade to '?' instead of losing the output.
+    sys.stdout.reconfigure(line_buffering=True, errors='replace')
+except (AttributeError, ValueError):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass  # Python <3.7
 
 from udp_joystick_receiver import JoystickReceiver
 from flight_logger import FlightLogger
@@ -95,6 +112,17 @@ from heading_demostitch import (
     DEFAULT_OFFSET_DEG,
     OFFSET_MIN_DEG,
     OFFSET_MAX_DEG,
+)
+from swarm_plane import (
+    SwarmPlane,
+    alt_spread,
+    separation_3d,
+    DEFAULT_PLANE_GAIN,
+    PLANE_GAIN_MIN,
+    PLANE_GAIN_MAX,
+    DEFAULT_PLANE_LEASH_M,
+    ALT_SPREAD_GATE_M,
+    DOWNWASH_RADIUS_M,
 )
 from olfati_saber import (
     OlfatiSaber,
@@ -779,8 +807,8 @@ DEFAULT_CMD_PORT = 5098
 
 def command_listener(swarming, meta, host, port, shapes_path=None):
     """Receive GUI command datagrams (Start/Stop, gimbal slider, heading
-    mode + point-inwards + stitch-offset controls, obstacle/geofence edits)
-    over UDP.
+    mode + point-inwards + stitch-offset controls, vertical-plane toggle +
+    gain, obstacle/geofence edits) over UDP.
 
     This thread NEVER touches ds_wrapper — it only mutates the shared `swarming`
     Event and the shared `meta` dict. The control loop (run) detects the edge /
@@ -847,6 +875,27 @@ def command_listener(swarming, meta, host, port, shapes_path=None):
                 if meta is not None:
                     meta["stitch_offset"] = v
                     print(f"[gui] stitch offset -> {v:.0f}°")
+            elif action == "plane":
+                # GUI toggle: vertical-plane ("wall") swarming. Only a request
+                # flag — run() owns the transition (it needs the position/
+                # altitude snapshot to seed the wall, and it gates entry on the
+                # reported-altitude spread), and clears this back to False if it
+                # refuses.
+                if meta is not None:
+                    meta["plane_mode"] = bool(msg.get("value"))
+                    print(f"[gui] vertical plane -> "
+                          f"{'ON' if meta['plane_mode'] else 'off'}")
+            elif action == "plane_gain":
+                # GUI number input: restoring pull onto the plane (m/s per
+                # metre of out-of-plane offset). run() reads it live each tick.
+                try:
+                    v = float(msg.get("value"))
+                except (TypeError, ValueError):
+                    continue
+                v = max(PLANE_GAIN_MIN, min(PLANE_GAIN_MAX, v))
+                if meta is not None:
+                    meta["plane_gain"] = v
+                    print(f"[gui] plane gain -> {v:.2f}")
             elif action == "rotation_check":
                 # GUI button: open-loop actuation probe (RotationProbe). Only
                 # a request marker — run() starts/ticks the probe on the
@@ -925,7 +974,8 @@ def command_listener(swarming, meta, host, port, shapes_path=None):
 def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         logger=None, speed_scale=1.0, meta=None, heading_ctrl=None,
         stitch_ctrl=None, cmd_sender=None, identity_check=True,
-        min_separation=DEFAULT_MIN_SEPARATION_M, avoid=None):
+        min_separation=DEFAULT_MIN_SEPARATION_M, avoid=None,
+        plane_ctrl=None, max_alt=MAX_ALT_M):
     print("\n--- Olfati-Saber Swarm Mode ---")
     print(f"  Drones: {sorted(swarm.drones.keys())}")
     print(f"  c_vm={olfati.c_vm}  r0_coh={olfati.r0_coh}  scale={olfati.scale}")
@@ -942,6 +992,14 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
           f"demostitch = the laterally-middle drone points at the stick yaw, "
           f"neighbours fan out by meta['stitch_offset']° per rank (camera "
           f"overlap for stitching)")
+    if plane_ctrl is not None:
+        print(f"  Vertical plane: toggle from the GUI — the swarm re-forms as a "
+              f"wall facing the stick-steered heading, on PER-DRONE altitude "
+              f"setpoints (leash ±{plane_ctrl.leash_m:.0f} m, gain "
+              f"{plane_ctrl.gain:.2f} m/s per m). Entry is refused if the "
+              f"reported altitudes disagree by more than "
+              f"{ALT_SPREAD_GATE_M:.1f} m — launch from one flat pad.")
+    print(f"  Altitude band: {MIN_ALT_M:.0f}–{max_alt:.0f} m")
     print(f"  Telemetry velocity frame: {vel_frame}  "
           f"(switch via --vel-frame if consensus oscillates)")
     if speed_scale != 1.0:
@@ -961,6 +1019,8 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
     target_alt = INITIAL_ALT_M
     vs_on = False
     last_heading_mode = mode0           # detect GUI mode switches (below)
+    last_plane_req = False              # detect the GUI vertical-plane toggle
+    last_downwash = ()                  # advisory pairs, to print each change once
     last_swarming = swarming.is_set()   # starts cleared = held (do nothing)
     last_gimbal = None                  # last gimbal pitch applied to the drones
     last_t = time.time()
@@ -1069,6 +1129,11 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 target_alt = max(sum(alts) / len(alts), START_ALT_FLOOR_M)
             else:
                 target_alt = max(INITIAL_ALT_M, START_ALT_FLOOR_M)
+            target_alt = min(target_alt, max_alt)
+            # A wall from a previous stint must not carry over: Start re-enters
+            # plane mode from scratch (below) if the GUI toggle is still on.
+            if plane_ctrl is not None:
+                plane_ctrl.reset()
             # Re-admit any geofence-breached drones: Stop→Start is the
             # explicit operator action that clears the removed set, and
             # enable_vs_all() below re-arms them along with everyone else.
@@ -1093,6 +1158,13 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             swarm.disable_vs_all()
             vs_on = False
             print("[swarm] VS disabled — drones holding position autonomously")
+            # Abandon the wall: each drone was just commanded its OWN current
+            # altitude and now GPS-hovers there, so there is nothing left to
+            # ramp. The GUI toggle keeps its state; the next Start rebuilds.
+            if plane_ctrl is not None and (plane_ctrl.active or plane_ctrl.ramping):
+                print("[plane] wall abandoned on Stop — drones hold their "
+                      "current altitudes")
+                plane_ctrl.reset()
             if meta is not None:
                 meta["resp"] = {}   # live rotation fits are meaningless held
         last_swarming = sw
@@ -1121,6 +1193,14 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             # GUI's FENCED OUT badges; refreshed every tick, also while held,
             # so a Stop→Start visibly clears it.
             meta["removed"] = sorted(removed)
+            # Wall state every tick, INCLUDING while held — the plane block
+            # below sits behind the swarming gate, so publishing only from
+            # there would leave the GUI showing a WALL chip after a Stop
+            # abandoned it. The block re-publishes with fresher data mid-tick.
+            if plane_ctrl is not None:
+                meta["plane"] = plane_ctrl.status()
+            if not sw:
+                meta["downwash"] = []   # stacking is only meaningful under command
             # A rotation-check click while armed is refused NOW — consuming it
             # here stops it from firing as a surprise right after Stop.
             req = meta.get("rotation_check_req")
@@ -1160,12 +1240,43 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         # meta["point_inwards"]/meta["stitch_offset"]; the CLI flags just seed
         # them). Applied here, outside the swarming gate, so the operator can
         # preselect the mode while held.
+        # Vertical-plane request (GUI toggle). Read here, before the swarming
+        # gate, so the heading override below is visible while held; the wall
+        # itself is only built while swarming (further down, where the position/
+        # altitude snapshot exists).
+        plane_req = bool(meta.get("plane_mode")) if meta is not None else False
+        if plane_ctrl is not None and meta is not None:
+            try:
+                plane_ctrl.gain = max(PLANE_GAIN_MIN, min(
+                    PLANE_GAIN_MAX, float(meta.get("plane_gain",
+                                                   plane_ctrl.gain))))
+            except (TypeError, ValueError):
+                pass
+            if plane_req != last_plane_req:
+                print(f"[plane] vertical plane -> "
+                      f"{'ON' if plane_req else 'off'}")
+                if logger:
+                    logger.log_drone_command(
+                        0, "EVENT", cmd=f"PLANE_MODE:{plane_req}")
+                last_plane_req = plane_req
+
         hull_mode = False
         stitch_mode = False
         if meta is not None and heading_ctrl is not None:
             mode = meta.get("heading_mode")
             if mode not in ("manual", "convexhull", "demostitch"):
                 mode = "manual"
+            # Vertical plane forces MANUAL heading. Both other modes degenerate
+            # on a wall: the convex hull is computed from horizontal positions,
+            # which collapse to a line, and demostitch ranks drones laterally,
+            # which stacked drones cannot be. Manual is also exactly what the
+            # sim does in plane mode — every nose on the plane azimuth (=
+            # target_yaw), so the whole wall of cameras faces out of it.
+            if plane_req and mode != "manual":
+                print(f"[plane] heading mode {mode} not available on a wall "
+                      f"-> manual")
+                mode = "manual"
+                meta["heading_mode"] = mode   # so the GUI shows what is in force
             hull_mode = mode == "convexhull"
             stitch_mode = mode == "demostitch" and stitch_ctrl is not None
             if mode != last_heading_mode:
@@ -1261,7 +1372,11 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 target_yaw, ff_yaw_rate, dt, swarm_mean_heading(swarm))
         else:
             cmd_frame_yaw = _wrap180(cmd_frame_yaw + ff_yaw_rate * dt)
-        target_alt = max(MIN_ALT_M, min(MAX_ALT_M,
+        # Shared altitude target (horizontal mode). In vertical-plane mode the
+        # per-drone setpoints below take over and the climb stick moves the
+        # whole wall instead; this keeps integrating so the hand-back on exit
+        # lands somewhere sensible.
+        target_alt = max(MIN_ALT_M, min(max_alt,
                                         target_alt + lin_z * VERT_RATE_MPS * speed_scale * dt))
         # d_ref (scaled units); physical spacing = d_ref * scale. Already
         # published to the GUI as meta["d_ref_m"] every loop above (pre-gate).
@@ -1329,7 +1444,11 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 vel_ne = (v_n_world, v_e_world)
             else:
                 vel_ne = (t['vx'], t['vy'])
-            snap[did] = (pos_ne, vel_ne, t['heading'])
+            # Altitude rides along in the snapshot: the 3D separation failsafe
+            # and vertical-plane mode both need it. Takeoff-relative per
+            # aircraft (SwarmActivity KeyAircraftLocation3D) — the same
+            # reference the VS throttle setpoint is in.
+            snap[did] = (pos_ne, vel_ne, t['heading'], t.get('alt'))
 
         # Virtual obstacles / geofence: convert the GUI-drawn lat/lon shapes
         # into local N/E metres with the SAME per-tick reference point as the
@@ -1346,14 +1465,19 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         # Minimum-separation failsafe: any pair too close -> auto-STOP swarming
         # (the falling edge above then zeroes velocities, brakes, and disables
         # VS, exactly like the GUI Stop button; the drones GPS-hover apart).
+        # TRUE 3D distance, not horizontal: vertical-plane mode stacks drones
+        # deliberately, and a horizontal-only check would read a forming wall as
+        # 0 m separated and stop the swarm the moment it started working. The
+        # vertical component is only as good as the per-aircraft takeoff-relative
+        # altitude frames (launch from one flat pad).
         if min_separation > 0 and len(snap) >= 2:
             ids_ = sorted(snap.keys())
             tripped = None
             for i, a in enumerate(ids_):
                 for b in ids_[i+1:]:
-                    (na, ea), _, _ = snap[a]
-                    (nb, eb), _, _ = snap[b]
-                    d = math.hypot(na - nb, ea - eb)
+                    (pa, _, _, alt_a) = snap[a]
+                    (pb, _, _, alt_b) = snap[b]
+                    d = separation_3d(pa, alt_a, pb, alt_b)
                     if d < min_separation:
                         tripped = (a, b, d)
                         break
@@ -1370,6 +1494,40 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 time.sleep(0.02)
                 continue
 
+        # Downwash advisory. A pair this close HORIZONTALLY with an altitude
+        # difference has the upper drone's prop wash over the lower one — the
+        # hazard a vertical wall creates by design and the Unity sim models not
+        # at all (its drones are independent rigid bodies). Advisory ONLY: it
+        # warns, logs and shows a GUI chip, and never stops the swarm; the 3D
+        # min-separation check above is the hard failsafe.
+        downwash = []
+        if len(snap) >= 2:
+            ids_ = sorted(snap.keys())
+            for i, a in enumerate(ids_):
+                for b in ids_[i+1:]:
+                    (pa, _, _, alt_a) = snap[a]
+                    (pb, _, _, alt_b) = snap[b]
+                    if alt_a is None or alt_b is None:
+                        continue
+                    if abs(alt_a - alt_b) < 0.5:
+                        continue    # level flight: no wash geometry
+                    if math.hypot(pa[0] - pb[0], pa[1] - pb[1]) < DOWNWASH_RADIUS_M:
+                        hi, lo = (a, b) if alt_a > alt_b else (b, a)
+                        downwash.append([hi, lo])
+        if meta is not None:
+            meta["downwash"] = downwash      # replace whole (concurrency rule)
+        dw_key = tuple(tuple(p) for p in downwash)
+        if dw_key != last_downwash:
+            for hi, lo in downwash:
+                if [hi, lo] not in [list(p) for p in last_downwash]:
+                    print(f"[DOWNWASH] drone {hi} is directly above drone {lo} "
+                          f"(< {DOWNWASH_RADIUS_M:.1f} m horizontally) — prop "
+                          f"wash on the lower aircraft")
+                    if logger:
+                        logger.log_drone_command(
+                            0, "EVENT", cmd=f"DOWNWASH:{hi}over{lo}")
+            last_downwash = dw_key
+
         # Geofence hard cutoff: a drone whose GPS fix lands OUTSIDE the fence
         # polygon is braked (one zero-velocity command; the app re-sends it at
         # 20 Hz), then gets DISABLE_VS after a 0.4 s non-blocking brake window
@@ -1382,7 +1540,7 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             for did in snap:
                 if did in removed:
                     continue
-                (n_pos, e_pos), _, _ = snap[did]
+                (n_pos, e_pos), _, _, _ = snap[did]
                 if point_in_polygon(n_pos, e_pos, fence_ne):
                     continue
                 removed.add(did)
@@ -1403,7 +1561,7 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                     swarm.drones[did].disable_vs()
                 del pending_disable[did]
                 print(f"[FENCE] drone {did} VS disabled — GPS-hovering; "
-                      f"recover on the RC. Stop→Start re-admits it.")
+                      f"recover on the RC. Stop/Start re-admits it.")
                 if logger:
                     logger.log_drone_command(did, "EVENT",
                                              cmd="FENCE_DISABLE_VS")
@@ -1415,7 +1573,7 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         hull_targets = None
         if hull_mode:
             hull_targets = heading_ctrl.update(
-                {did: pos for did, (pos, _, _) in snap.items()
+                {did: pos for did, (pos, _, _, _) in snap.items()
                  if did not in removed}, dt)
             if meta is not None:
                 meta["hull_boundary"] = heading_ctrl.boundary_ids()
@@ -1433,11 +1591,125 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             except (TypeError, ValueError):
                 stitch_off = DEFAULT_OFFSET_DEG
             stitch_targets = stitch_ctrl.update(
-                {did: pos for did, (pos, _, _) in snap.items()
+                {did: pos for did, (pos, _, _, _) in snap.items()
                  if did not in removed},
                 target_yaw, stitch_off, dt)
             if meta is not None:
                 meta["stitch_centre"] = stitch_ctrl.centre_id
+
+        # ---- Vertical-plane ("wall") swarming ----
+        # The plane is a swap of the constraint the SAME cohesion law runs
+        # under: in-plane forces come from the untouched 2D
+        # OlfatiSaber.GetSwarmAcceleration, evaluated in the wall's own axes
+        # (swarm_plane.py). Its vertical component becomes a PER-DRONE altitude
+        # setpoint, because DJI VS gives us absolute-altitude control and no
+        # vertical velocity channel.
+        #
+        # plane_corr / plane_alt are the two things it hands to the per-drone
+        # loop below: a horizontal correction (replacing the 2D one) and an
+        # altitude (replacing the shared target_alt). During the exit ramp only
+        # the altitude is ours — the horizontal command comes from the normal 2D
+        # path again, since the plane is already gone.
+        plane_corr = None
+        plane_alt = None
+        plane_vup = None
+        if plane_ctrl is not None:
+            fix_pos = {did: pos for did, (pos, _, _, _) in snap.items()
+                       if did not in removed}
+            fix_alt = {did: a for did, (_, _, _, a) in snap.items()
+                       if did not in removed and a is not None}
+            fix_vel = {did: vel for did, (_, vel, _, _) in snap.items()
+                       if did not in removed}
+            if plane_req and not plane_ctrl.active and not plane_ctrl.ramping:
+                # Entry gate. Every drone has been holding the SAME shared
+                # target_alt, so the spread of their REPORTED altitudes measures
+                # takeoff-frame bias plus tracking error directly. A wall built
+                # on skewed frames has wrong vertical gaps — and the 3D
+                # separation failsafe would be wrong by the same amount.
+                spread = alt_spread(fix_alt.values())
+                if len(fix_alt) < 2:
+                    print("[plane] REFUSING: need at least 2 drones with a GPS "
+                          "fix and an altitude")
+                    meta["plane_mode"] = False
+                elif spread > ALT_SPREAD_GATE_M:
+                    print(f"[plane] REFUSING: reported altitudes disagree by "
+                          f"{spread:.1f} m (> {ALT_SPREAD_GATE_M:.1f} m). "
+                          f"Altitude is takeoff-relative per aircraft — launch "
+                          f"from one flat pad, or let the swarm settle on the "
+                          f"shared target first.")
+                    if logger:
+                        logger.log_drone_command(
+                            0, "EVENT",
+                            cmd=f"PLANE_REFUSED_ALT_SPREAD:{spread:.2f}m")
+                    meta["plane_mode"] = False
+                else:
+                    seeded = plane_ctrl.enter(fix_pos, fix_alt, target_yaw,
+                                              d_ref * olfati.scale)
+                    # Headroom advisory. A wall of N drones at d_ref spacing
+                    # needs roughly (N-1)*d_ref of vertical room around its
+                    # reference altitude; too low and the bottom of the wall
+                    # just piles up against MIN_ALT_M, so the formation is
+                    # squashed and the low drones sit near the ground with a
+                    # downward demand they can't follow. Warn rather than
+                    # refuse — the operator may want a deliberately short wall.
+                    need = 0.5 * (len(fix_alt) - 1) * d_ref * olfati.scale
+                    if plane_ctrl.alt_ref - need < MIN_ALT_M:
+                        print(f"[plane] WARNING: alt_ref {plane_ctrl.alt_ref:.1f} m "
+                              f"leaves the wall short of ground clearance — "
+                              f"{len(fix_alt)} drones at "
+                              f"{d_ref * olfati.scale:.1f} m spacing want "
+                              f"±{need:.1f} m, so the bottom row will clamp at "
+                              f"the {MIN_ALT_M:.0f} m floor. Climb to "
+                              f"~{need + MIN_ALT_M:.0f} m first.")
+                        if logger:
+                            logger.log_drone_command(
+                                0, "EVENT",
+                                cmd=f"PLANE_LOW_HEADROOM:{plane_ctrl.alt_ref:.1f}m")
+                    seed_desc = "  ".join(f"{d}:{a:.1f}m"
+                                          for d, a in sorted(seeded.items()))
+                    print(f"[plane] wall ON: azimuth {target_yaw:+.1f}°, "
+                          f"alt_ref {plane_ctrl.alt_ref:.1f} m, alt spread "
+                          f"{spread:.2f} m, staggered seed  {seed_desc}")
+                    if logger:
+                        logger.log_drone_command(
+                            0, "EVENT",
+                            cmd=f"PLANE_ENTER:az={target_yaw:.1f}:"
+                                f"alt_ref={plane_ctrl.alt_ref:.2f}:"
+                                f"spread={spread:.2f}")
+            elif not plane_req and plane_ctrl.active:
+                # Leaving: converge the per-drone setpoints onto their mean at a
+                # bounded rate before handing the vertical channel back, so no
+                # drone gets a multi-metre step to fly at the FC's own pace.
+                plane_ctrl.exit_ramp()
+                print(f"[plane] wall OFF: ramping altitudes to "
+                      f"{plane_ctrl.alt_ref:.1f} m")
+                if logger:
+                    logger.log_drone_command(
+                        0, "EVENT",
+                        cmd=f"PLANE_EXIT:alt_ref={plane_ctrl.alt_ref:.2f}")
+
+            if plane_ctrl.active or plane_ctrl.ramping:
+                was_ramping = plane_ctrl.ramping
+                plane_out = plane_ctrl.update(
+                    olfati, fix_pos, fix_alt, fix_vel, target_yaw, d_ref,
+                    lin_z * VERT_RATE_MPS, dt, speed_scale=speed_scale,
+                    exclude=removed)
+                plane_alt = {did: v[2] for did, v in plane_out.items()}
+                plane_vup = {did: v[3] for did, v in plane_out.items()}
+                if plane_ctrl.active:
+                    plane_corr = {did: (v[0], v[1])
+                                  for did, v in plane_out.items()}
+                if was_ramping and not plane_ctrl.ramping:
+                    # Ramp finished: hand the vertical channel back with the
+                    # shared target where the drones actually are.
+                    target_alt = max(MIN_ALT_M,
+                                     min(max_alt, plane_ctrl.alt_ref))
+                    plane_alt = None
+                    print(f"[plane] altitudes converged — shared target "
+                          f"{target_alt:.1f} m")
+                    plane_ctrl.reset()
+            if meta is not None:
+                meta["plane"] = plane_ctrl.status()
 
         # Per-drone flocking command. The joystick's desired velocity goes
         # straight through (DJI VS already runs a velocity tracker); the swarm
@@ -1450,7 +1722,7 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             if did in removed:
                 continue  # fenced out: VS disabled, gets no commands
             try:
-                self_pos, self_vel, hdg = snap[did]
+                self_pos, self_vel, hdg, _self_alt = snap[did]
                 if hull_targets is not None:
                     # Hull mode: servo boundary drones onto their hull-derived
                     # heading (no stick feed-forward); interior drones hold
@@ -1483,11 +1755,22 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 # toward (or velocity-matches) a fenced-out hoverer.
                 neighbours = [(snap[j][0], snap[j][1]) for j in snap
                               if j != did and j not in removed]
-                # Swarm correction (consensus + cohesion) in world frame
-                v_n_corr, v_e_corr = olfati.GetSwarmAcceleration(
-                    self_pos, self_vel, neighbours, d_ref=d_ref,
-                )
+                # Swarm correction (consensus + cohesion) in world frame. On a
+                # vertical wall it comes from the SAME law evaluated in the
+                # plane's axes (swarm_plane.py) and its vertical part has
+                # already been folded into this drone's altitude setpoint; a
+                # drone the plane could not place (no altitude reported) falls
+                # back to the horizontal path.
+                if plane_corr is not None and did in plane_corr:
+                    v_n_corr, v_e_corr = plane_corr[did]
+                else:
+                    v_n_corr, v_e_corr = olfati.GetSwarmAcceleration(
+                        self_pos, self_vel, neighbours, d_ref=d_ref,
+                    )
                 # Virtual obstacles + geofence soft repulsion (β-agent term).
+                # Deliberately NOT projected onto the plane: avoidance is the
+                # stronger authority and the plane's restoring term is clamped
+                # (MAX_PLANE_MPS) so it can never win an argument with it.
                 o_n, o_e = 0.0, 0.0
                 if avoid is not None and (rects_ne or fence_ne):
                     o_n, o_e = avoid.GetObstacleForce(
@@ -1500,6 +1783,12 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 # the relative behaviour being tuned keeps its shape.
                 v_n_total *= speed_scale
                 v_e_total *= speed_scale
+                # Altitude: the swarm's shared absolute target, unless the wall
+                # (or its exit ramp) owns this drone's altitude. This is the
+                # ONLY place a per-drone altitude is commanded.
+                alt_cmd = target_alt
+                if plane_alt is not None and did in plane_alt:
+                    alt_cmd = plane_alt[did]
                 # Live command->response rotation fit: feed what is actually
                 # sent (post-scale), read back the sliding-window estimate.
                 resp = None
@@ -1522,23 +1811,40 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                         resp_gain=None if resp is None else round(resp[1], 3),
                         link_sq=None if link is None else link["sq"],
                         link_down=None if link is None else link["down"],
-                        link_up=None if link is None else link["up"])
+                        link_up=None if link is None else link["up"],
+                        plane_on=1 if plane_corr is not None else 0,
+                        plane_az=(round(plane_ctrl.azimuth_deg, 1)
+                                  if plane_corr is not None else None),
+                        plane_off=(round(plane_ctrl.offsets[did], 2)
+                                   if plane_corr is not None
+                                   and did in plane_ctrl.offsets else None),
+                        v_up=(round(plane_vup[did], 3)
+                              if plane_vup is not None
+                              and did in plane_vup else None),
+                        alt_cmd=round(alt_cmd, 2))
                 # DJI VS is in GROUND/VELOCITY mode (SwarmActivity sets
                 # FlightCoordinateSystem.GROUND), so pitch = north m/s and
                 # roll = east m/s. We send world-frame velocities directly —
                 # the drone does its own world→body rotation internally.
                 if dry_run:
+                    plane_desc = ""
+                    if plane_corr is not None:
+                        plane_desc = (
+                            f"  off={plane_ctrl.offsets.get(did, 0.0):+5.2f}m "
+                            f"v_up={plane_vup.get(did, 0.0):+.2f}")
+                    elif plane_alt is not None:
+                        plane_desc = "  [ramp]"
                     print(f"  [dry] drone {did}  "
                           f"v_des=({v_n_des:+.2f}N,{v_e_des:+.2f}E)  "
                           f"corr=({v_n_corr:+.2f},{v_e_corr:+.2f})  "
                           f"obs=({o_n:+.2f},{o_e:+.2f})  "
                           f"cmd=({v_n_total:+.2f}N,{v_e_total:+.2f}E)  "
-                          f"hdg={hdg:+6.1f}°→{drone_target:+.1f}° "
+                          f"hdg={hdg:+6.1f}°->{drone_target:+.1f}° "
                           f"yawrate={cmd_yaw_rate:+5.1f}°/s  "
-                          f"alt={target_alt:.1f}m  "
+                          f"alt={alt_cmd:.1f}m{plane_desc}  "
                           f"d_ref={d_ref:.3f} (~{d_ref*olfati.scale:.1f}m)")
                 else:
-                    ctrl.set_velocity(v_n_total, v_e_total, cmd_yaw_rate, target_alt)
+                    ctrl.set_velocity(v_n_total, v_e_total, cmd_yaw_rate, alt_cmd)
             except Exception as e:
                 print(f"[drone {did}] flocking error: {e}")
 
@@ -1556,29 +1862,39 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                             f"centre={stitch_ctrl.centre_id or '-'}")
             else:
                 yaw_desc = f"yaw={target_yaw:+6.1f}°"
+            if plane_ctrl is not None and (plane_ctrl.active or plane_ctrl.ramping):
+                alt_desc = (f"WALL az={plane_ctrl.azimuth_deg:+6.1f}° "
+                            f"alt_ref={(plane_ctrl.alt_ref or 0.0):5.1f}m"
+                            + ("  [ramping]" if plane_ctrl.ramping else ""))
+            else:
+                alt_desc = f"alt={target_alt:5.1f}m"
             print(f"  v_des=({v_n_des:+5.2f}N,{v_e_des:+5.2f}E) world  "
-                  f"{yaw_desc}  alt={target_alt:5.1f}m  "
+                  f"{yaw_desc}  {alt_desc}  "
                   f"d_ref={d_ref:.3f} (~{d_ref*olfati.scale:.1f}m)  "
                   f"fixes={len(snap)}/{len(swarm.drones)}  "
                   f"SWARM={'ON' if sw else 'off'}  VS={'ON' if vs_on else 'off'}")
             # Per-drone local position + the per-drone world-frame command
             # (which equals v_des once the swarm correction is added).
             for did in sorted(snap.keys()):
-                (n_m, e_m), self_vel, hdg = snap[did]
-                drone_alt = swarm.drones[did].telemetry.get('alt', 0.0)
+                (n_m, e_m), self_vel, hdg, drone_alt = snap[did]
                 v_n_self, v_e_self = self_vel
+                extra = ""
+                if plane_ctrl is not None and did in plane_ctrl.offsets:
+                    extra = (f"  off={plane_ctrl.offsets[did]:+5.2f}m"
+                             f"  alt*={plane_ctrl.alt_cmd.get(did, 0.0):5.1f}m")
                 print(f"    drone {did}  pos=({n_m:+6.2f}N,{e_m:+6.2f}E)  "
-                      f"alt={drone_alt:5.1f}m  hdg={hdg:+6.1f}°  "
-                      f"vel=({v_n_self:+5.2f}N,{v_e_self:+5.2f}E)")
-            # Pairwise distances (physical meters)
+                      f"alt={(drone_alt or 0.0):5.1f}m  hdg={hdg:+6.1f}°  "
+                      f"vel=({v_n_self:+5.2f}N,{v_e_self:+5.2f}E){extra}")
+            # Pairwise distances (physical metres, 3D — same measure the
+            # min-separation failsafe uses, so the two never disagree).
             ids = sorted(snap.keys())
             if len(ids) >= 2:
                 pairs = []
                 for i, a in enumerate(ids):
                     for b in ids[i+1:]:
-                        (na, ea), _, _ = snap[a]
-                        (nb, eb), _, _ = snap[b]
-                        d = math.hypot(na - nb, ea - eb)
+                        (pa, _, _, alt_a) = snap[a]
+                        (pb, _, _, alt_b) = snap[b]
+                        d = separation_3d(pa, alt_a, pb, alt_b)
                         pairs.append(f"{a}-{b}={d:5.2f}m")
                 print(f"    distances: {'  '.join(pairs)}")
             last_print = now
@@ -1666,8 +1982,39 @@ def main():
     ap.add_argument("--min-separation", type=float,
                     default=DEFAULT_MIN_SEPARATION_M, metavar="M",
                     help="Failsafe: auto-STOP swarming when any drone pair "
-                         f"gets closer than this many metres (default "
-                         f"{DEFAULT_MIN_SEPARATION_M:.1f}; 0 disables)")
+                         f"gets closer than this many metres, measured in 3D "
+                         f"(default {DEFAULT_MIN_SEPARATION_M:.1f}; 0 disables)")
+    ap.add_argument("--plane-mode", action="store_true",
+                    help="Start with vertical-plane ('wall') swarming enabled: "
+                         "the swarm re-forms as a wall facing the stick-steered "
+                         "heading, on per-drone altitude setpoints (port of the "
+                         "Unity sim's SwarmPlaneController). Toggleable live "
+                         "from the GUI; this flag only seeds the toggle. Forces "
+                         "manual heading (hull/demostitch degenerate on a "
+                         "wall) and is refused if the drones' reported "
+                         f"altitudes disagree by more than "
+                         f"{ALT_SPREAD_GATE_M:.1f} m.")
+    ap.add_argument("--plane-gain", type=float, default=DEFAULT_PLANE_GAIN,
+                    help="Vertical-plane restoring pull: m/s of horizontal "
+                         "command per metre of out-of-plane offset (default "
+                         f"{DEFAULT_PLANE_GAIN:.2f}, range "
+                         f"[{PLANE_GAIN_MIN:.2f}, {PLANE_GAIN_MAX:.2f}]; the "
+                         "term itself is clamped so obstacle/geofence "
+                         "avoidance always outranks it). Live-tunable from the "
+                         "GUI.")
+    ap.add_argument("--plane-leash", type=float,
+                    default=DEFAULT_PLANE_LEASH_M, metavar="M",
+                    help="Vertical-plane leash: how far one drone's altitude "
+                         "setpoint may sit from the wall's reference altitude "
+                         f"(default {DEFAULT_PLANE_LEASH_M:.0f} m). Bounds the "
+                         "wall's vertical extent and stops a runaway climb.")
+    ap.add_argument("--max-alt", type=float, default=MAX_ALT_M, metavar="M",
+                    help="Ceiling for every commanded altitude (default "
+                         f"{MAX_ALT_M:.0f} m). Raise it for a tall vertical "
+                         "wall — N drones at d_ref spacing need roughly "
+                         "(N-1)*d_ref of vertical room, centred well above "
+                         f"the {MIN_ALT_M:.0f} m floor. Check your site's "
+                         "legal ceiling first.")
     ap.add_argument("--airlink-bands", default="", metavar="LIST",
                     help="Per-drone RF band assignment, sent to each RC as a "
                          "one-shot AIRLINK command at startup: comma list in "
@@ -1762,6 +2109,13 @@ def main():
     if not (OFFSET_MIN_DEG <= args.stitch_offset <= OFFSET_MAX_DEG):
         ap.error(f"--stitch-offset must be in "
                  f"[{OFFSET_MIN_DEG:.0f}, {OFFSET_MAX_DEG:.0f}]")
+    if not (PLANE_GAIN_MIN <= args.plane_gain <= PLANE_GAIN_MAX):
+        ap.error(f"--plane-gain must be in "
+                 f"[{PLANE_GAIN_MIN:.2f}, {PLANE_GAIN_MAX:.2f}]")
+    if args.plane_leash <= 0:
+        ap.error("--plane-leash must be > 0")
+    if args.max_alt <= MIN_ALT_M:
+        ap.error(f"--max-alt must be > the {MIN_ALT_M:.0f} m floor")
 
     def per_drone_list(raw, flag):
         """Expand a comma list to one token per drone (a single token fans
@@ -1877,6 +2231,8 @@ def main():
             "drone_ips": resolved_ips,
             "identity_check": not args.no_identity_check,
             "min_separation": args.min_separation,
+            "plane_mode": args.plane_mode, "plane_gain": args.plane_gain,
+            "plane_leash": args.plane_leash, "max_alt": args.max_alt,
             "d_obs": args.d_obs, "r0_obs": args.r0_obs, "c_obs": args.c_obs,
             "shapes_file": args.shapes_file,
             "airlink_bands": airlink_bands,
@@ -2052,6 +2408,12 @@ def main():
     heading_ctrl = ConvexHullHeading(point_inwards=args.point_inwards)
     stitch_ctrl = DemoStitchHeading()
 
+    # Vertical-plane ("wall") controller. Always instantiated so the GUI toggle
+    # works at runtime; it stays inert (and the altitude channel stays the
+    # shared scalar) until run() enters plane mode.
+    plane_ctrl = SwarmPlane(gain=args.plane_gain, leash_m=args.plane_leash,
+                            min_alt=MIN_ALT_M, max_alt=args.max_alt)
+
     receiver = JoystickReceiver(port=args.port, logger=logger)
     receiver.start()
     print(f"  UDP joystick listener on :{args.port}")
@@ -2079,6 +2441,16 @@ def main():
         # (odd drone counts only) for the GUI's CENTRE pill.
         "stitch_offset": args.stitch_offset,
         "stitch_centre": None,
+        # Vertical-plane ("wall") swarming: plane_mode/plane_gain are seeded
+        # from the CLI and then owned by the GUI toggle + gain input;
+        # meta["plane"] is the live wall state run() publishes (azimuth, the
+        # reference altitude, and each drone's out-of-plane offset + commanded
+        # altitude). "downwash" lists [upper, lower] pairs stacked closer than
+        # DOWNWASH_RADIUS_M horizontally — advisory only, never a stop.
+        "plane_mode": args.plane_mode,
+        "plane_gain": args.plane_gain,
+        "plane": plane_ctrl.status(),
+        "downwash": [],
         # Live gimbal pitch target (deg): seeded from --gimbal-pitch, then driven
         # by the GUI slider via command_listener. Published so the slider can
         # seed its starting position.
@@ -2131,7 +2503,8 @@ def main():
             speed_scale=args.slow, meta=swarm_meta, heading_ctrl=heading_ctrl,
             stitch_ctrl=stitch_ctrl, cmd_sender=cmd_sender,
             identity_check=identity_check,
-            min_separation=args.min_separation, avoid=avoid)
+            min_separation=args.min_separation, avoid=avoid,
+            plane_ctrl=plane_ctrl, max_alt=args.max_alt)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:

@@ -102,6 +102,26 @@ no video.
     settings owned by the GUI** (Heading selector in `swarm_gui.py`'s controls bar →
     `/command` POST → UDP :5098 → `command_listener` → `meta["heading_mode"]`); the
     `--heading`/`--point-inwards` CLI flags only seed them. Pure Python, no `ds_wrapper` import.
+  - `swarm_plane.py` — VERTICAL-PLANE ("wall") swarming, port of the Unity sim's
+    `SwarmPlaneController.cs`: a GUI toggle (`--plane-mode` / `PlaneMode` seeds it) that
+    swaps the plane the cohesion law is constrained to, from horizontal to a **vertical
+    wall** facing the stick-steered `target_yaw`, so the operator faces a billboard of
+    drones. Binary, like the sim — there is no tilt angle. It calls
+    `OlfatiSaber.GetSwarmAcceleration` **unmodified**, on coordinates projected into the
+    wall's axes (`n`/`e1` horizontal, `e2` = up); the potential is isotropic, so the basis
+    is all that changes. Its vertical component becomes a **per-drone altitude setpoint**
+    (`alt += v_up·dt`, leashed to a reference altitude the climb stick moves) — the only
+    per-drone altitude anywhere in this repo, because DJI VS gives absolute-altitude
+    control and no vertical-velocity channel. Deviations from the sim, all deliberate:
+    azimuth comes from the PC-owned `target_yaw` not a drone's compass; the plane is
+    centroid-pinned (the sim's anchor drone is pilot-flown, which has no analogue here);
+    the restoring gain is in physical m/s-per-m and clamped so obstacle/geofence
+    repulsion always outranks it; **entry seeds an alternating vertical stagger** because
+    a wall seeded flat is a horizontal line in its own axes — the saddle this fleet
+    already gets stuck in; and exit **ramps** the per-drone setpoints together at a
+    bounded rate instead of stepping back to the shared scalar. Pure Python, no
+    `ds_wrapper` import; `python swarm_plane.py` runs a self-check that flies a
+    kinematic 3-drone swarm into a wall. See the [vertical-plane gotchas](#critical-gotchas).
   - `heading_demostitch.py` — DEMOSTITCH heading control, the third Heading-selector mode
     (between manual and convexhull), used by `swarm_flocking.py`: the laterally-middle drone
     (positions projected perpendicular to the stick-steered global yaw) points exactly at the
@@ -124,8 +144,13 @@ no video.
   - `joyreporter.py` — pygame joystick debug readout.
   - `swarm_gui.py` — browser GUI server: a satellite map (default EPFL Lausanne) showing
     each drone's position + heading, a complete graph of inter-drone distance lines
-    (metres labelled), and a per-drone status panel (including an **RF link** row fed by
-    `meta["link"]` — see the [link diagnostics protocol](#two-protocols-you-will-touch-constantly)).
+    (**3D** metres labelled, split into horizontal/vertical when the pair is stacked), and
+    a per-drone status panel (including an **RF link** row fed by
+    `meta["link"]` — see the [link diagnostics protocol](#two-protocols-you-will-touch-constantly),
+    plus **Alt cmd** / **Off plane** rows while a vertical-plane wall is up). The controls
+    bar owns the live runtime settings (heading mode, stitch offset, gimbal, obstacles/
+    geofence, and the **Vertical plane** toggle + gain — `meta["plane_mode"]`/
+    `meta["plane_gain"]`, with the controller free to refuse the toggle and echo it back off).
     **Does NOT import `ds_wrapper`** — it
     only LISTENS on UDP :5099 for telemetry pushed by a running controller (so it runs
     unprivileged, in its own terminal, on any Python ≥3.7; it does import the pure
@@ -371,7 +396,28 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   checking this rate first.
 - **Min-separation failsafe:** `swarm_flocking.py` auto-STOPs swarming (zero velocities →
   brake → DISABLE_VS, same as GUI Stop) when any pair with a GPS fix gets closer than
-  `--min-separation` (default 3 m, `MinSeparation` config key, 0 disables).
+  `--min-separation` (default 3 m, `MinSeparation` config key, 0 disables). Distance is
+  **3D** (`swarm_plane.separation_3d`), not horizontal — vertical-plane mode stacks drones
+  on purpose, and a horizontal-only check reads a forming wall as 0 m apart and stops the
+  swarm the moment it starts working. The GUI's distance labels and cohesion plot use the
+  same 3D measure so they can never disagree with the failsafe.
+- **Vertical-plane mode owns the altitude channel, and altitude frames are per-aircraft.**
+  With the wall up, each drone gets its OWN `VS:` throttle value instead of the shared
+  `target_alt`; everywhere else in the repo altitude is one shared scalar. Two consequences
+  bite: (1) telemetry `alt` is **takeoff-relative per aircraft**, so the true vertical gap
+  between two drones is `(alt_i − alt_j) + (ground_i − ground_j)` — a wall built in altitude
+  space is skewed by launch-pad height differences and the 3D separation check is wrong by
+  the same amount. **Launch every drone from one flat pad.** Entry is gated on the spread of
+  reported altitudes (`ALT_SPREAD_GATE_M`, 3 m) since all drones were holding the same shared
+  target, which makes that spread a direct measure of the mismatch; the toggle pops back off
+  in the GUI when it refuses. (2) A 90° wall puts drones directly above one another, so the
+  upper one's **rotor downwash** lands on the lower — a 249 g airframe's worst case, and
+  something the Unity sim (independent rigid bodies) does not model at all. There is a
+  non-blocking DOWNWASH advisory (chip + log) for it; the 3D min-separation check is the only
+  hard stop. Also note plane mode forces heading `manual` (`convexhull`'s hull collapses to a
+  line on a wall, `demostitch` ranks drones laterally and stacked drones cannot be), and
+  `MAX_ALT_M` (30 m) is now a `--max-alt` / `MaxAlt` setting because a wall needs roughly
+  `(N-1)·d_ref` of vertical room — check the site's legal ceiling before raising it.
 - **Joystick arm gate:** swarming Start refuses to arm unless a fresh joystick packet
   arrived on :5055 inside the receiver's staleness window (readController.py running +
   controller connected). The GUI mirrors it via `meta["joystick"]`: Start greys out and a
@@ -430,7 +476,7 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 | Launcher | Starts | Params → script flags |
 | --- | --- | --- |
 | `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
-| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-DemoStitch`→`--heading demostitch` / `-StitchOffset`→`--stitch-offset` (demostitch fan offset deg/rank, config key `StitchOffset`), `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-DObs`→`--d-obs` / `-R0Obs`→`--r0-obs` / `-CObs`→`--c-obs` (virtual-obstacle/geofence repulsion cutoff, detection radius [physical m] and gain; config keys `DObs`/`R0Obs`/`CObs`; the shapes themselves are drawn in the GUI and persist in `shapes.json`), `-AirlinkBands`→`--airlink-bands` / `-AirlinkBandwidth`→`--airlink-bandwidth` / `-VideoMode`→`--video-mode` (per-drone RF band + channel bandwidth in MHz `40\|20\|10\|5` + camera-stream cap, sent to each RC as an `AIRLINK:` one-shot at startup; config keys `AirlinkBands`/`AirlinkBandwidth`/`VideoMode`; empty = send nothing, which leaves whatever was last applied — **not** a reset, see the [AirLink gotcha](#critical-gotchas)), `-NoLinkScan`→`--no-link-scan` (skip the read-only pre-flight link/interference scan; config key `LinkScan`), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
+| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-DemoStitch`→`--heading demostitch` / `-StitchOffset`→`--stitch-offset` (demostitch fan offset deg/rank, config key `StitchOffset`), `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-DObs`→`--d-obs` / `-R0Obs`→`--r0-obs` / `-CObs`→`--c-obs` (virtual-obstacle/geofence repulsion cutoff, detection radius [physical m] and gain; config keys `DObs`/`R0Obs`/`CObs`; the shapes themselves are drawn in the GUI and persist in `shapes.json`), `-AirlinkBands`→`--airlink-bands` / `-AirlinkBandwidth`→`--airlink-bandwidth` / `-VideoMode`→`--video-mode` (per-drone RF band + channel bandwidth in MHz `40\|20\|10\|5` + camera-stream cap, sent to each RC as an `AIRLINK:` one-shot at startup; config keys `AirlinkBands`/`AirlinkBandwidth`/`VideoMode`; empty = send nothing, which leaves whatever was last applied — **not** a reset, see the [AirLink gotcha](#critical-gotchas)), `-NoLinkScan`→`--no-link-scan` (skip the read-only pre-flight link/interference scan; config key `LinkScan`), `-PlaneMode`→`--plane-mode` / `-PlaneGain`→`--plane-gain` / `-PlaneLeash`→`--plane-leash` / `-MaxAlt`→`--max-alt` (vertical-plane "wall" swarming seed, its restoring gain [m/s per m of out-of-plane offset] and vertical leash, plus the ceiling every commanded altitude is clamped to; config keys `PlaneMode`/`PlaneGain`/`PlaneLeash`/`MaxAlt`; the toggle and gain are live in the GUI — this only seeds them), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
 | `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
 
 `dji-flocking.ps1`'s launch settings live in **`AOS server/flocking.config.psd1`** (a

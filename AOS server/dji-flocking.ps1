@@ -1,4 +1,4 @@
-# Launch swarm_flocking.py, readController.py, and the browser GUI in Windows
+﻿# Launch swarm_flocking.py, readController.py, and the browser GUI in Windows
 # Terminal. Runs the multi-drone Olfati-Saber flocking controller (vs.
 # dji-joystick.ps1 which runs the single-drone direct-stick controller).
 #
@@ -37,7 +37,15 @@
 #                                     # IPs from the running DroneSwarmServer (id = slot);
 #                                     # -DroneIPs server = force the legacy server path.
 #   .\dji-flocking.ps1 -NoIdentityCheck   # skip the command<->telemetry identity probe
-#   .\dji-flocking.ps1 -MinSeparation 5   # auto-STOP swarming if any pair < 5 m (0 = off)
+#   .\dji-flocking.ps1 -MinSeparation 5   # auto-STOP swarming if any pair < 5 m in 3D (0 = off)
+#   .\dji-flocking.ps1 -PlaneMode -MaxAlt 40   # start with VERTICAL-PLANE ("wall") swarming:
+#                                     # the swarm re-forms as a vertical wall facing the stick
+#                                     # heading, on per-drone altitude setpoints. -PlaneGain
+#                                     # tunes the pull onto the plane, -PlaneLeash its vertical
+#                                     # extent. Toggleable live from the GUI (this is a seed).
+#                                     # Launch all drones from ONE FLAT PAD — altitude is
+#                                     # takeoff-relative per aircraft — and mind the downwash:
+#                                     # a wall stacks drones vertically.
 #   .\dji-flocking.ps1 -DObs 3 -R0Obs 4   # obstacle/geofence repulsion cutoff + detection
 #                                     # radius (physical metres); -CObs sets the gain.
 #                                     # The obstacles/geofence themselves are drawn on the
@@ -72,6 +80,10 @@ param(
     [switch]$PointInwards,
     [switch]$DemoStitch,
     [double]$StitchOffset,
+    [switch]$PlaneMode,
+    [double]$PlaneGain,
+    [double]$PlaneLeash,
+    [double]$MaxAlt,
     [switch]$NoGui,
     [switch]$ImageStream,
     [switch]$NoIdentityCheck,
@@ -94,6 +106,7 @@ $settings = @{
     DObs = 5.0; R0Obs = 6.0; CObs = 4.3
     DroneIPs = @()
     IdentityCheck = $true; MinSeparation = 3.0
+    PlaneMode = $false; PlaneGain = 0.25; PlaneLeash = 12.0; MaxAlt = 30.0
     AirlinkBands = @(); AirlinkBandwidth = @(); VideoMode = ''
     LinkScan = $true
 }
@@ -118,6 +131,10 @@ if ($PSBoundParameters.ContainsKey('NoGui'))        { $settings.NoGui = [bool]$N
 if ($PSBoundParameters.ContainsKey('ImageStream'))  { $settings.ImageStream = [bool]$ImageStream }
 if ($PSBoundParameters.ContainsKey('PointInwards')) { $settings.PointInwards = [bool]$PointInwards }
 if ($PSBoundParameters.ContainsKey('StitchOffset')) { $settings.StitchOffset = $StitchOffset }
+if ($PSBoundParameters.ContainsKey('PlaneMode'))    { $settings.PlaneMode = [bool]$PlaneMode }
+if ($PSBoundParameters.ContainsKey('PlaneGain'))    { $settings.PlaneGain = $PlaneGain }
+if ($PSBoundParameters.ContainsKey('PlaneLeash'))   { $settings.PlaneLeash = $PlaneLeash }
+if ($PSBoundParameters.ContainsKey('MaxAlt'))       { $settings.MaxAlt = $MaxAlt }
 if ($PSBoundParameters.ContainsKey('DroneIPs'))     { $settings.DroneIPs = $DroneIPs }
 if ($PSBoundParameters.ContainsKey('AirlinkBands'))     { $settings.AirlinkBands = $AirlinkBands }
 if ($PSBoundParameters.ContainsKey('AirlinkBandwidth')) { $settings.AirlinkBandwidth = $AirlinkBandwidth }
@@ -146,6 +163,10 @@ $NoGui        = [bool]$settings.NoGui
 $ImageStream  = [bool]$settings.ImageStream
 $PointInwards = [bool]$settings.PointInwards
 $StitchOffset = [double]$settings.StitchOffset
+$PlaneMode    = [bool]$settings.PlaneMode
+$PlaneGain    = [double]$settings.PlaneGain
+$PlaneLeash   = [double]$settings.PlaneLeash
+$MaxAlt       = [double]$settings.MaxAlt
 $Heading      = ("$($settings.Heading)").ToLower()
 $DroneIPs     = @($settings.DroneIPs | Where-Object { "$_".Trim() -ne '' })
 $IdentityCheck = [bool]$settings.IdentityCheck
@@ -184,6 +205,21 @@ if ($CmdMode -eq 'explicit' -and $DroneIPs.Count -lt $Drones) {
            "(order = drone id; extras beyond Drones are fine)")
 }
 if ($MinSeparation -lt 0) { throw "MinSeparation must be >= 0 (0 disables) (got $MinSeparation)" }
+# Bounds mirror swarm_plane.py's PLANE_GAIN_MIN/MAX and swarm_flocking.py's
+# validation, so a bad value fails here instead of after the panes open.
+if ($PlaneGain -lt 0.02 -or $PlaneGain -gt 1.0) {
+    throw "PlaneGain must be in [0.02, 1.0] m/s per m of offset (got $PlaneGain)"
+}
+if ($PlaneLeash -le 0) { throw "PlaneLeash must be > 0 metres (got $PlaneLeash)" }
+if ($MaxAlt -le 1.0) { throw "MaxAlt must be > the 1 m altitude floor (got $MaxAlt)" }
+if ($PlaneMode -and $Heading -ne 'manual') {
+    # The controller would override it anyway; say so before anything flies.
+    # NB: ASCII only inside PowerShell string literals here - this file has no
+    # BOM, so PS 5.1 reads it as ANSI and a UTF-8 dash/quote byte can terminate
+    # the string mid-expression. Non-ASCII is fine in comments.
+    Write-Host ("[dji-flocking] NOTE: PlaneMode forces manual heading - " +
+                "'$Heading' cannot apply on a vertical wall.") -ForegroundColor Yellow
+}
 if ($DObs -le 0) { throw "DObs must be > 0 (physical metres) (got $DObs)" }
 if ($R0Obs -lt $DObs) { throw "R0Obs must be >= DObs (detect at least as far as the repulsion reaches) (got R0Obs=$R0Obs, DObs=$DObs)" }
 if ($CObs -lt 0) { throw "CObs must be >= 0 (got $CObs)" }
@@ -206,6 +242,7 @@ Write-Host ("[dji-flocking] config $Config -> drones=$Drones slow=$Slow gimbal=$
             "heading=$Heading pointInwards=$PointInwards stitchOffset=$StitchOffset " +
             "noGui=$NoGui imageStream=$ImageStream " +
             "c_vm=$Cvm r0=$R0 scale=$Scale minSep=$MinSeparation identityCheck=$IdentityCheck " +
+            "planeMode=$PlaneMode planeGain=$PlaneGain planeLeash=$PlaneLeash maxAlt=$MaxAlt " +
             "dObs=$DObs r0Obs=$R0Obs cObs=$CObs " +
             "httpPort=$HttpPort cmdPath=$CmdPathDesc airlink=$AirlinkDesc " +
             "linkScan=$LinkScan")
@@ -254,6 +291,16 @@ $DroneIPsArg = switch ($CmdMode) {
 $IdentityArg = if (-not $IdentityCheck)   { " --no-identity-check" }                     else { "" }
 $MinSepArg   = if ($MinSeparation -ne 3.0){ " --min-separation " + (Inv $MinSeparation) } else { "" }
 
+# Vertical-plane ("wall") swarming. PlaneMode only SEEDS the GUI toggle; gain
+# and leash are forwarded whenever they differ from the script defaults so a
+# live GUI toggle later starts from the configured values. MaxAlt raises the
+# ceiling every commanded altitude is clamped to — needed for a tall wall.
+$PlaneArg = ""
+if ($PlaneMode)              { $PlaneArg += " --plane-mode" }
+if ($PlaneGain -ne 0.25)     { $PlaneArg += " --plane-gain " + (Inv $PlaneGain) }
+if ($PlaneLeash -ne 12.0)    { $PlaneArg += " --plane-leash " + (Inv $PlaneLeash) }
+if ($MaxAlt -ne 30.0)        { $PlaneArg += " --max-alt " + (Inv $MaxAlt) }
+
 # Obstacle/geofence repulsion tuning (physical metres; script defaults 5/6/4.3).
 $DObsArg  = if ($DObs -ne 5.0)  { " --d-obs " + (Inv $DObs) }   else { "" }
 $R0ObsArg = if ($R0Obs -ne 6.0) { " --r0-obs " + (Inv $R0Obs) } else { "" }
@@ -270,7 +317,7 @@ if ($VideoMode)              { $AirlinkArg += " --video-mode $VideoMode" }
 # Read-only pre-flight link/interference scan (on by default; forward the opt-out).
 $LinkScanArg = if (-not $LinkScan) { " --no-link-scan" } else { "" }
 
-$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg$IdentityArg$MinSepArg$DObsArg$R0ObsArg$CObsArg$AirlinkArg$LinkScanArg"
+$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$PlaneArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg$IdentityArg$MinSepArg$DObsArg$R0ObsArg$CObsArg$AirlinkArg$LinkScanArg"
 
 # The readController pane sources the conda hook and activates this env
 # before launching the script. Edit if your miniconda lives elsewhere.

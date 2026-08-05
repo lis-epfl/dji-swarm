@@ -74,6 +74,7 @@ _SWARM_COLS = [
     'v_n_total', 'v_e_total', 'd_ref', 'n_neighbours',
     'resp_rot_deg', 'resp_gain',
     'link_sq', 'link_down', 'link_up',
+    'plane_on', 'plane_az', 'plane_off', 'v_up', 'alt_cmd',
 ]
 
 # Stream name -> (filename, column list).
@@ -199,7 +200,9 @@ class FlightLogger:
                         v_n_total, v_e_total, d_ref, n_neighbours,
                         v_n_obs=0.0, v_e_obs=0.0,
                         resp_rot_deg=None, resp_gain=None,
-                        link_sq=None, link_down=None, link_up=None):
+                        link_sq=None, link_down=None, link_up=None,
+                        plane_on=0, plane_az=None, plane_off=None,
+                        v_up=None, alt_cmd=None):
         """Log the Olfati-Saber decomposition for one drone (swarm mode only).
         v_n_obs/v_e_obs is the virtual-obstacle + geofence repulsion term
         (optional, defaults 0 so callers without obstacles stay unchanged).
@@ -207,7 +210,14 @@ class FlightLogger:
         rotation fit (blank while there is not enough commanded motion).
         link_sq/link_down/link_up are the RC's AirLink quality percentages
         pushed by the app (blank on the server command path, which has no
-        app->PC diagnostic channel)."""
+        app->PC diagnostic channel).
+        plane_on/plane_az/plane_off/v_up describe vertical-plane ("wall")
+        swarming: whether the wall owns this drone this tick, the plane azimuth
+        (deg), the drone's out-of-plane offset (m) and the in-plane vertical
+        velocity that drove its altitude setpoint (blank in horizontal mode).
+        alt_cmd is the altitude actually commanded (the shared target in
+        horizontal mode, this drone's own setpoint on a wall) — the thing to
+        diff against telemetry alt when tuning plane_gain."""
         self._enqueue('swarm', {
             'drone_id': drone_id,
             'v_n_des': v_n_des,
@@ -225,6 +235,11 @@ class FlightLogger:
             'link_sq': link_sq,
             'link_down': link_down,
             'link_up': link_up,
+            'plane_on': plane_on,
+            'plane_az': plane_az,
+            'plane_off': plane_off,
+            'v_up': v_up,
+            'alt_cmd': alt_cmd,
         })
 
     # ------------------------------------------------------------------ #

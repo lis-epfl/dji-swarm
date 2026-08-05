@@ -183,10 +183,18 @@ class OlfatiSaber:
     comes through args.
 
     Not ported from the C# on purpose:
-      - Is3D=false altitude correction (c_altitude_2d pull toward the mean
-        neighbour altitude): the real drones fly a shared ABSOLUTE altitude
-        setpoint (DJI VS VerticalControlMode.POSITION), which already does
-        this job; adding the Unity term would fight that channel.
+      - Is3D=false altitude correction (c_altitude_2d / c_plane pull toward the
+        mean neighbour altitude): in HORIZONTAL flight the real drones fly a
+        shared ABSOLUTE altitude setpoint (DJI VS
+        VerticalControlMode.POSITION), which already does this job; adding the
+        Unity term would fight that channel. The C#'s generalisation of it —
+        constraining the swarm to an arbitrary plane, i.e. vertical-plane
+        ("wall") swarming — lives in swarm_plane.py instead, and deliberately
+        calls THIS class unmodified: it projects the drones into the wall's own
+        axes and hands the 2D coordinates to GetSwarmAcceleration below (the
+        potential is isotropic, so it does not care which orthonormal basis it
+        is given). Keep it that way — the flight-critical math stays in one
+        place with one set of tests.
       - gamma, lambda_obs, MaxMigrationDistance: declared in the C# but not
         used by GetSwarmAcceleration.
       - GetObstacleForce lives in ObstacleAvoidance below (the Unity version

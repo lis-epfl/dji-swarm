@@ -52,6 +52,10 @@ from olfati_saber import (
 # is pure stdlib, no ds_wrapper — safe to import here too).
 from heading_demostitch import OFFSET_MIN_DEG, OFFSET_MAX_DEG
 
+# Vertical-plane gain bounds, shared with the controller the same way (
+# swarm_plane.py is pure stdlib too) so the GUI and the CLI cannot drift apart.
+from swarm_plane import PLANE_GAIN_MIN, PLANE_GAIN_MAX
+
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui")
 
@@ -289,6 +293,23 @@ def make_handler(state, cmd_sock=None, cmd_addr=None, shapes=None):
                     self._send(400, b'{"ok":false,"error":"out of range"}', "application/json")
                     return
                 out = {"action": "stitch_offset", "value": v}
+            elif action == "plane":
+                # Vertical-plane ("wall") toggle. Forwarded as a request only —
+                # the controller owns the transition and refuses (clearing the
+                # flag back) if the drones' altitudes disagree too much.
+                out = {"action": "plane", "value": bool(msg.get("value"))}
+            elif action == "plane_gain":
+                # Restoring pull onto the plane (m/s per m of offset); bounds
+                # shared with the controller's CLI validation.
+                try:
+                    v = float(msg.get("value"))
+                except (TypeError, ValueError):
+                    self._send(400, b'{"ok":false,"error":"bad value"}', "application/json")
+                    return
+                if not (PLANE_GAIN_MIN <= v <= PLANE_GAIN_MAX):
+                    self._send(400, b'{"ok":false,"error":"out of range"}', "application/json")
+                    return
+                out = {"action": "plane_gain", "value": v}
             elif action == "rotation_check":
                 # Open-loop actuation probe: forwarded as a plain request; the
                 # controller runs it only while swarming is held and reports
