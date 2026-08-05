@@ -12,7 +12,10 @@ width = 800
 height = 450
 depth = 3
 processedImageSize = width * height * depth
-metadataSize = 12
+# Owned by utils.imageSharingUtil (the module that writes the bytes). Replayed
+# frames carry no camera pose, so their blocks get poseStatus 0: usable for
+# STABSTITCH and for feed display, not for the pose-driven PLANAR stitcher.
+metadataSize = imageSharingUtil.BLOCK_HEADER_BYTES
 blockSize = metadataSize + processedImageSize
 totalMMFSize = num_drones * blockSize
 

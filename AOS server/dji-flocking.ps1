@@ -86,6 +86,7 @@ param(
     [double]$MaxAlt,
     [switch]$NoGui,
     [switch]$ImageStream,
+    [switch]$ImageStreamPose,
     [switch]$NoIdentityCheck,
     [string[]]$DroneIPs,
     [string[]]$AirlinkBands,
@@ -101,7 +102,7 @@ param(
 $settings = @{
     Drones = 3; HttpPort = 8000; Slow = 1.0; GimbalPitch = -10.0
     Heading = 'manual'; PointInwards = $false; StitchOffset = 30.0; NoGui = $false
-    ImageStream = $false
+    ImageStream = $false; ImageStreamPose = $false
     Cvm = 0.0; R0 = 150.0; Scale = 10.0
     DObs = 5.0; R0Obs = 6.0; CObs = 4.3
     DroneIPs = @()
@@ -129,6 +130,7 @@ if ($PSBoundParameters.ContainsKey('R0'))           { $settings.R0 = $R0 }
 if ($PSBoundParameters.ContainsKey('Scale'))        { $settings.Scale = $Scale }
 if ($PSBoundParameters.ContainsKey('NoGui'))        { $settings.NoGui = [bool]$NoGui }
 if ($PSBoundParameters.ContainsKey('ImageStream'))  { $settings.ImageStream = [bool]$ImageStream }
+if ($PSBoundParameters.ContainsKey('ImageStreamPose')) { $settings.ImageStreamPose = [bool]$ImageStreamPose }
 if ($PSBoundParameters.ContainsKey('PointInwards')) { $settings.PointInwards = [bool]$PointInwards }
 if ($PSBoundParameters.ContainsKey('StitchOffset')) { $settings.StitchOffset = $StitchOffset }
 if ($PSBoundParameters.ContainsKey('PlaneMode'))    { $settings.PlaneMode = [bool]$PlaneMode }
@@ -161,6 +163,7 @@ $R0           = [double]$settings.R0
 $Scale        = [double]$settings.Scale
 $NoGui        = [bool]$settings.NoGui
 $ImageStream  = [bool]$settings.ImageStream
+$ImageStreamPose = [bool]$settings.ImageStreamPose
 $PointInwards = [bool]$settings.PointInwards
 $StitchOffset = [double]$settings.StitchOffset
 $PlaneMode    = [bool]$settings.PlaneMode
@@ -275,7 +278,10 @@ if ($StitchOffset -ne 30.0)    { $HeadingArg += " --stitch-offset " + (Inv $Stit
 # In-process image streaming to the stitcher pipeline (replaces the old
 # standalone image_stream.py pane, which starved the controller's ds_wrapper
 # access and collapsed the cmd/telem rates).
-$ImageStreamArg = if ($ImageStream) { " --image-stream" } else { "" }
+# --image-stream-pose implies --image-stream on the Python side, so only the
+# stronger flag is forwarded when both are set.
+$ImageStreamArg = if ($ImageStreamPose) { " --image-stream-pose" }
+                  elseif ($ImageStream) { " --image-stream" } else { "" }
 
 # Command path: explicit IP list or forced legacy 'server' get forwarded;
 # auto mode passes nothing (it is swarm_flocking.py's default — the script

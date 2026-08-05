@@ -172,6 +172,13 @@
     # (unlike the old standalone image_stream.py process). CLI: -ImageStream
     ImageStream = $true
 
+    # Include a per-frame camera pose (GPS + gimbal attitude -> Unity world) in
+    # each published block (--image-stream-pose; implies ImageStream). The sim's
+    # PLANAR stitcher computes its homographies from pose and cannot run without
+    # this; STABSTITCH ignores it. Costs one small conversion per frame and no
+    # extra ds_wrapper calls. CLI: -ImageStreamPose
+    ImageStreamPose = $false
+
     # --- Olfati-Saber flocking tuning (seed values; the GUI can retune live) ---
     # Velocity-matching gain, swarm_flocking.py --c-vm (default 0.0).
     Cvm = 0.0

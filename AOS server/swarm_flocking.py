@@ -140,6 +140,7 @@ from olfati_saber import (
     save_shapes,
 )
 from image_stream_feed import ImageStreamPublisher
+from dji_camera_pose import CameraPoseSolver
 from mqtt_command_sender import MqttCommandSender
 from response_monitor import ResponseMonitor
 from joystick_controller import (
@@ -2074,6 +2075,12 @@ def main():
                          "threads' image fetches (replaces running the "
                          "standalone image_stream.py, which contends with this "
                          "controller for the ds_wrapper protocol)")
+    ap.add_argument("--image-stream-pose", action="store_true",
+                    help="Include a per-frame camera pose (GPS + gimbal attitude -> "
+                         "Unity world) in each published block. Required by the sim's "
+                         "PLANAR stitcher, which computes its homographies from pose "
+                         "and cannot run without it; ignored by STABSTITCH. Implies "
+                         "--image-stream")
     ap.add_argument("--gui-host", default=DEFAULT_GUI_HOST,
                     help=f"GUI telemetry UDP host (default {DEFAULT_GUI_HOST})")
     ap.add_argument("--gui-port", type=int, default=DEFAULT_GUI_PORT,
@@ -2226,7 +2233,8 @@ def main():
             "c_vm": args.c_vm, "r0": args.r0, "scale": args.scale,
             "vel_frame": args.vel_frame, "dry_run": args.dry_run,
             "slow": args.slow, "gimbal_pitch": args.gimbal_pitch,
-            "image_stream": args.image_stream,
+            "image_stream": args.image_stream or args.image_stream_pose,
+            "image_stream_pose": args.image_stream_pose,
             "cmd_mode": cmd_mode,
             "drone_ips": resolved_ips,
             "identity_check": not args.no_identity_check,
@@ -2365,11 +2373,17 @@ def main():
     # telemetry threads' existing fetches (via DroneController.frame_sink), so
     # it adds no ds_wrapper calls and cannot slow the cmd/telem rates.
     img_stream = None
-    if args.image_stream:
-        img_stream = ImageStreamPublisher(swarm.drones, hw_decode)
+    if args.image_stream or args.image_stream_pose:
+        # ONE solver for the whole fleet: it latches a single GPS origin on the
+        # first valid fix, and every drone's position has to be measured from that
+        # same origin or the poses are not in a common frame.
+        pose_solver = CameraPoseSolver() if args.image_stream_pose else None
+        img_stream = ImageStreamPublisher(swarm.drones, hw_decode,
+                                          pose_solver=pose_solver)
         img_stream.start()
         print(f"  Image stream -> DroneFeedSharedMemory "
-              f"({args.drones} x 800x450, <=20 Hz per drone)")
+              f"({args.drones} x 800x450, <=20 Hz per drone"
+              f"{', with camera pose' if pose_solver is not None else ''})")
 
     # angular.x is repurposed for d_ref in swarm mode, so the gimbal would
     # otherwise stay at the DroneController default (-90°). Park it at the

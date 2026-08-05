@@ -24,12 +24,20 @@ which is exactly why it must live on its own thread. Frame rate therefore
 tops out at the telemetry rate (20 Hz per drone).
 
 Block layout (must match ImageSharing.cs / imageSharingUtil.write_memory):
-    int32 flag | int32 droneId (ZERO-based) | float32 heading | 800x450x3 BGR
-    block = 12 + 1080000 bytes; mapping = MAX_DRONES * block (fixed capacity so
+    int32 flag | int32 droneId (ZERO-based) | float32 heading
+      | float32 camPos[3] | float32 camRot[4] xyzw | float32 captureTime
+      | int32 poseStatus | 800x450x3 BGR
+    block = 48 + 1080000 bytes; mapping = MAX_DRONES * block (fixed capacity so
     the size never depends on fleet size or creation order), indexed by
     (drone_id - 1). ImageSharing.cs marks blocks it has consumed (and blocks
     never written) with droneId = -1 and skips them; every write here restores
     droneId, which is how Unity detects a genuinely new frame.
+
+    The pose fields are what the sim's PLANAR stitcher needs and a heading alone
+    cannot give: one scalar is no position at all and one of three rotation
+    degrees of freedom. Supply a `pose_solver` to fill them; without one they are
+    zeroed with poseStatus 0, which costs PLANAR (it drops unposed views) and
+    nothing else.
 
 Real-drone mode note: keep the Unity scene's PyUniSharingFast component with
 enableImageWriting DISABLED — in the DJI scene ImageSharing.cs is the sole
@@ -40,6 +48,7 @@ No ds_wrapper import — decode mode and frames are passed in by the controller.
 
 import mmap
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -53,14 +62,16 @@ RAW_ROWS = 1080 * 3 // 2   # 1620 (YUV420 planar / NV12)
 RAW_COLS = 1920
 
 BLOCK_MAP_NAME = "DroneFeedSharedMemory"
-BLOCK_HEADER_BYTES = 12    # int32 flag + int32 droneId + float32 heading
+# Re-exported rather than redefined: utils.imageSharingUtil owns the block layout
+# because it is what writes the bytes. image_feed_test.py imports this name.
+BLOCK_HEADER_BYTES = imageSharingUtil.BLOCK_HEADER_BYTES
 MAX_DRONES = 10            # fixed mapping capacity (must match ImageSharing.cs)
 
 
 class ImageStreamPublisher:
     """Per-drone worker threads that push frames to DroneFeedSharedMemory."""
 
-    def __init__(self, drones, hw_decode, width=800, height=450):
+    def __init__(self, drones, hw_decode, width=800, height=450, pose_solver=None):
         """
         Args:
             drones: {drone_id (1-based int): DroneController} — each controller
@@ -72,8 +83,20 @@ class ImageStreamPublisher:
             width/height: output frame size; 800x450 is the fixed size the
                     Unity consumer reads (ImageSharing.cs ImageWidth/Height
                     consts must match).
+            pose_solver: optional dji_camera_pose.CameraPoseSolver. Given one,
+                    each block carries the camera pose the sim's PLANAR stitcher
+                    needs; without one the blocks carry poseStatus 0 and PLANAR
+                    falls back to the individual feeds (STABSTITCH is unaffected
+                    either way). ONE solver for the whole fleet, never one per
+                    drone — they must share a latched origin or their positions
+                    are not in a common frame, which is the entire point of it.
         """
         self._drones = dict(drones)
+        self._pose_solver = pose_solver
+        # Capture timestamps are seconds since the publisher started, NOT a wall
+        # clock: the wire field is float32, in which time.time() (~1.75e9) has
+        # about 128 s of resolution. The consumer only ever reads differences.
+        self._t0 = time.perf_counter()
         bad_ids = [did for did in self._drones if not 1 <= did <= MAX_DRONES]
         if bad_ids:
             raise ValueError(
@@ -120,8 +143,23 @@ class ImageStreamPublisher:
             try:
                 yuv = np.array(data[:RAW_IMAGE_BYTES], copy=True)
                 heading = float(telem.get("heading", 0.0))
+
+                # Solved HERE, not on the worker thread, and not from a later
+                # telemetry sample: `data` and `telem` came out of the same
+                # ds_wrapper fetch, so this is the tightest pose/frame pairing
+                # available anywhere in the system. Pose/video skew is a
+                # first-order error term for the planar mosaic — at the 40 deg/s
+                # yaw clamp, 300 ms of it is ~55 px — so pairing them one call
+                # later would give away the one part of that budget we control.
+                pose = None
+                if self._pose_solver is not None:
+                    pos, quat, status = self._pose_solver.pose_for(telem)
+                    if status:
+                        pose = (pos, quat)
+                capture_time = time.perf_counter() - self._t0
+
                 with self._locks[drone_id]:
-                    self._latest[drone_id] = (yuv, heading)
+                    self._latest[drone_id] = (yuv, heading, pose, capture_time)
                 self._events[drone_id].set()
             except Exception:
                 # Streaming is non-critical to flight; never break the
@@ -140,14 +178,14 @@ class ImageStreamPublisher:
                 frame = self._latest.pop(drone_id, None)
             if frame is None:
                 continue
-            yuv, heading = frame
+            yuv, heading, pose, capture_time = frame
             try:
                 img = cv2.cvtColor(yuv.reshape(RAW_ROWS, RAW_COLS), self._cvt)
                 img = cv2.resize(img, self._size)
                 imageSharingUtil.write_memory(
                     mmf, (drone_id - 1) * self._block_bytes,
                     self._image_bytes, img, drone_id - 1, heading,
-                    pace_s=0.04)
+                    pace_s=0.04, pose=pose, capture_time=capture_time)
             except Exception as e:
                 print("[image-stream {}] frame error: {}".format(drone_id, e),
                       flush=True)
