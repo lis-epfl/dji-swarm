@@ -173,19 +173,20 @@ no video.
     mailbox, and does the convert/resize/handshake on per-drone worker threads so it
     can never slow the cmd/telem rates. (In real-drone mode the Unity component's
     `enableImageWriting` must be off — its writer would fight this one.)
-    The block header it writes is the **12-byte v1** `flag|droneId|heading`, and that is
-    structural, not a version lag: the pose header (v2, 48 bytes) carries a per-frame
-    *camera* position + rotation, which the DJI telemetry string simply does not contain
-    (it has GPS + aircraft/gimbal angles, not an optical-centre pose). Consequence: the
-    sim's **`PLANAR` stitcher cannot run on real drones** — it is pose-driven, so it needs
-    v2. `StitcherThreading.planar_inputs_ready()` detects the v1 producer, prints one
-    `[PLANAR] unavailable: …` line and falls back to the individual feeds; the symptom is a
-    blank panorama, not a crash. Use `STABSTITCH` here. Making `PLANAR` work with real
-    drones is not a wiring change — it needs a camera-pose source that does not exist yet.
+    The block header it writes is the **48-byte v2** `flag|droneId|heading|camPos[3]|
+    camRot[4] xyzw|captureTime|poseStatus` (layout owned by `utils/imageSharingUtil.py`).
+    The pose fields are what the sim's pose-driven **`PLANAR`** stitcher needs and a
+    compass heading cannot give (one scalar is no position and one of three rotation
+    DoF); `dji_camera_pose.CameraPoseSolver` supplies them, gated behind
+    `--image-stream-pose`/`ImageStreamPose`. **Without that flag the blocks go out with
+    `poseStatus 0`** and `PLANAR` drops every view — `StitcherThreading.planar_inputs_ready()`
+    prints one `[PLANAR] unavailable: …` line and falls back to the individual feeds, so
+    the symptom is a blank panorama, not a crash. `STABSTITCH` ignores pose either way.
   - `clip_recorder.py` — `ClipRecorder`, embedded by `swarm_flocking.py`: the GUI's
     **Record clip** button saves a short section of a flight WITH pictures — one
-    1080p MP4 per drone plus a per-frame index CSV (`t_epoch`/lat/lon/alt/heading/
-    gimbal), and the flight data for exactly that window, in
+    1080p MP4 per drone plus a per-frame index CSV (`t_epoch`, raw telemetry, and the
+    **solved Unity-world camera pose** `pos_*`/`quat_*` xyzw/`pose_status` from
+    `dji_camera_pose.CameraPoseSolver`), and the flight data for exactly that window, in
     `recordings/clip_YYYYMMDD_HHMMSS/` (`--recording-dir`/`RecordingDir`, gitignored,
     **separate from `flight_logs/`**, which is untouched and keeps running). Auto-stops
     at `--record-max-s`/`RecordMaxSeconds` (default 120 s) so a forgotten recording can't
@@ -198,7 +199,37 @@ no video.
     receives every row **already stamped by the primary**, so clip rows are byte-identical
     to their `flight_logs/` counterparts and join across the two. **`drone*_frames.csv`
     `t_epoch` is the authoritative timebase, not the MP4** — see the
-    [video-rate gotcha](#critical-gotchas). GUI state rides on `meta["recording"]`
+    [video-rate gotcha](#critical-gotchas).
+    **Clips are the offline feed for the sim's `PLANAR` stitcher**, which is pose-driven
+    and cannot use pixels alone. The pose is solved on the telemetry thread from the same
+    `ds_wrapper` fetch that produced the frame (tightest available pairing — pose/video
+    skew is the dominant mosaic error term), using the **same fleet-wide
+    `CameraPoseSolver` instance as the live image stream**, so a clip and the feed share
+    one latched GPS origin. That origin is recorded in `session.json`
+    (`pose_origin_latlon`) because it exists nowhere else once the controller exits, along
+    with nominal camera intrinsics for the clip's own 1920×1080 (`camera.fx` ≈ 1260 px at
+    the Mini 3 Pro's 46.4° vfov — a working default, **not** a calibration; the pinhole
+    model has no distortion term, so **DJI dewarping must be ON at capture**). Frames
+    taken without a GPS fix get `pose_status` 0 and are counted + warned about at stop.
+  - `clip_replay.py` — replays a recorded clip into `DroneFeedSharedMemory` **as if the
+    drones were flying**, so the Unity DJI scene + stitcher run with no change from a live
+    flight: same map, same 48-byte v2 header, same 800×450 BGR payload, same per-frame
+    pose, same cross-drone capture skew, real-time paced off the recorded `t_epoch`.
+    Every byte goes through the same `utils.imageSharingUtil.write_memory` the live
+    publisher uses, and the map name / capacity / header size are **imported from
+    `image_stream_feed`** rather than restated — a live/replay wire mismatch would be
+    silent (the consumer reads image bytes as a header), so it must not be possible to
+    introduce one. Poses are taken from the CSV, never re-derived: re-deriving would
+    relatch the GPS origin and put the replay in a different frame from the recording.
+    `--loop` for tuning against fixed footage, `--speed`, and `--pose-lead-s` to re-pair
+    frames with earlier/later poses — the one knob for pose/video skew, which the sim's
+    error budget makes the dominant term. Needs **no `ds_wrapper`, no DroneSwarmServer,
+    no admin, no drones**. Supersedes `image_replay.py` for clips (that one reads
+    `saved_streams/` JPEGs and writes `poseStatus 0`, so it can't drive PLANAR).
+    `PyUniSharingFast` must still be in the scene — it is the only writer of the wire
+    version, intrinsics and scene plane, all three of which
+    `StitcherThreading.planar_inputs_ready()` requires; the settings to match are printed
+    at startup. GUI state rides on `meta["recording"]`
     (`{on, finalizing, elapsed, remaining, frames, dropped, last, …}`); the button hides
     itself when a controller doesn't publish it. Recording is deliberately **independent of
     swarming**: a Stop, a min-separation auto-STOP or a geofence DISABLE_VS does not cut the
@@ -221,7 +252,7 @@ no video.
     `clear_scans()`. Messages are routed by topic, so diagnostics never pollute the
     identity-probe buffer.
   - `image_stream.py` — **standalone debug tool only; never run alongside a live
-    controller.** It polls the wrapper from its own process, and the shared-memory
+    controller.** (`clip_replay.py` is safe by contrast — it reads files, not the wrapper.) It polls the wrapper from its own process, and the shared-memory
     protocol (one status byte per drone slot, no mutex) lets a second process starve a
     running controller's cmd/telem loops down to ~1 Hz — the bug that motivated
     `image_stream_feed.py`. `image_save.py` / `image_replay.py` + utils in

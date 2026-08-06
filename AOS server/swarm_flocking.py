@@ -2427,27 +2427,35 @@ def main():
         print("  Identity check n/a: server command path uses one identity "
               "(slot) for commands and telemetry by construction")
 
+    # ONE solver for the whole fleet, SHARED by the live image stream and the
+    # clip recorder: it latches a single GPS origin on the first valid fix, and
+    # every drone's position — live or recorded — has to be measured from that
+    # same origin or the poses are not in a common frame. A second instance
+    # would silently put the recording in a different frame from the feed.
+    # Always constructed (it holds one lat/lon and does nothing until asked).
+    pose_solver = CameraPoseSolver()
+
     # Optional in-process image streaming to the stitcher pipeline. Fed by the
     # telemetry threads' existing fetches (a DroneController frame sink), so
     # it adds no ds_wrapper calls and cannot slow the cmd/telem rates.
     img_stream = None
     if args.image_stream or args.image_stream_pose:
-        # ONE solver for the whole fleet: it latches a single GPS origin on the
-        # first valid fix, and every drone's position has to be measured from that
-        # same origin or the poses are not in a common frame.
-        pose_solver = CameraPoseSolver() if args.image_stream_pose else None
-        img_stream = ImageStreamPublisher(swarm.drones, hw_decode,
-                                          pose_solver=pose_solver)
+        img_stream = ImageStreamPublisher(
+            swarm.drones, hw_decode,
+            pose_solver=pose_solver if args.image_stream_pose else None)
         img_stream.start()
         print(f"  Image stream -> DroneFeedSharedMemory "
               f"({args.drones} x 800x450, <=20 Hz per drone"
-              f"{', with camera pose' if pose_solver is not None else ''})")
+              f"{', with camera pose' if args.image_stream_pose else ''})")
 
     # GUI-triggered clip recording. Always available (the button is in the
     # controls bar); constructing it touches no disk and starts no threads, so
     # a run where Record is never pressed costs nothing. Like the image stream
     # it rides the telemetry threads' existing fetches — both can be active at
-    # once now that frame sinks are a list.
+    # once now that frame sinks are a list. It gets the pose solver
+    # unconditionally (not gated on --image-stream-pose): a clip without a
+    # per-frame camera pose cannot drive the sim's PLANAR stitcher, and the
+    # solve is a handful of flops on data already in hand.
     recording_dir = args.recording_dir
     if not os.path.isabs(recording_dir):
         recording_dir = os.path.join(
@@ -2460,10 +2468,14 @@ def main():
                                   "drone_ips": resolved_ips,
                                   "dry_run": args.dry_run,
                                   "slow": args.slow,
+                                  "gimbal_pitch": args.gimbal_pitch,
+                                  "plane_mode": args.plane_mode,
                                   "flight_log": (logger.session_dir
-                                                 if logger else None)})
+                                                 if logger else None)},
+                            pose_solver=pose_solver)
     print(f"  Clip recording -> {recording_dir} "
-          f"(GUI Record button, max {args.record_max_s:.0f} s per clip)")
+          f"(GUI Record button, max {args.record_max_s:.0f} s per clip, "
+          f"with per-frame camera pose)")
 
     # angular.x is repurposed for d_ref in swarm mode, so the gimbal would
     # otherwise stay at the DroneController default (-90°). Park it at the

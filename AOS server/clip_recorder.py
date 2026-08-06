@@ -42,6 +42,30 @@ rate is recorded in session.json, and anything that needs true frame times joins
 force a constant rate: that would destroy the frame<->telemetry correspondence,
 which is the point of recording at all.
 
+What the frame index carries, and why
+-------------------------------------
+Each MP4 has a `drone{N}_frames.csv` beside it, one row per written frame. It
+carries the raw telemetry the frame was taken with AND the **solved Unity-world
+camera pose** (`pos_*`, `quat_*` xyzw, `pose_status`) from
+`dji_camera_pose.CameraPoseSolver`.
+
+The pose is the point. The sim's PLANAR stitcher builds every homography from
+`G = K R [e1|e2|(O-C)]`, so it needs a per-frame camera position and rotation;
+a clip that only has pixels and a compass heading cannot drive it. Writing the
+*solved* pose (rather than leaving it to be re-derived) also preserves the
+fleet-wide latched GPS origin, which otherwise exists only inside the live
+solver and is gone the moment the controller exits — it is recorded in
+`session.json` as `pose_origin_latlon`.
+
+The pose is solved on the telemetry thread, from the same `ds_wrapper` fetch
+that produced the pixels, because pose/video skew is the dominant error term in
+a pose-driven mosaic and that pairing is the tightest one available.
+
+`session.json` also records nominal camera intrinsics for the clip's own
+resolution. They are a working default (DJI Mini 3 Pro wide, 16:9), not a
+calibration, and the pinhole model has no distortion term — so DJI's dewarping
+must be enabled on the camera.
+
 Flight data for the window comes from FlightLogger's mirror hook: a second
 FlightLogger rooted in the clip folder is attached as `logger.mirror` for the
 duration, so all four streams are captured with the timestamps the primary
@@ -54,6 +78,7 @@ controller. `python clip_recorder.py` runs a standalone self-check.
 
 import csv
 import json
+import math
 import os
 import queue
 import shutil
@@ -90,13 +115,35 @@ DEFAULT_QUEUE_DEPTH = 4
 # check at start(). Measured field value goes in flocking.config.psd1.
 EST_BYTES_PER_S_PER_DRONE = 2500000
 
-# Index written alongside each MP4. Gimbal angles ride along because a frame
-# without them is not enough to place a view; everything else is in the
-# mirrored telemetry.csv.
+# Nominal camera intrinsics recorded in session.json so an offline consumer
+# cannot silently guess them. This is the DJI Mini 3 Pro wide lens at 16:9 and
+# matches PyUniSharingFast.manualVerticalFovDeg in the sim — a working default,
+# NOT a calibration. The pinhole model has no distortion term, so DJI's
+# dewarping must be ENABLED on the camera for it to hold.
+NOMINAL_VFOV_DEG = 46.4
+
+# Index written alongside each MP4, one row per recorded frame.
+#
+# The pose block is the reason this file exists in this shape: the sim's PLANAR
+# stitcher is pose-driven (G = K R [e1|e2|(O-C)]), so a clip that cannot produce
+# a per-frame camera pose is unusable to it. `pos_*`/`quat_*` are the SOLVED
+# Unity-world pose (dji_camera_pose.CameraPoseSolver), written straight to disk
+# so a replay reproduces the live wire exactly instead of re-deriving it — and
+# so the fleet-wide latched origin, which lives only in the solver, cannot be
+# lost. The raw fields it was solved from are kept alongside it so the solve can
+# be redone or corrected offline; `gimbal_roll` is here only because pose_for
+# consumes it. `sat_count` lets a consumer drop frames taken on a poor fix.
 _FRAME_COLS = ['frame', 't_epoch', 'lat', 'lon', 'alt', 'heading',
-               'gimbal_pitch', 'gimbal_yaw']
+               'gimbal_pitch', 'gimbal_yaw', 'gimbal_roll', 'sat_count',
+               'pos_x', 'pos_y', 'pos_z',
+               'quat_x', 'quat_y', 'quat_z', 'quat_w', 'pose_status']
 
 _FLUSH_INTERVAL = 1.0     # frames-CSV flush period (matches FlightLogger)
+
+
+def _focal_px(height_px, vfov_deg):
+    """Pinhole focal length in pixels for a vertical field of view."""
+    return (height_px * 0.5) / math.tan(math.radians(vfov_deg) * 0.5)
 
 
 class _Clip:
@@ -136,7 +183,8 @@ class ClipRecorder:
 
     def __init__(self, drones, hw_decode, base_dir=DEFAULT_RECORDING_DIR,
                  max_seconds=DEFAULT_MAX_SECONDS, fps=DEFAULT_FPS,
-                 logger=None, meta=None, queue_depth=DEFAULT_QUEUE_DEPTH):
+                 logger=None, meta=None, queue_depth=DEFAULT_QUEUE_DEPTH,
+                 pose_solver=None):
         """
         Args:
             drones: {drone_id (1-based int): DroneController} — each must expose
@@ -153,6 +201,14 @@ class ClipRecorder:
             logger: the live FlightLogger to mirror for the window. None (or
                     --no-log) = video only, with a warning.
             meta: run-config dict seeded into the clip's session.json.
+            pose_solver: dji_camera_pose.CameraPoseSolver used to write a
+                    per-frame Unity-world camera pose into the frame index —
+                    what the sim's PLANAR stitcher needs and a heading alone
+                    cannot give. Pass the SAME instance the image-stream
+                    publisher uses (ONE per fleet, never one per drone): it
+                    latches a single GPS origin, and poses solved against
+                    different origins are not in a common frame. None = write
+                    the raw telemetry columns with pose_status 0.
         """
         self._drones = dict(drones)
         self._base_dir = base_dir
@@ -161,6 +217,7 @@ class ClipRecorder:
         self._logger = logger
         self._meta = dict(meta or {})
         self._queue_depth = int(queue_depth)
+        self._pose_solver = pose_solver
         self._cvt = (cv2.COLOR_YUV2BGR_NV12 if hw_decode == 1
                      else cv2.COLOR_YUV420p2BGR)
         # Guards the start/stop transition only — every hot path (the sink, the
@@ -331,15 +388,32 @@ class ClipRecorder:
                 # and never calls poll(), the clip stops growing here.
                 if not clip.active or time.monotonic() >= clip.deadline:
                     return
-                item = (
-                    np.array(data[:RAW_IMAGE_BYTES], copy=True),
-                    time.time(),
-                    telem.get("lat"), telem.get("lon"), telem.get("alt"),
-                    telem.get("heading"),
-                    telem.get("gimbal_pitch"), telem.get("gimbal_yaw"),
-                )
+                row = {
+                    't_epoch': time.time(),
+                    'lat': telem.get("lat"), 'lon': telem.get("lon"),
+                    'alt': telem.get("alt"), 'heading': telem.get("heading"),
+                    'gimbal_pitch': telem.get("gimbal_pitch"),
+                    'gimbal_yaw': telem.get("gimbal_yaw"),
+                    'gimbal_roll': telem.get("gimbal_roll"),
+                    'sat_count': telem.get("sat_count"),
+                    'pose_status': 0,
+                }
+                # Solved HERE, not on the worker and not from a later telemetry
+                # sample: this frame and this telemetry came out of the SAME
+                # ds_wrapper fetch, which is the tightest pose/pixel pairing the
+                # system can produce. Pose/video skew is the dominant error term
+                # in the pose-driven mosaic, so the part of it we control is not
+                # worth giving away for a slightly cheaper sink.
+                if self._pose_solver is not None:
+                    pos, quat, status = self._pose_solver.pose_for(telem)
+                    if status:
+                        row['pos_x'], row['pos_y'], row['pos_z'] = pos
+                        (row['quat_x'], row['quat_y'],
+                         row['quat_z'], row['quat_w']) = quat
+                        row['pose_status'] = status
                 try:
-                    q.put_nowait(item)
+                    q.put_nowait((np.array(data[:RAW_IMAGE_BYTES], copy=True),
+                                  row))
                 except queue.Full:
                     clip.dropped[drone_id] += 1
             except Exception:
@@ -360,6 +434,7 @@ class ClipRecorder:
         csv_file = None
         csv_writer = None
         n = 0
+        n_posed = 0
         t_first = t_last = None
         last_flush = time.time()
         err = None
@@ -381,7 +456,8 @@ class ClipRecorder:
                         break
                     continue
 
-                yuv, t_epoch, lat, lon, alt, heading, gpitch, gyaw = item
+                yuv, row = item
+                t_epoch = row['t_epoch']
                 img = cv2.cvtColor(yuv.reshape(RAW_ROWS, RAW_COLS), self._cvt)
 
                 if writer is None:
@@ -410,11 +486,10 @@ class ClipRecorder:
                 if t_first is None:
                     t_first = t_epoch
                 t_last = t_epoch
-                csv_writer.writerow({
-                    'frame': n, 't_epoch': t_epoch,
-                    'lat': lat, 'lon': lon, 'alt': alt, 'heading': heading,
-                    'gimbal_pitch': gpitch, 'gimbal_yaw': gyaw,
-                })
+                row['frame'] = n
+                csv_writer.writerow(row)
+                if row['pose_status']:
+                    n_posed += 1
                 clip.frames[drone_id] = n
 
                 now = time.time()
@@ -438,6 +513,7 @@ class ClipRecorder:
             span = (t_last - t_first) if (n > 1 and t_first is not None) else 0.0
             clip.results[drone_id] = {
                 'frames': n,
+                'frames_posed': n_posed,   # usable by the PLANAR stitcher
                 'dropped': clip.dropped[drone_id],
                 'fps_nominal': self._fps,
                 'fps_actual': round((n - 1) / span, 2) if span > 0 else None,
@@ -469,6 +545,15 @@ class ClipRecorder:
             'clip_stop_reason': clip.reason,
             'clip_duration_s': summary['duration_s'],
             'drones': {str(k): v for k, v in sorted(clip.results.items())},
+            # The fleet-wide latched origin every pos_* in every frames CSV is
+            # measured from. Recorded because it lives nowhere else — the solver
+            # picks it from the first valid fix and then it is gone. Without it
+            # the clip's poses cannot be related to anything outside the clip
+            # (they are still self-consistent, which is all PLANAR's
+            # FormationRelative plane needs).
+            'pose_origin_latlon': (list(self._pose_solver.origin)
+                                   if (self._pose_solver is not None
+                                       and self._pose_solver.origin) else None),
         }
         if clip.mirror is not None:
             clip.mirror.update_meta(final_meta)
@@ -481,7 +566,15 @@ class ClipRecorder:
             if r['frames'] == 0:
                 print("[clip] WARNING drone {} recorded NO frames — no video "
                       "(is its telemetry parsing?)".format(did), flush=True)
-            elif r['dropped']:
+                continue
+            if self._pose_solver is not None and r['frames_posed'] < r['frames']:
+                # Unposed frames are dead weight to the pose-driven stitcher,
+                # and the cause (no GPS fix) is fixable on the next flight.
+                print("[clip] WARNING drone {}: {}/{} frames have NO camera "
+                      "pose (no GPS fix) — those are unusable for PLANAR"
+                      .format(did, r['frames'] - r['frames_posed'],
+                              r['frames']), flush=True)
+            if r['dropped']:
                 print("[clip] WARNING drone {} dropped {} frames (encoder fell "
                       "behind)".format(did, r['dropped']), flush=True)
         rates = ", ".join(
@@ -538,6 +631,26 @@ class ClipRecorder:
             'fps_nominal': self._fps,
             'frame_size': [RAW_COLS, 1080],
             'flight_data': clip.mirror is not None or self._logger is not None,
+            'pose': ('per-frame Unity-world camera pose in drone*_frames.csv '
+                     '(pos_*, quat_* xyzw, pose_status), solved by '
+                     'dji_camera_pose.CameraPoseSolver against one fleet-wide '
+                     'latched origin' if self._pose_solver is not None else
+                     'NONE — no pose solver was attached, so pose_status is 0 '
+                     'on every frame and this clip cannot drive the PLANAR '
+                     'stitcher'),
+            # Nominal, not measured. Recorded so an offline consumer scales fx
+            # to the clip's own resolution instead of inheriting the sim's
+            # 800x450 numbers, and so a later real calibration has something
+            # explicit to replace.
+            'camera': {
+                'width': RAW_COLS, 'height': 1080,
+                'vfov_deg': NOMINAL_VFOV_DEG,
+                'fx': round(_focal_px(1080, NOMINAL_VFOV_DEG), 2),
+                'fy': round(_focal_px(1080, NOMINAL_VFOV_DEG), 2),
+                'cx': RAW_COLS / 2.0, 'cy': 1080 / 2.0,
+                'model': 'pinhole, no distortion — DJI dewarping must be ON',
+                'source': 'nominal DJI Mini 3 Pro wide @16:9, NOT a calibration',
+            },
             'timebase': ('drone*_frames.csv t_epoch is authoritative; the MP4 '
                          'header rate is nominal (see clip_recorder.py)'),
         })
@@ -580,13 +693,16 @@ if __name__ == "__main__":
         buf[1080 * RAW_COLS:] = 128        # neutral chroma
         return buf
 
+    from dji_camera_pose import CameraPoseSolver, POSE_VALID
+
     out = tempfile.mkdtemp(prefix="clip_selfcheck_")
     log = FlightLogger(base_dir=os.path.join(out, "flight_logs"),
                        meta={"script": "clip_recorder", "test": True})
     drones = {1: _FakeDrone(), 2: _FakeDrone()}
+    solver = CameraPoseSolver()          # one per fleet, as in swarm_flocking
     rec = ClipRecorder(drones, hw_decode=1,
                        base_dir=os.path.join(out, "recordings"),
-                       max_seconds=2.0, logger=log,
+                       max_seconds=2.0, logger=log, pose_solver=solver,
                        meta={"script": "clip_recorder", "test": True})
 
     assert rec.status()["on"] is False
@@ -598,7 +714,7 @@ if __name__ == "__main__":
     while not rec.poll():                  # runs until the 2 s auto-stop
         telem = {"lat": 46.5 + i * 1e-6, "lon": 6.56, "alt": 10.0 + i * 0.01,
                  "heading": (i * 3) % 360, "gimbal_pitch": -2.0,
-                 "gimbal_yaw": 0.0}
+                 "gimbal_yaw": 0.0, "gimbal_roll": 0.0, "sat_count": 15}
         for d in drones.values():
             for s in d.sinks:
                 s(_frame(i), telem)
@@ -637,12 +753,33 @@ if __name__ == "__main__":
         assert ts == sorted(ts) and ts[0] > 0
         counts[did] = len(rows)
 
+        # Every frame must carry a usable camera pose — without one the sim's
+        # PLANAR stitcher drops the view.
+        assert all(int(r['pose_status']) == POSE_VALID for r in rows)
+        # Position must move with the (northward-drifting, climbing) fake
+        # flight, and be measured from the latched origin: the first row sits
+        # at it, so its north/up offsets start near zero.
+        assert abs(float(rows[0]['pos_z'])) < 0.5, rows[0]['pos_z']
+        assert float(rows[-1]['pos_z']) > float(rows[0]['pos_z'])
+        assert float(rows[-1]['pos_y']) > float(rows[0]['pos_y'])
+        # ...and match what the same solver produces from the same telemetry.
+        want = solver.pose_for({'lat': 46.5, 'lon': 6.56, 'alt': 10.0,
+                                'gimbal_yaw': 0.0, 'gimbal_pitch': -2.0,
+                                'gimbal_roll': 0.0})
+        assert abs(float(rows[0]['quat_x']) - want[1][0]) < 1e-6, rows[0]
+        assert abs(float(rows[0]['quat_w']) - want[1][3]) < 1e-6, rows[0]
+
     with open(os.path.join(clip_dir, "session.json")) as f:
         info = json.load(f)
     assert info['meta']['clip'] == clip_name
     assert info['meta']['clip_stop_reason'] == "max_duration"
     for did, n_rows in counts.items():
         assert info['meta']['drones'][str(did)]['frames'] == n_rows
+        assert info['meta']['drones'][str(did)]['frames_posed'] == n_rows
+    # The latched origin must survive to disk: it exists nowhere else once the
+    # controller exits, and without it the clip's poses cannot be georeferenced.
+    assert info['meta']['pose_origin_latlon'] == [46.5, 6.56], info['meta']
+    assert info['meta']['camera']['fx'] == round(_focal_px(1080, 46.4), 2)
     for fname in ('telemetry.csv', 'drone_commands.csv',
                   'user_commands.csv', 'swarm_debug.csv'):
         assert os.path.exists(os.path.join(clip_dir, fname)), fname
