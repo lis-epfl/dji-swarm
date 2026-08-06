@@ -57,6 +57,11 @@
 #                                     # the main lever when many links share the site
 #   .\dji-flocking.ps1 -VideoMode 1920x1080@24     # cap the camera stream on every RC
 #   .\dji-flocking.ps1 -NoLinkScan    # skip the read-only pre-flight link/interference scan
+#   .\dji-flocking.ps1 -RecordMaxSeconds 60 -RecordingDir 'D:\Flight clips'
+#                                     # GUI "Record clip" button: per-drone 1080p MP4 + a frame
+#                                     # index + the flight-data CSVs for that window only, in
+#                                     # their own folder under RecordingDir (separate from
+#                                     # flight_logs/). Auto-stops at RecordMaxSeconds.
 #   .\dji-flocking.ps1 -Config .\my-other.psd1   # use a different config file
 #
 # If PowerShell blocks the script, either run once with:
@@ -88,6 +93,8 @@ param(
     [switch]$ImageStream,
     [switch]$ImageStreamPose,
     [switch]$NoIdentityCheck,
+    [string]$RecordingDir,
+    [double]$RecordMaxSeconds,
     [string[]]$DroneIPs,
     [string[]]$AirlinkBands,
     [string[]]$AirlinkBandwidth,
@@ -110,6 +117,7 @@ $settings = @{
     PlaneMode = $false; PlaneGain = 0.25; PlaneLeash = 12.0; MaxAlt = 30.0
     AirlinkBands = @(); AirlinkBandwidth = @(); VideoMode = ''
     LinkScan = $true
+    RecordingDir = 'recordings'; RecordMaxSeconds = 120.0
 }
 
 if (-not (Test-Path $Config)) {
@@ -131,6 +139,8 @@ if ($PSBoundParameters.ContainsKey('Scale'))        { $settings.Scale = $Scale }
 if ($PSBoundParameters.ContainsKey('NoGui'))        { $settings.NoGui = [bool]$NoGui }
 if ($PSBoundParameters.ContainsKey('ImageStream'))  { $settings.ImageStream = [bool]$ImageStream }
 if ($PSBoundParameters.ContainsKey('ImageStreamPose')) { $settings.ImageStreamPose = [bool]$ImageStreamPose }
+if ($PSBoundParameters.ContainsKey('RecordingDir'))     { $settings.RecordingDir = $RecordingDir }
+if ($PSBoundParameters.ContainsKey('RecordMaxSeconds')) { $settings.RecordMaxSeconds = $RecordMaxSeconds }
 if ($PSBoundParameters.ContainsKey('PointInwards')) { $settings.PointInwards = [bool]$PointInwards }
 if ($PSBoundParameters.ContainsKey('StitchOffset')) { $settings.StitchOffset = $StitchOffset }
 if ($PSBoundParameters.ContainsKey('PlaneMode'))    { $settings.PlaneMode = [bool]$PlaneMode }
@@ -181,6 +191,8 @@ $AirlinkBands     = @($settings.AirlinkBands | Where-Object { "$_".Trim() -ne ''
 $AirlinkBandwidth = @($settings.AirlinkBandwidth | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne '' })
 $VideoMode        = "$($settings.VideoMode)".Trim()
 $LinkScan         = [bool]$settings.LinkScan
+$RecordingDir     = "$($settings.RecordingDir)".Trim()
+$RecordMaxSeconds = [double]$settings.RecordMaxSeconds
 
 # Command-path mode from the DroneIPs value:
 #   @()                     -> 'auto'    (swarm_flocking.py discovers the RC IPs from
@@ -226,6 +238,12 @@ if ($PlaneMode -and $Heading -ne 'manual') {
 if ($DObs -le 0) { throw "DObs must be > 0 (physical metres) (got $DObs)" }
 if ($R0Obs -lt $DObs) { throw "R0Obs must be >= DObs (detect at least as far as the repulsion reaches) (got R0Obs=$R0Obs, DObs=$DObs)" }
 if ($CObs -lt 0) { throw "CObs must be >= 0 (got $CObs)" }
+# Bounds mirror clip_recorder.py's MAX_SECONDS_MIN/MAX (and swarm_flocking.py's
+# --record-max-s validation), so a bad value fails before the panes open.
+if ($RecordMaxSeconds -lt 1 -or $RecordMaxSeconds -gt 900) {
+    throw "RecordMaxSeconds must be in [1, 900] seconds (got $RecordMaxSeconds)"
+}
+if (-not $RecordingDir) { throw "RecordingDir must not be empty" }
 # Fail here rather than letting swarm_flocking.py reject it after the panes open.
 foreach ($bw in $AirlinkBandwidth) {
     if ($bw -notin @('40', '20', '10', '5', '-')) {
@@ -248,7 +266,7 @@ Write-Host ("[dji-flocking] config $Config -> drones=$Drones slow=$Slow gimbal=$
             "planeMode=$PlaneMode planeGain=$PlaneGain planeLeash=$PlaneLeash maxAlt=$MaxAlt " +
             "dObs=$DObs r0Obs=$R0Obs cObs=$CObs " +
             "httpPort=$HttpPort cmdPath=$CmdPathDesc airlink=$AirlinkDesc " +
-            "linkScan=$LinkScan")
+            "linkScan=$LinkScan recordDir=$RecordingDir recordMax=${RecordMaxSeconds}s")
 
 # --- Build the swarm_flocking.py CLI -----------------------------------------
 # Format doubles invariantly so the decimal point survives locales that use a
@@ -323,7 +341,13 @@ if ($VideoMode)              { $AirlinkArg += " --video-mode $VideoMode" }
 # Read-only pre-flight link/interference scan (on by default; forward the opt-out).
 $LinkScanArg = if (-not $LinkScan) { " --no-link-scan" } else { "" }
 
-$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$PlaneArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg$IdentityArg$MinSepArg$DObsArg$R0ObsArg$CObsArg$AirlinkArg$LinkScanArg"
+# GUI clip recording. Single-quoted so an absolute path with spaces survives
+# the double-quoted -Command "..." string the panes are launched with.
+$RecordArg = ""
+if ($RecordingDir -ne 'recordings') { $RecordArg += " --recording-dir '$RecordingDir'" }
+if ($RecordMaxSeconds -ne 120.0)    { $RecordArg += " --record-max-s " + (Inv $RecordMaxSeconds) }
+
+$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$PlaneArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg$IdentityArg$MinSepArg$DObsArg$R0ObsArg$CObsArg$AirlinkArg$LinkScanArg$RecordArg"
 
 # The readController pane sources the conda hook and activates this env
 # before launching the script. Edit if your miniconda lives elsewhere.

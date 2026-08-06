@@ -146,6 +146,16 @@
   #banner .chip.swarm-off { background: rgba(139,148,158,.16); color: var(--muted); }
   #banner .chip.fence-warn { background: rgba(248,81,73,.18); color: #ff938c; border-color: rgba(248,81,73,.45); }
   #banner .chip.joy-bad    { background: rgba(248,81,73,.18); color: #ff938c; border-color: rgba(248,81,73,.45); }
+  /* Clip recording: the armed Record button pulses, because a recording left
+     running is the one control state whose cost (disk) is invisible. */
+  #controls button#btn-record.armed {
+    border-color: #f85149; background: rgba(248,81,73,.22); color: #ff938c;
+    animation: rec-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes rec-pulse { 50% { background: rgba(248,81,73,.05); } }
+  #banner .chip.rec-on  { background: rgba(248,81,73,.18);   color: #ff938c; border-color: rgba(248,81,73,.45); }
+  #banner .chip.rec-fin { background: rgba(255,210,63,.16);  color: #ffd23f; border-color: rgba(255,210,63,.40); }
+  #banner .chip.rec-done{ background: rgba(63,185,80,.18);   color: #7ee787; border-color: rgba(63,185,80,.45); }
   /* Rotation-check chip + per-drone response colors */
   #banner .chip.rot-run  { background: rgba(63,192,255,.16);  color: #7cd6ff; border-color: rgba(63,192,255,.45); }
   #banner .chip.rot-ok   { background: rgba(63,185,80,.18);   color: #7ee787; border-color: rgba(63,185,80,.45); }
@@ -211,6 +221,7 @@
     <span class="chip" id="fence-chip" style="display:none"></span>
     <span class="chip" id="downwash-chip" style="display:none"></span>
     <span class="chip" id="rotcheck-chip" style="display:none"></span>
+    <span class="chip" id="record-chip" style="display:none"></span>
   </div>
 
   <div id="panel">
@@ -229,6 +240,8 @@
             title="Stop swarming — drones hold position (disarms Virtual Stick)">&#9632; Stop swarming</button>
     <button id="btn-rotcheck"
             title="Open-loop actuation check (run while HOLDING, drones well separated): each drone in turn flies a short pulse north then east at its current altitude; the GPS track gives a per-drone rotation/gain verdict (OK / SKEWED / ROTATED / SWAPPED / DEAD). Any verdict other than OK means the drone executes commands in the wrong direction — do NOT start swarming with it.">&#10227; Rotation check</button>
+    <button id="btn-record" style="display:none"
+            title="Record a clip of this flight: one 1080p MP4 per drone, a per-frame index (time / lat / lon / alt / heading / gimbal), and the four flight-data CSVs restricted to the recording window — all in their own folder under the recordings root. Auto-stops at the configured maximum. Independent of swarming: Start/Stop, and the min-separation or geofence failsafes, do not interrupt a recording.">&#9679; Record clip</button>
     <label id="heading-ctl"
            title="Heading control: Manual = joystick yaw steers a shared target heading; Convex hull = drones on the swarm's outer ring face outward (GLOBAL_CONVEXHULL), interior drones hold heading, stick yaw is ignored; Demo stitch = the laterally-middle drone points at the stick-steered heading and each neighbour fans out by the offset per rank, keeping adjacent camera views overlapped for stitching">
       Heading
@@ -775,6 +788,52 @@ function render(data) {
   } else {
     rcChip.style.display = 'none';
   }
+
+  // ----- clip recording (video + the flight data for the window) -----
+  // meta.recording is published every tick by a controller that supports it;
+  // its absence (an older controller, or the joystick_controller feed) hides
+  // the whole control rather than offering a button that does nothing.
+  const recState = meta.recording || null;
+  const recChip = document.getElementById('record-chip');
+  const bRecord = document.getElementById('btn-record');
+  bRecord.style.display = recState ? '' : 'none';
+  if (recState) {
+    const recOn = !!recState.on;
+    const recFin = !!recState.finalizing;
+    bRecord.disabled = !feedLive || recFin;
+    if (Date.now() > recordPendingUntil) {
+      recordOn = recOn;
+      bRecord.classList.toggle('armed', recOn);
+      bRecord.innerHTML = recOn ? '&#9632; Stop recording' : '&#9679; Record clip';
+    }
+    const dropped = Object.values(recState.dropped || {})
+                          .reduce((a, b) => a + b, 0);
+    const last = recState.last || null;
+    recChip.style.display = '';
+    if (recState.error) {
+      // Sticks until the next start: a clip that silently didn't record is
+      // exactly the failure the operator must not discover hours later.
+      recChip.className = 'chip rec-on';
+      recChip.textContent = `REC problem: ${recState.error}`;
+    } else if (recOn) {
+      recChip.className = 'chip rec-on';
+      recChip.textContent = `● REC ${(recState.elapsed || 0).toFixed(1)} s`
+        + ` / ${(recState.max_s || 0).toFixed(0)} s`
+        + (dropped ? ` — ${dropped} frames dropped` : '');
+    } else if (recFin) {
+      recChip.className = 'chip rec-fin';
+      recChip.textContent = 'Saving clip…';
+    } else if (last && last.t_end && (data.server_time - last.t_end) < 20) {
+      recChip.className = 'chip rec-done';
+      recChip.textContent = `Saved ${last.clip} `
+        + `(${(last.duration_s || 0).toFixed(1)} s, ${last.frames} frames)`;
+    } else {
+      recChip.style.display = 'none';
+    }
+  } else {
+    recChip.style.display = 'none';
+  }
+
   // Per-drone data for the cards: live fit while swarming, probe verdicts after.
   const respMap = meta.resp || {};
   const linkMap = meta.link || {};
@@ -904,6 +963,22 @@ async function postCommand(payload) {
 document.getElementById('btn-start').addEventListener('click', () => postCommand({ action: 'start' }));
 document.getElementById('btn-stop').addEventListener('click', () => postCommand({ action: 'stop' }));
 document.getElementById('btn-rotcheck').addEventListener('click', () => postCommand({ action: 'rotation_check' }));
+
+// Clip recording. One button, two actions — recordOn mirrors the controller's
+// meta.recording.on, and the pending window keeps the 200 ms poll from flipping
+// the label back before the 5 Hz meta echo confirms the change. Elapsed time
+// comes from the controller too (no local timer), so there is no browser/
+// controller clock skew to reason about.
+let recordPendingUntil = 0;
+let recordOn = false;
+document.getElementById('btn-record').addEventListener('click', () => {
+  recordPendingUntil = Date.now() + 1500;
+  recordOn = !recordOn;
+  const btn = document.getElementById('btn-record');
+  btn.classList.toggle('armed', recordOn);
+  btn.innerHTML = recordOn ? '&#9632; Stop recording' : '&#9679; Record clip';
+  postCommand({ action: recordOn ? 'record_start' : 'record_stop' });
+});
 
 // Heading mode (manual / convex hull / demo stitch) + point-inwards + stitch
 // offset. The controller owns the live values (meta.heading_mode /

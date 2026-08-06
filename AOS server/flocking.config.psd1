@@ -179,6 +179,27 @@
     # extra ds_wrapper calls. CLI: -ImageStreamPose
     ImageStreamPose = $false
 
+    # --- Clip recording (GUI "Record clip" button) --------------------------
+    # Root folder for recorded CLIPS: a short, operator-triggered section of a
+    # flight saved WITH pictures — one 1080p MP4 per drone, a per-frame index
+    # CSV (time / lat / lon / alt / heading / gimbal), and a copy of the four
+    # flight-data CSVs restricted to the recording window. Each clip gets its
+    # own clip_YYYYMMDD_HHMMSS folder here.
+    #
+    # SEPARATE from the always-on flight log (flight_logs/), which is unchanged
+    # and keeps running throughout. Gitignored. Created on the first Record
+    # press, so a run where the button is never pressed writes nothing.
+    # Relative paths resolve against "AOS server/"; an absolute path (e.g.
+    # 'D:\Flight clips') works and may quote spaces. Keep it on a LOCAL disk —
+    # this writes video for every drone at once. CLI: -RecordingDir
+    RecordingDir = 'recordings'
+
+    # Hard cap on ONE clip in seconds [1, 900]; the controller auto-stops and
+    # finalises the MP4s there, so a forgotten recording cannot fill the disk.
+    # Budget roughly 2-3 MB/s per drone at 1080p (measure on your fleet and
+    # correct this note). CLI: -RecordMaxSeconds
+    RecordMaxSeconds = 120.0
+
     # --- Olfati-Saber flocking tuning (seed values; the GUI can retune live) ---
     # Velocity-matching gain, swarm_flocking.py --c-vm (default 0.0).
     Cvm = 0.0

@@ -303,12 +303,16 @@ class DroneController:
         self._send_meter = _RateMeter()
         self._recv_meter = _RateMeter()
 
-        # Optional frame consumer (set by ImageStreamPublisher): called from
-        # the telemetry thread as frame_sink(data, telem) with the raw wrapper
-        # array so the image bytes it already carries aren't thrown away. The
-        # sink must copy immediately — `data` aliases the wrapper's shared
-        # memory. None = telemetry-only (default).
-        self.frame_sink = None
+        # Optional frame consumers (ImageStreamPublisher, ClipRecorder), added
+        # with add_frame_sink(): each is called from the telemetry thread as
+        # sink(data, telem) with the raw wrapper array so the image bytes it
+        # already carries aren't thrown away. A sink must copy immediately
+        # (`data` aliases the wrapper's shared memory) and must not block.
+        # Empty = telemetry-only (default). A TUPLE, replaced wholesale rather
+        # than mutated, so the telemetry thread's lock-free read always sees a
+        # complete list; the lock only serialises the cold add/remove path.
+        self._frame_sinks = ()
+        self._sink_lock = threading.Lock()
 
         # Optional MqttCommandSender (set by the launch script): when set,
         # commands publish straight to the RC's broker over its persistent
@@ -385,6 +389,25 @@ class DroneController:
         """Measured rate (Hz) at which telemetry is actually being read back."""
         return self._recv_meter.hz()
 
+    def add_frame_sink(self, sink):
+        """Register a frame consumer called as sink(data, telem) on this
+        drone's telemetry thread. Several may be active at once (live stitcher
+        feed + clip recorder); each gets its own call, so each must do its own
+        copy of `data`."""
+        if sink is None:
+            return
+        with self._sink_lock:
+            self._frame_sinks = self._frame_sinks + (sink,)
+
+    def remove_frame_sink(self, sink):
+        """Unregister a previously added frame sink (identity match). Removal is
+        not instantaneous — a sink already executing on the telemetry thread
+        still finishes, so sinks must tolerate one late call after removal."""
+        if sink is None:
+            return
+        with self._sink_lock:
+            self._frame_sinks = tuple(s for s in self._frame_sinks if s is not sink)
+
     def get_image_and_telemetry(self):
         """Get raw image + telemetry data from the drone.
         Returns the full numpy array from ds_wrapper.
@@ -401,13 +424,13 @@ class DroneController:
             self.telemetry = t
             if self.logger:
                 self.logger.log_telemetry(self.drone_id, t)
-            sink = self.frame_sink
-            if sink is not None:
+            # One try/except PER sink: frame publishing is non-critical, and a
+            # failing sink must not break the telemetry loop or starve the
+            # other sinks.
+            for sink in self._frame_sinks:
                 try:
                     sink(data, t)
                 except Exception:
-                    # Frame publishing is non-critical; never let it break
-                    # the telemetry loop.
                     pass
         return t
 

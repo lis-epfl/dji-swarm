@@ -140,6 +140,10 @@ from olfati_saber import (
     save_shapes,
 )
 from image_stream_feed import ImageStreamPublisher
+from clip_recorder import (
+    ClipRecorder, DEFAULT_RECORDING_DIR, DEFAULT_MAX_SECONDS,
+    MAX_SECONDS_MIN, MAX_SECONDS_MAX,
+)
 from dji_camera_pose import CameraPoseSolver
 from mqtt_command_sender import MqttCommandSender
 from response_monitor import ResponseMonitor
@@ -904,6 +908,18 @@ def command_listener(swarming, meta, host, port, shapes_path=None):
                 if meta is not None:
                     meta["rotation_check_req"] = time.time()
                     print("[gui] rotation check requested")
+            elif action in ("record_start", "record_stop"):
+                # GUI Record button: clip recording (video + the flight data
+                # for the window). Only a request marker — run() owns the
+                # transition, because start() creates folders, spawns encoder
+                # threads and installs frame sinks, and because keeping
+                # start/stop/auto-stop on ONE thread makes them unable to
+                # interleave. Replace, never mutate.
+                if meta is not None:
+                    meta["record_req"] = {"cmd": action[len("record_"):],
+                                          "t": time.time()}
+                    print(f"[gui] clip recording {action[len('record_'):]} "
+                          f"requested")
             elif action == "add_obstacle":
                 # GUI map drag: a lat/lon-axis-aligned rectangle given by two
                 # opposite corners. Validation/normalization is shared with
@@ -976,7 +992,7 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         logger=None, speed_scale=1.0, meta=None, heading_ctrl=None,
         stitch_ctrl=None, cmd_sender=None, identity_check=True,
         min_separation=DEFAULT_MIN_SEPARATION_M, avoid=None,
-        plane_ctrl=None, max_alt=MAX_ALT_M):
+        plane_ctrl=None, max_alt=MAX_ALT_M, recorder=None):
     print("\n--- Olfati-Saber Swarm Mode ---")
     print(f"  Drones: {sorted(swarm.drones.keys())}")
     print(f"  c_vm={olfati.c_vm}  r0_coh={olfati.r0_coh}  scale={olfati.scale}")
@@ -1046,6 +1062,9 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
     # ticked from the held branch below.
     probe = None
     last_probe_req = (meta or {}).get("rotation_check_req")
+    # GUI clip recorder (video + windowed flight data); the marker's timestamp
+    # is what dedupes it, so a repeated UDP datagram is a no-op.
+    last_record_req = ((meta or {}).get("record_req") or {}).get("t")
 
     while True:
         now = time.time()
@@ -1219,6 +1238,32 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             if js is not None:
                 meta["d_ref_m"] = round(
                     d_ref_from_ax(js.angular_x, scale=olfati.scale) * olfati.scale, 2)
+
+        # GUI Record button + the clip duration cap. Deliberately OUTSIDE the
+        # swarming gate below and allowed in --dry-run: recording is read-only,
+        # it must work while held (the operator lines the shot up before Start),
+        # and a Stop — including a min-separation or geofence auto-STOP — must
+        # NOT cut the clip. A clip spanning an incident, with the DISABLE_VS
+        # visible in its own drone_commands.csv, is exactly the artifact worth
+        # having.
+        if recorder is not None:
+            if meta is not None:
+                req = meta.get("record_req") or {}
+                if req.get("t") is not None and req["t"] != last_record_req:
+                    last_record_req = req["t"]
+                    if req.get("cmd") == "start":
+                        if recorder.start() and logger:
+                            logger.log_drone_command(
+                                0, "EVENT",
+                                cmd=f"CLIP_START:{recorder.status()['clip']}")
+                    elif recorder.stop("operator") and logger:
+                        logger.log_drone_command(0, "EVENT", cmd="CLIP_STOP")
+            if recorder.poll():
+                print("[clip] duration limit reached — saving")
+                if recorder.stop("max_duration") and logger:
+                    logger.log_drone_command(0, "EVENT", cmd="CLIP_STOP_MAX")
+            if meta is not None:
+                meta["recording"] = recorder.status()
 
         # GUI gimbal slider: apply the shared pitch target to every drone
         # whenever it changes. set_gimbal only updates the send-loop's cached
@@ -2095,6 +2140,14 @@ def main():
                     help="Disable background flight-data logging to flight_logs/")
     ap.add_argument("--log-dir", default="flight_logs",
                     help="Directory for flight-log session folders (default flight_logs)")
+    ap.add_argument("--recording-dir", default=DEFAULT_RECORDING_DIR,
+                    help=f"Root for GUI-triggered clip recordings — per-drone "
+                         f"1080p MP4 + frame index + the flight data for the "
+                         f"window (default {DEFAULT_RECORDING_DIR}/, separate "
+                         f"from --log-dir)")
+    ap.add_argument("--record-max-s", type=float, default=DEFAULT_MAX_SECONDS,
+                    help=f"Hard cap on one clip in seconds; recording "
+                         f"auto-stops there (default {DEFAULT_MAX_SECONDS:.0f})")
     args = ap.parse_args()
 
     if args.drones < 1:
@@ -2123,6 +2176,9 @@ def main():
         ap.error("--plane-leash must be > 0")
     if args.max_alt <= MIN_ALT_M:
         ap.error(f"--max-alt must be > the {MIN_ALT_M:.0f} m floor")
+    if not (MAX_SECONDS_MIN <= args.record_max_s <= MAX_SECONDS_MAX):
+        ap.error(f"--record-max-s must be in "
+                 f"[{MAX_SECONDS_MIN:.0f}, {MAX_SECONDS_MAX:.0f}] seconds")
 
     def per_drone_list(raw, flag):
         """Expand a comma list to one token per drone (a single token fans
@@ -2243,6 +2299,8 @@ def main():
             "plane_leash": args.plane_leash, "max_alt": args.max_alt,
             "d_obs": args.d_obs, "r0_obs": args.r0_obs, "c_obs": args.c_obs,
             "shapes_file": args.shapes_file,
+            "recording_dir": args.recording_dir,
+            "record_max_s": args.record_max_s,
             "airlink_bands": airlink_bands,
             "airlink_bandwidth": airlink_bw,
             "video_mode": video_mode,
@@ -2370,7 +2428,7 @@ def main():
               "(slot) for commands and telemetry by construction")
 
     # Optional in-process image streaming to the stitcher pipeline. Fed by the
-    # telemetry threads' existing fetches (via DroneController.frame_sink), so
+    # telemetry threads' existing fetches (a DroneController frame sink), so
     # it adds no ds_wrapper calls and cannot slow the cmd/telem rates.
     img_stream = None
     if args.image_stream or args.image_stream_pose:
@@ -2384,6 +2442,28 @@ def main():
         print(f"  Image stream -> DroneFeedSharedMemory "
               f"({args.drones} x 800x450, <=20 Hz per drone"
               f"{', with camera pose' if pose_solver is not None else ''})")
+
+    # GUI-triggered clip recording. Always available (the button is in the
+    # controls bar); constructing it touches no disk and starts no threads, so
+    # a run where Record is never pressed costs nothing. Like the image stream
+    # it rides the telemetry threads' existing fetches — both can be active at
+    # once now that frame sinks are a list.
+    recording_dir = args.recording_dir
+    if not os.path.isabs(recording_dir):
+        recording_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), recording_dir)
+    recorder = ClipRecorder(swarm.drones, hw_decode, base_dir=recording_dir,
+                            max_seconds=args.record_max_s, logger=logger,
+                            meta={"script": "swarm_flocking",
+                                  "drones": args.drones,
+                                  "cmd_mode": cmd_mode,
+                                  "drone_ips": resolved_ips,
+                                  "dry_run": args.dry_run,
+                                  "slow": args.slow,
+                                  "flight_log": (logger.session_dir
+                                                 if logger else None)})
+    print(f"  Clip recording -> {recording_dir} "
+          f"(GUI Record button, max {args.record_max_s:.0f} s per clip)")
 
     # angular.x is repurposed for d_ref in swarm mode, so the gimbal would
     # otherwise stay at the DroneController default (-90°). Park it at the
@@ -2518,7 +2598,7 @@ def main():
             stitch_ctrl=stitch_ctrl, cmd_sender=cmd_sender,
             identity_check=identity_check,
             min_separation=args.min_separation, avoid=avoid,
-            plane_ctrl=plane_ctrl, max_alt=args.max_alt)
+            plane_ctrl=plane_ctrl, max_alt=args.max_alt, recorder=recorder)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
@@ -2526,6 +2606,10 @@ def main():
             gui_feed.stop()
         if img_stream is not None:
             img_stream.stop()
+        # BEFORE logger.close(): this finalises any clip in progress (an MP4
+        # whose writer is never released has no moov atom and won't play) and
+        # detaches + closes the flight-log mirror it owns.
+        recorder.close()
         receiver.stop()
         swarm.stop_all()
         if cmd_sender is not None:

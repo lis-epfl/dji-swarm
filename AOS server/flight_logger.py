@@ -26,6 +26,21 @@ Design notes
   and counted rather than stalling a control loop.
 * Python 3.7 compatible.
 
+Mirrors (windowed copies)
+-------------------------
+Setting `logger.mirror = <another FlightLogger>` tees every row into that second
+logger for as long as it is attached, so a shorter-lived session can capture the
+same four streams restricted to its own window. clip_recorder.ClipRecorder uses
+this to put the flight data for a recorded clip next to the clip's video.
+
+The mirror receives the row **already stamped by the primary**, so a given event
+carries byte-identical t_epoch/t_iso in both sessions and rows can be joined
+across them. The same dict object is handed to both loggers — safe because
+DictWriter.writerow only reads it — so the tee costs one attribute load on the
+control thread and allocates nothing. Attach/detach is a single assignment
+(GIL-atomic); rows in flight at that instant land in one logger or both, never
+half-written.
+
 Usage (from a launch script):
 
     from flight_logger import FlightLogger
@@ -100,21 +115,33 @@ _SENTINEL = object()
 class FlightLogger:
     """Buffered, thread-safe flight-data logger writing CSV streams to disk."""
 
-    def __init__(self, base_dir="flight_logs", meta=None):
+    def __init__(self, base_dir="flight_logs", meta=None, session_name=None):
         """
         Args:
             base_dir: parent directory for session folders (created if absent).
             meta:     JSON-serializable dict describing the run (script name,
                       args, ...). Stored in session.json alongside a column
                       legend and the start time.
+            session_name: subfolder name inside base_dir. None = the usual
+                      "flight_YYYYMMDD_HHMMSS". Pass "" to write the CSVs
+                      straight into base_dir — what a mirror wants, so a clip's
+                      flight data sits beside its video instead of in a nested
+                      flight_* folder.
         """
-        self.session_name = "flight_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.session_dir = os.path.join(base_dir, self.session_name)
+        if session_name is None:
+            session_name = "flight_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_name = session_name
+        self.session_dir = os.path.join(base_dir, session_name) if session_name else base_dir
         os.makedirs(self.session_dir, exist_ok=True)
 
         self._queue = queue.Queue(maxsize=_QUEUE_MAXSIZE)
         self.dropped = 0          # rows dropped because the queue was full
         self._written = 0
+
+        # Optional second FlightLogger tee'd from _enqueue (see the module
+        # docstring). Plain attribute: assignment is GIL-atomic, so attaching or
+        # detaching a mirror never needs to stop the control threads.
+        self.mirror = None
 
         # Open one file + DictWriter per stream and write headers immediately.
         self._files = {}
@@ -247,11 +274,22 @@ class FlightLogger:
     # ------------------------------------------------------------------ #
 
     def _enqueue(self, stream, row):
-        """Stamp the row with the current time and hand it to the writer thread.
-        Never blocks: if the queue is full the row is dropped and counted."""
-        now = time.time()
-        row['t_epoch'] = now
+        """Stamp the row with the current time and hand it to the writer thread
+        (and to the mirror, if one is attached).
+        Never blocks: if a queue is full the row is dropped and counted."""
+        row['t_epoch'] = time.time()
         row['t_iso'] = datetime.now().isoformat(timespec='milliseconds')
+        self._accept(stream, row)
+        # One atomic attribute read, so no lock: the mirror is either fully
+        # attached or not attached for this row. Deliberately passes the SAME
+        # dict — writerow only reads it — so both sessions record identical
+        # timestamps and the control thread allocates nothing extra.
+        mirror = self.mirror
+        if mirror is not None:
+            mirror._accept(stream, row)
+
+    def _accept(self, stream, row):
+        """Queue an already-stamped row for this logger's writer thread."""
         try:
             self._queue.put_nowait((stream, row))
         except queue.Full:
@@ -344,14 +382,44 @@ if __name__ == "__main__":
         s1: int = 0
         s2: int = 0
 
+    def _rows(path):
+        with open(path, newline='') as f:
+            return list(csv.DictReader(f))
+
     log = FlightLogger(meta={"script": "flight_logger", "test": True})
-    for i in range(5):
-        log.log_user_command(_FakeState(), source="udp")
-        log.log_drone_command(1, "VS", 0.1, -0.2, 90.0, 4.0, -10.0, 0.0,
-                              cmd="VS:0.10:-0.20:90.00:4.00:-10.00:0.00")
-        log.log_telemetry(1, {f: float(i) for f in TELEMETRY_FIELDS})
-        log.log_swarm_debug(1, 0.1, -0.2, 0.01, 0.02, 0.11, -0.18, 0.5, 2)
-        time.sleep(0.05)
+
+    def _burst(n):
+        for i in range(n):
+            log.log_user_command(_FakeState(), source="udp")
+            log.log_drone_command(1, "VS", 0.1, -0.2, 90.0, 4.0, -10.0, 0.0,
+                                  cmd="VS:0.10:-0.20:90.00:4.00:-10.00:0.00")
+            log.log_telemetry(1, {f: float(i) for f in TELEMETRY_FIELDS})
+            log.log_swarm_debug(1, 0.1, -0.2, 0.01, 0.02, 0.11, -0.18, 0.5, 2)
+            time.sleep(0.05)
+
+    _burst(2)                                  # before the mirror
+    mirror = FlightLogger(base_dir=os.path.join(log.session_dir, "mirror_test"),
+                          meta={"script": "flight_logger", "mirror": True},
+                          session_name="")     # CSVs straight into base_dir
+    log.mirror = mirror
+    _burst(5)                                  # windowed: both loggers
+    log.mirror = None
+    mirror.close()
+    _burst(2)                                  # after: primary only
     log.log_drone_command(1, "EVENT", cmd="ENABLE_VS")
     log.close()
+
+    # The mirror must hold exactly the windowed rows, with the timestamps the
+    # primary stamped — that identity is what lets a clip's rows be joined back
+    # to the full flight log.
+    for stream, (fname, _cols) in _STREAMS.items():
+        main_rows = _rows(os.path.join(log.session_dir, fname))
+        mir_rows = _rows(os.path.join(mirror.session_dir, fname))
+        assert len(mir_rows) == 5, (stream, len(mir_rows))
+        window = [r for r in main_rows if r['t_epoch'] in
+                  {m['t_epoch'] for m in mir_rows}]
+        assert len(window) == 5, (stream, len(window))
+        assert [r['t_iso'] for r in window] == [m['t_iso'] for m in mir_rows], stream
+    assert os.path.exists(os.path.join(mirror.session_dir, 'session.json'))
+    print("Mirror check OK — 5 windowed rows per stream, timestamps identical")
     print("Smoke test complete — inspect:", log.session_dir)

@@ -244,8 +244,8 @@ def make_handler(state, cmd_sock=None, cmd_addr=None, shapes=None):
 
         def do_POST(self):
             # The only POST route: swarm controls (Start/Stop buttons, gimbal
-            # pitch slider, heading mode + point-inwards toggles, obstacle/
-            # geofence edits drawn on the map). We forward
+            # pitch slider, heading mode + point-inwards toggles, clip
+            # recording, obstacle/geofence edits drawn on the map). We forward
             # the action to the flight controller
             # (swarm_flocking.py) as a local UDP datagram on the command port.
             # This server never touches ds_wrapper.
@@ -315,6 +315,14 @@ def make_handler(state, cmd_sock=None, cmd_addr=None, shapes=None):
                 # controller runs it only while swarming is held and reports
                 # progress/results back via meta.rotation_check.
                 out = {"action": "rotation_check"}
+            elif action in ("record_start", "record_stop"):
+                # Clip recording (video + the flight data for the window).
+                # Zero-arg on purpose: the duration cap lives on the
+                # controller's CLI, so there is nothing to validate and this
+                # server stays free of a clip_recorder import — that module
+                # needs cv2, and the GUI must keep running unprivileged on any
+                # plain Python >= 3.7.
+                out = {"action": action}
             elif action == "add_obstacle":
                 # Rectangular virtual obstacle: two opposite corners drawn on
                 # the map. Applied to the GUI's own store (validated + saved

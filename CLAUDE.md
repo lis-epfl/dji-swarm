@@ -150,7 +150,9 @@ no video.
     plus **Alt cmd** / **Off plane** rows while a vertical-plane wall is up). The controls
     bar owns the live runtime settings (heading mode, stitch offset, gimbal, obstacles/
     geofence, and the **Vertical plane** toggle + gain — `meta["plane_mode"]`/
-    `meta["plane_gain"]`, with the controller free to refuse the toggle and echo it back off).
+    `meta["plane_gain"]`, with the controller free to refuse the toggle and echo it back off)
+    plus the **Record clip** button and its REC chip (`meta["recording"]`, see
+    `clip_recorder.py`; the button hides itself if the controller doesn't publish that key).
     **Does NOT import `ds_wrapper`** — it
     only LISTENS on UDP :5099 for telemetry pushed by a running controller (so it runs
     unprivileged, in its own terminal, on any Python ≥3.7; it does import the pure
@@ -167,7 +169,7 @@ no video.
     live frame (800×450 BGR + heading) into the `DroneFeedSharedMemory` mapping read by
     the Unity DJI scene (`ImageSharing.cs`, which feeds the stitcher). **No `ds_wrapper` import
     and zero extra wrapper calls** — it consumes the image bytes the telemetry threads
-    already fetch (via `DroneController.frame_sink`), copies them into a latest-wins
+    already fetch (via `DroneController.add_frame_sink`), copies them into a latest-wins
     mailbox, and does the convert/resize/handshake on per-drone worker threads so it
     can never slow the cmd/telem rates. (In real-drone mode the Unity component's
     `enableImageWriting` must be off — its writer would fight this one.)
@@ -180,6 +182,28 @@ no video.
     `[PLANAR] unavailable: …` line and falls back to the individual feeds; the symptom is a
     blank panorama, not a crash. Use `STABSTITCH` here. Making `PLANAR` work with real
     drones is not a wiring change — it needs a camera-pose source that does not exist yet.
+  - `clip_recorder.py` — `ClipRecorder`, embedded by `swarm_flocking.py`: the GUI's
+    **Record clip** button saves a short section of a flight WITH pictures — one
+    1080p MP4 per drone plus a per-frame index CSV (`t_epoch`/lat/lon/alt/heading/
+    gimbal), and the flight data for exactly that window, in
+    `recordings/clip_YYYYMMDD_HHMMSS/` (`--recording-dir`/`RecordingDir`, gitignored,
+    **separate from `flight_logs/`**, which is untouched and keeps running). Auto-stops
+    at `--record-max-s`/`RecordMaxSeconds` (default 120 s) so a forgotten recording can't
+    fill the disk. Like the image stream it adds **zero `ds_wrapper` calls** — it registers
+    another `DroneController.add_frame_sink()` consumer (frame sinks are now a **list**, so
+    `image_stream_feed.py` no longer owns the hook exclusively and both can run at once),
+    does one ~3 MB copy on the telemetry thread onto a 4-deep bounded queue, and encodes on
+    per-drone worker threads. The windowed flight data comes from the `FlightLogger` mirror
+    tee (`logger.mirror`, see `flight_logger.py`): a second logger rooted in the clip folder
+    receives every row **already stamped by the primary**, so clip rows are byte-identical
+    to their `flight_logs/` counterparts and join across the two. **`drone*_frames.csv`
+    `t_epoch` is the authoritative timebase, not the MP4** — see the
+    [video-rate gotcha](#critical-gotchas). GUI state rides on `meta["recording"]`
+    (`{on, finalizing, elapsed, remaining, frames, dropped, last, …}`); the button hides
+    itself when a controller doesn't publish it. Recording is deliberately **independent of
+    swarming**: a Stop, a min-separation auto-STOP or a geofence DISABLE_VS does not cut the
+    clip, and it works in `--dry-run`. No `ds_wrapper` import; `python clip_recorder.py`
+    runs a self-check that records a synthetic 2-drone fleet through a full auto-stop cycle.
   - `mqtt_command_sender.py` — `MqttCommandSender`, used by `swarm_flocking.py` when
     `DroneIPs`/`--drone-ips` is set: one **persistent** paho-mqtt connection per RC broker
     (`tcp://<rc-ip>:1883`), publishing the command strings directly (the app's Moquette
@@ -449,7 +473,13 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   20 Hz fetch loop so nothing starves, but standardize the camera settings if the stitcher
   needs uniform frame ages. (The live stream codec is H.265 end-to-end regardless of the
   camera's recording-codec setting — the server's decoder options are `hevc_cuvid`/`hevc`
-  only.) Stale-command handling matters — see the UDP staleness window in
+  only.) This is also why **a recorded clip's MP4 timing is only nominal**:
+  `cv2.VideoWriter` takes one constant header rate and has no per-frame timestamp input, so
+  `clip_recorder.py` writes a 20 fps header (the fetch rate) and records the *measured* rate
+  in the clip's `session.json`. Anything that needs true frame times must join
+  `frame` → `t_epoch` through `drone*_frames.csv` — frames are never duplicated or dropped
+  to force a constant rate, because that would destroy the frame↔telemetry correspondence.
+  Stale-command handling matters — see the UDP staleness window in
   `udp_joystick_receiver.py`.
 - **The `.ps1` launchers are the real entry points — keep them in sync.** The operator does
   not run `python …` by hand; they run `.\dji-joystick.ps1` / `.\dji-flocking.ps1` /
@@ -476,7 +506,7 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 | Launcher | Starts | Params → script flags |
 | --- | --- | --- |
 | `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
-| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-DemoStitch`→`--heading demostitch` / `-StitchOffset`→`--stitch-offset` (demostitch fan offset deg/rank, config key `StitchOffset`), `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-DObs`→`--d-obs` / `-R0Obs`→`--r0-obs` / `-CObs`→`--c-obs` (virtual-obstacle/geofence repulsion cutoff, detection radius [physical m] and gain; config keys `DObs`/`R0Obs`/`CObs`; the shapes themselves are drawn in the GUI and persist in `shapes.json`), `-AirlinkBands`→`--airlink-bands` / `-AirlinkBandwidth`→`--airlink-bandwidth` / `-VideoMode`→`--video-mode` (per-drone RF band + channel bandwidth in MHz `40\|20\|10\|5` + camera-stream cap, sent to each RC as an `AIRLINK:` one-shot at startup; config keys `AirlinkBands`/`AirlinkBandwidth`/`VideoMode`; empty = send nothing, which leaves whatever was last applied — **not** a reset, see the [AirLink gotcha](#critical-gotchas)), `-NoLinkScan`→`--no-link-scan` (skip the read-only pre-flight link/interference scan; config key `LinkScan`), `-PlaneMode`→`--plane-mode` / `-PlaneGain`→`--plane-gain` / `-PlaneLeash`→`--plane-leash` / `-MaxAlt`→`--max-alt` (vertical-plane "wall" swarming seed, its restoring gain [m/s per m of out-of-plane offset] and vertical leash, plus the ceiling every commanded altitude is clamped to; config keys `PlaneMode`/`PlaneGain`/`PlaneLeash`/`MaxAlt`; the toggle and gain are live in the GUI — this only seeds them), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
+| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-DemoStitch`→`--heading demostitch` / `-StitchOffset`→`--stitch-offset` (demostitch fan offset deg/rank, config key `StitchOffset`), `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-DObs`→`--d-obs` / `-R0Obs`→`--r0-obs` / `-CObs`→`--c-obs` (virtual-obstacle/geofence repulsion cutoff, detection radius [physical m] and gain; config keys `DObs`/`R0Obs`/`CObs`; the shapes themselves are drawn in the GUI and persist in `shapes.json`), `-AirlinkBands`→`--airlink-bands` / `-AirlinkBandwidth`→`--airlink-bandwidth` / `-VideoMode`→`--video-mode` (per-drone RF band + channel bandwidth in MHz `40\|20\|10\|5` + camera-stream cap, sent to each RC as an `AIRLINK:` one-shot at startup; config keys `AirlinkBands`/`AirlinkBandwidth`/`VideoMode`; empty = send nothing, which leaves whatever was last applied — **not** a reset, see the [AirLink gotcha](#critical-gotchas)), `-NoLinkScan`→`--no-link-scan` (skip the read-only pre-flight link/interference scan; config key `LinkScan`), `-RecordingDir`→`--recording-dir` / `-RecordMaxSeconds`→`--record-max-s` (root folder and per-clip duration cap for the GUI's **Record clip** button — per-drone 1080p MP4 + frame index + the flight-data CSVs for that window; config keys `RecordingDir`/`RecordMaxSeconds`; separate from `--log-dir` and gitignored), `-PlaneMode`→`--plane-mode` / `-PlaneGain`→`--plane-gain` / `-PlaneLeash`→`--plane-leash` / `-MaxAlt`→`--max-alt` (vertical-plane "wall" swarming seed, its restoring gain [m/s per m of out-of-plane offset] and vertical leash, plus the ceiling every commanded altitude is clamped to; config keys `PlaneMode`/`PlaneGain`/`PlaneLeash`/`MaxAlt`; the toggle and gain are live in the GUI — this only seeds them), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
 | `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
 
 `dji-flocking.ps1`'s launch settings live in **`AOS server/flocking.config.psd1`** (a
@@ -550,7 +580,8 @@ lives at `github.com/lis-epfl/lis-swarm-app`. The root has no remote configured 
 
 The root `.gitignore` excludes build output (`build/`, `.gradle/`, `x64/`, NuGet `packages/`),
 regenerable C++ binaries (`*.exe`, `*.lib`, `*.a`, `*.pyd`, `python37.dll` — rebuild via
-`AOS server/README.md`), heap dumps (`*.hprof`), `__pycache__/`, and the bundled WebView2
-runtime. The prebuilt Android `.so` libs and assets under `lis-swarm-app/app/src/main/`
+`AOS server/README.md`), heap dumps (`*.hprof`), `__pycache__/`, the bundled WebView2
+runtime, and the field-session artifacts (`flight_logs/`, `recordings/`, `saved_streams/`,
+`shapes.json`). The prebuilt Android `.so` libs and assets under `lis-swarm-app/app/src/main/`
 **are** committed (no source exists for them); the largest, `libdjisdk_jni.so` (~55 MB),
 trips GitHub's >50 MB warning but is under the 100 MB hard limit.

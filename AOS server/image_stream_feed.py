@@ -14,9 +14,10 @@ the flight controller's command/telemetry loops (they collapsed to ~1 Hz).
 Instead, this publisher is EMBEDDED in the controller (swarm_flocking.py
 --image-stream) and adds ZERO ds_wrapper calls: the controller's telemetry
 threads already fetch the full image+telemetry array at 20 Hz and discard the
-pixels. Each DroneController exposes a `frame_sink` hook; ours copies the raw
-YUV slice out of the (aliased, soon-overwritten) wrapper buffer into a
-latest-wins mailbox, and a per-drone worker thread does the heavy lifting
+pixels. Each DroneController takes frame consumers via add_frame_sink() (there
+may be others — clip_recorder.py registers one too); ours copies the raw YUV
+slice out of the (aliased, soon-overwritten) wrapper buffer into a latest-wins
+mailbox, and a per-drone worker thread does the heavy lifting
 (YUV->BGR convert, resize, shared-memory handshake) off the control path.
 The cv2 calls release the GIL, and imageSharingUtil.write_memory's consumer
 handshake (flag polling + pacing, 0.04 s here) can block for up to ~1 s,
@@ -75,8 +76,9 @@ class ImageStreamPublisher:
         """
         Args:
             drones: {drone_id (1-based int): DroneController} — each controller
-                    must expose a settable `frame_sink` attribute called by its
-                    telemetry thread as frame_sink(data, telem).
+                    must expose add_frame_sink()/remove_frame_sink(), which
+                    register a callable its telemetry thread invokes as
+                    sink(data, telem).
             hw_decode: ds_wrapper.isHWDecoderEnabled() result — 1 selects the
                     NV12 (hardware) colour conversion, anything else the
                     planar YUV420 (software) one, matching image_stream.py.
@@ -129,6 +131,10 @@ class ImageStreamPublisher:
         self._latest = {}
         self._locks = {did: threading.Lock() for did in self._drones}
         self._events = {did: threading.Event() for did in self._drones}
+        # The sink object registered per drone, kept so stop() can unregister
+        # the IDENTICAL object. Never clear a controller's sinks wholesale —
+        # other consumers (clip_recorder) register their own.
+        self._sinks = {}
         self._running = False
         self._threads = []
 
@@ -195,7 +201,9 @@ class ImageStreamPublisher:
             return
         self._running = True
         for did, drone in self._drones.items():
-            drone.frame_sink = self._make_sink(did)
+            sink = self._make_sink(did)
+            self._sinks[did] = sink
+            drone.add_frame_sink(sink)
             t = threading.Thread(target=self._worker, args=(did,),
                                  daemon=True, name="ImgStream_{}".format(did))
             self._threads.append(t)
@@ -203,8 +211,8 @@ class ImageStreamPublisher:
 
     def stop(self):
         self._running = False
-        for drone in self._drones.values():
-            drone.frame_sink = None
+        for did, drone in self._drones.items():
+            drone.remove_frame_sink(self._sinks.pop(did, None))
         for event in self._events.values():
             event.set()   # wake workers so they see _running == False
         for t in self._threads:
