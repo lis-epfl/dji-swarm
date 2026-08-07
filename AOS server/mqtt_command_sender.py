@@ -187,6 +187,23 @@ class MqttCommandSender:
             return None
         return dict(vals)
 
+    @staticmethod
+    def parse_scan(scan):
+        """Split a LINKSCAN: payload into {field: value}.
+
+        Values are the app's raw strings — SDK enum names like
+        BANDWIDTH_40MHZ, or "?" for a key the firmware refused. Returns {} for
+        None/garbage so callers can treat "no scan" and "unparseable" alike.
+        """
+        if not scan or not scan.startswith("LINKSCAN:"):
+            return {}
+        out = {}
+        for field in scan[len("LINKSCAN:"):].split(":"):
+            key, sep, val = field.partition("=")
+            if sep:
+                out[key.strip()] = val.strip()
+        return out
+
     def scan_of(self, drone_id):
         """Last raw LINKSCAN: string for drone_id, or None. Not age-limited —
         a scan is an explicit one-shot and stays valid until re-requested."""

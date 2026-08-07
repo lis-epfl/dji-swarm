@@ -328,6 +328,11 @@ LINKSCAN:band=..:mode=..:bw=..:freq=..:sq=..:down=..:up=..:if=<from>-<to>@<rssi>
 `LINK:` is served purely from the app's `KeyManager.listen()` cache (**no** `getValue()`
 round-trips — that polling is what got removed from `DroneSwarmStreamData`); `LINKSCAN:` is
 on-demand only and does five one-shot reads, with `?` for any key the firmware locks.
+**On the Mini 3 Pro `if=` is always `?`** — `KeyFrequencyInterference` is not served by this
+airframe's firmware (bench-verified 2026-08-07), so there is no on-aircraft band scan to be
+had; `band`/`mode`/`bw`/`freq`/`sq`/`down`/`up` all return real values. A scan taken right
+after an `AIRLINK:` waits `AIRLINK_SETTLE_S` first and then flags any requested value the
+aircraft did not adopt — see the [AirLink read-back gotcha](#critical-gotchas).
 Quality scales are 0-100, DJI's reading: **<40 poor, 40-60 normal, >60 good**. Available
 only on the direct MQTT command path (the server path has no return channel).
 Surfaced as `meta["link"]` → the GUI's per-drone **RF link** row, logged to
@@ -408,6 +413,14 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   (`AirlinkBands = @('DUAL')` is the DJI default). This is the first thing to check when
   the link "got worse" after an AirLink change. `LINKDIAG`/the startup link scan reports
   what is actually in force per RC.
+- **An AirLink set is ASYNC — never read it back immediately.**
+  `SwarmActivity.applyAirlinkSettings` fires `KeyManager.setValue` and returns; a bandwidth
+  change renegotiates the link and takes seconds. A `LINKDIAG` sent straight after the
+  `AIRLINK:` therefore reports the value from *before* the set, which looks exactly like a
+  rejection (this bit during the 2026-08-07 bench run). `swarm_flocking.py` sleeps
+  `AIRLINK_SETTLE_S` between the two and then compares requested vs reported, printing
+  `NOT APPLIED` on a mismatch. The RC status line is the authoritative accept/reject signal;
+  the scan is the independent second opinion, read through a different key path.
 - **No manual channel selection on the Mini 3 Pro.** DJI does not support manual
   image-transmission channel selection on this airframe — the RC always picks the channel.
   The `AIRLINK:` protocol therefore has no channel field (the old `AirlinkChannels` config

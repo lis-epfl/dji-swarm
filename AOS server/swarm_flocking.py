@@ -209,6 +209,23 @@ IDCHECK_TIMEOUT_S = 2.0
 # may leave hanging until it times out on its side.
 LINK_SCAN_TIMEOUT_S = 5.0
 
+# How long to let an AIRLINK: one-shot settle before the link scan reads the
+# radio back. SwarmActivity.applyAirlinkSettings fires an ASYNC setValue and
+# returns, so without this wait the scan races the set and reports the OLD
+# value — which reads exactly like a rejection. A bandwidth change in
+# particular renegotiates the link, so it is not instant. Only paid when an
+# AIRLINK was actually sent.
+AIRLINK_SETTLE_S = 3.0
+
+# SDK enum names the app reports in a LINKSCAN, keyed by the token we sent, so
+# the scan can say "you asked for 10 MHz and the aircraft is on 40".
+_AIRLINK_EXPECTED = {
+    "band": {"2G4": "BAND_2_DOT_4G", "5G8": "BAND_5_DOT_8G",
+             "DUAL": "BAND_DUAL"},
+    "bw": {"40": "BANDWIDTH_40MHZ", "20": "BANDWIDTH_20MHZ",
+           "10": "BANDWIDTH_10MHZ", "5": "BANDWIDTH_5MHZ"},
+}
+
 # ---- Rotation check (open-loop actuation probe; GUI "Rotation check") ----
 # One drone at a time: enable VS, fly a short pulse NORTH then EAST at the
 # drone's current altitude, measure the GPS displacement of each pulse, and
@@ -2335,13 +2352,17 @@ def main():
     # Fields are named, so only what was configured is sent — an RC running an
     # older APK reports an unknown field instead of silently applying a value
     # to whatever used to occupy that position.
+    airlink_sent = {}    # drone id -> {"band": tok, "bw": tok} actually sent
     if (airlink_bands or airlink_bw or video_mode) and not args.dry_run:
         for did in sorted(swarm.drones):
             fields = []
+            asked = {}
             if airlink_bands and airlink_bands[did - 1] != "-":
                 fields.append("band=" + airlink_bands[did - 1])
+                asked["band"] = airlink_bands[did - 1]
             if airlink_bw and airlink_bw[did - 1] != "-":
                 fields.append("bw=" + airlink_bw[did - 1])
+                asked["bw"] = airlink_bw[did - 1]
             if video_mode:
                 fields.append("video=" + video_mode)
             if not fields:
@@ -2349,6 +2370,8 @@ def main():
             cmd = "AIRLINK:" + ":".join(fields)
             print(f"  AirLink setup -> drone {did}: {cmd}", flush=True)
             swarm.drones[did].send_command(cmd)
+            if asked:
+                airlink_sent[did] = asked
 
     # Pre-flight link scan. DJI's auto channel selection is per-link and has no
     # view of the fleet, so the useful question before flying is what the
@@ -2357,6 +2380,13 @@ def main():
     # read-only, and only available on the direct MQTT path (the app answers on
     # its own broker, which is what cmd_sender is subscribed to).
     if cmd_sender is not None and not args.dry_run and not args.no_link_scan:
+        if airlink_sent:
+            # See AIRLINK_SETTLE_S: without this the scan reads back the value
+            # from BEFORE the one-shot applied, which is indistinguishable from
+            # the aircraft rejecting it.
+            print(f"  Letting AirLink settle {AIRLINK_SETTLE_S:.0f}s before "
+                  f"reading it back...", flush=True)
+            time.sleep(AIRLINK_SETTLE_S)
         print("  Requesting link scan from each RC (read-only)...", flush=True)
         cmd_sender.clear_scans()
         for did in sorted(swarm.drones):
@@ -2378,8 +2408,27 @@ def main():
             if scan is None:
                 print(f"    drone {did}: no answer "
                       f"(older APK, or RC not connected yet)", flush=True)
-            else:
-                print(f"    drone {did}: {scan}", flush=True)
+                continue
+            print(f"    drone {did}: {scan}", flush=True)
+            # Did the aircraft actually take what we sent it? The set callback
+            # only tells the RC's own status line; this is the PC-side check,
+            # and it reads the radio back through a different key path than
+            # the one that wrote it.
+            got = MqttCommandSender.parse_scan(scan)
+            for field, tok in sorted(airlink_sent.get(did, {}).items()):
+                want = _AIRLINK_EXPECTED.get(field, {}).get(tok)
+                have = got.get(field)
+                if want is None or have is None:
+                    continue
+                if have == "?":
+                    print(f"      NOTE: asked for {field}={tok}; the aircraft "
+                          f"will not report {field} back, so it cannot be "
+                          f"confirmed either way", flush=True)
+                elif have != want:
+                    print(f"      WARNING: asked for {field}={tok} ({want}) "
+                          f"but the aircraft reports {have} — NOT APPLIED. "
+                          f"Check the RC status line for the rejection "
+                          f"reason.", flush=True)
         if logger:
             # A one-shot pre-flight fact, so it belongs in session.json next to
             # the rest of the run config — not in a per-tick CSV.
