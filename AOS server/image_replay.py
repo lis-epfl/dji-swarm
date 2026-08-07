@@ -1,9 +1,10 @@
 import time
 import cv2
 import os
-import mmap
 import glob
 import threading
+# The mapping is created by imageSharingUtil.open_stitch_map, which owns the
+# section's fixed geometry, so there is no direct mmap call here any more.
 import utils.imageSharingUtil as imageSharingUtil
 
 # --- Configuration (Matching image_stream.py and image_save.py) ---
@@ -16,20 +17,37 @@ processedImageSize = width * height * depth
 # frames carry no camera pose, so their blocks get poseStatus 0: usable for
 # STABSTITCH and for feed display, not for the pose-driven PLANAR stitcher.
 metadataSize = imageSharingUtil.BLOCK_HEADER_BYTES
-blockSize = metadataSize + processedImageSize
-totalMMFSize = num_drones * blockSize
+
+# Slot stride and section size come from imageSharingUtil, NOT from num_drones and
+# this tool's 800x450 image. BlockSharedMemory is a fixed 24-slot array at a stride
+# sized for the sim's 1280x720 envelope, and a named Windows section cannot be
+# resized: asking for a differently-sized one either denies Unity its mapping (if we
+# get there first) or silently maps a prefix of Unity's. The 800x450 payload is
+# written as a prefix of each slot and the rest of the slot is padding.
+#
+# num_drones is now only "how many drones this replay session has", i.e. how many of
+# the 24 slots get filled. It no longer sizes anything.
+blockSize = imageSharingUtil.STITCH_SLOT_STRIDE
+totalMMFSize = imageSharingUtil.STITCH_SECTION_BYTES
 
 print(f"processedImageSize: {processedImageSize}, blockSize: {blockSize}, totalMMFSize: {totalMMFSize}")
 
 # The directory where image_save.py dumped the files
-TARGET_SESSION_DIR = "saved_streams\captured_drone_images_20260121_165127" 
+TARGET_SESSION_DIR = "saved_streams\captured_drone_images_20260121_165127"
 
 # --- Shared Memory Initialization ---
+# Every slot is retired to droneId = -1 here, not just the num_drones this session
+# fills: a fresh section is zero-filled and 0 is a legal drone id, so an untouched
+# slot would advertise a ready block from drone 0 with a degenerate pose.
 try:
-    processedMMF = mmap.mmap(-1, totalMMFSize, "BlockSharedMemory")
-    print("Connected to Shared Memory: BlockSharedMemory")
+    processedMMF = imageSharingUtil.open_stitch_map()
+    print(f"Connected to Shared Memory: BlockSharedMemory "
+          f"({imageSharingUtil.STITCH_SLOT_CAPACITY} slots x {blockSize} B)")
 except Exception as e:
     print(f"Error creating shared memory: {e}")
+    print("  If this is an access-denied error, BlockSharedMemory already exists at a")
+    print("  different size -- a Unity or stitcher build with a different")
+    print("  STITCH_SLOT_CAPACITY or image envelope is still running.")
     processedMMF = None
 
 def parse_heading_from_filename(filename):

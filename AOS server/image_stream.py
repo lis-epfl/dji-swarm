@@ -16,8 +16,9 @@ import ds_wrapper as w
 import threading
 from collections import deque
 
-# Imports for image sharing to memory mapped files
-import mmap
+# Imports for image sharing to memory mapped files. The mapping itself is created by
+# imageSharingUtil.open_stitch_map, which owns the section's fixed geometry, so there
+# is no direct mmap call here any more.
 import utils.imageSharingUtil as imageSharingUtil
 
 # Ceiling on the wrapper poll rate so this tool never spins the shared-memory
@@ -52,14 +53,24 @@ processedImageSize = width * height * depth
 # no camera pose to publish, so its blocks carry poseStatus 0 and are simply not
 # usable by the PLANAR stitcher -- STABSTITCH is unaffected.
 metadataSize = imageSharingUtil.BLOCK_HEADER_BYTES
-blockSize = metadataSize + processedImageSize
-totalMMFSize = num_drones * blockSize
 
-# Create shared memory mapped file once
+# Slot stride and section size come from imageSharingUtil, NOT from num_drones and
+# this tool's 800x450 image. BlockSharedMemory is a fixed 24-slot array at a stride
+# sized for the sim's 1280x720 envelope, and a named Windows section cannot be
+# resized: asking for a differently-sized one either denies Unity its mapping (if we
+# get there first) or silently maps a prefix of Unity's. The 800x450 payload is
+# written as a prefix of each slot and the rest of the slot is padding.
+blockSize = imageSharingUtil.STITCH_SLOT_STRIDE
+
+# Create shared memory mapped file once, at the fixed size, with every slot retired
+# to droneId = -1 so the ones this tool never fills are not read as drone-0 views.
 try:
-    processedMMF = mmap.mmap(-1, totalMMFSize, "BlockSharedMemory")
+    processedMMF = imageSharingUtil.open_stitch_map()
 except Exception as e:
     print(f"Error creating shared memory: {e}")
+    print("  If this is an access-denied error, BlockSharedMemory already exists at a")
+    print("  different size -- a Unity or stitcher build with a different")
+    print("  STITCH_SLOT_CAPACITY or image envelope is still running.")
     processedMMF = None
 
 def process_drone(drone_id):

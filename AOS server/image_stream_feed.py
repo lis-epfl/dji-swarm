@@ -3,8 +3,11 @@ LIS_Swarm image stream publisher
 ================================
 Publishes each drone's live camera frame into the "DroneFeedSharedMemory"
 mapping consumed by the Unity VR sim's ImageSharing.cs, which displays the
-feeds and re-publishes the 3 body-yaw-selected views into the stitcher's
-separate 3-slot "BlockSharedMemory" (StitcherThreading.py).
+feeds and re-publishes the selected views into the stitcher's separate
+"BlockSharedMemory" (StitcherThreading.py) — the 3 body-yaw-selected ones under
+STABSTITCH, every fresh feed under PLANAR. That section is a fixed 24-slot
+array with no slot count to configure on either side; the two maps are sized
+independently, so nothing here changes when it does.
 
 This replaces running image_stream.py as a separate process. That was never
 safe: the ds_wrapper shared-memory protocol busy-waits on a single status byte

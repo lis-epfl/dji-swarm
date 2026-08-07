@@ -31,6 +31,71 @@ BLOCK_CAPTURE_TIME_OFFSET = 40  # float32, seconds since the publisher started
 BLOCK_POSE_STATUS_OFFSET = 44   # int32 bitfield
 POSE_VALID = 1 << 0
 
+# ---------------------------------------------------------------------------------
+# Geometry of the STITCHER's section, "BlockSharedMemory".
+#
+# This is a different map from the feed map this repo normally writes
+# ("DroneFeedSharedMemory", MAX_DRONES x [48 + 800*450*3], owned by
+# image_stream_feed.py). In the normal architecture nothing here touches
+# BlockSharedMemory at all -- Unity's ImageSharing.cs is its sole producer. The two
+# legacy debug tools image_stream.py and image_replay.py bypass Unity and write it
+# directly, and these constants are what let them do that without corrupting it.
+#
+# The section is a FIXED array of FIXED-stride slots, and both numbers must match
+# PyUniSharingFast.blockSlotCapacity / blockSlotStride, ImageSharing.cs's
+# StitchSlotCapacity / StitchSlotStride, and StitcherThreading.py's
+# BLOCK_SLOT_CAPACITY / BLOCK_SLOT_STRIDE, exactly. This is not a convention:
+#
+#   * A named Windows section cannot be resized. mmap.mmap(-1, size, tagname) is
+#     CreateFileMapping underneath, and when the name already exists it opens the
+#     EXISTING section -- a larger request fails with ERROR_ACCESS_DENIED, and a
+#     smaller one silently succeeds with a partial view. So a tool here that asks
+#     for a differently-sized BlockSharedMemory either denies Unity its mapping
+#     (if it gets there first) or quietly maps a prefix of Unity's.
+#   * The stride is sized from the sim's 1280x720 image envelope, NOT from the
+#     800x450 feed this repo produces. An 800x450 payload is written as a prefix of
+#     the slot and the rest is padding. Computing the stride from the local image
+#     size, as these tools used to, puts every slot after the first in the middle
+#     of its predecessor's pixels.
+#
+# vr_swarm_simulation/Assets/Scripts/ImageStitching/tools/check_wire_layout.py
+# asserts all four copies against each other when this repo is checked out beside
+# the sim. Run it after touching any of them.
+STITCH_SLOT_CAPACITY = 24
+STITCH_MAX_IMAGE_WIDTH = 1280
+STITCH_MAX_IMAGE_HEIGHT = 720
+# Kept on one line each: check_wire_layout.py parses this file with a line-oriented
+# regex, and a constant it cannot evaluate is silently skipped rather than checked.
+STITCH_SLOT_STRIDE = BLOCK_HEADER_V2_BYTES + STITCH_MAX_IMAGE_WIDTH * STITCH_MAX_IMAGE_HEIGHT * 3
+STITCH_SECTION_BYTES = STITCH_SLOT_CAPACITY * STITCH_SLOT_STRIDE
+
+
+def open_stitch_map(map_name="BlockSharedMemory"):
+    """
+    Map the stitcher's BlockSharedMemory at its fixed size and retire every slot.
+
+    Returns the mmap, or raises. Callers address slot i at i * STITCH_SLOT_STRIDE.
+
+    Every slot is initialised to flag = 0, droneId = -1, poseStatus = 0 — not just
+    the ones this tool intends to fill. A fresh section is zero-filled and 0 is a
+    legal drone id, so an untouched slot otherwise advertises a ready block from
+    drone 0 carrying an all-zero (degenerate) quaternion, which the sim's PLANAR
+    solve reports as a geometry error rather than as an empty slot. That used to be
+    unreachable here because the section was sized to exactly the slots the tool
+    filled; against a fixed 24-slot capacity most of them stay empty for the whole
+    run, so this loop is now the only thing standing between one replayed drone and
+    23 phantom ones.
+    """
+    mmf = mmap.mmap(-1, STITCH_SECTION_BYTES, map_name)
+    for slot in range(STITCH_SLOT_CAPACITY):
+        base = slot * STITCH_SLOT_STRIDE
+        mmf.seek(base)
+        mmf.write(struct.pack('<i', 0))                    # flag: ready
+        mmf.write(struct.pack('<i', -1))                   # droneId: no view here
+        mmf.seek(base + BLOCK_POSE_STATUS_OFFSET)
+        mmf.write(struct.pack('<i', 0))                    # poseStatus: unposed
+    return mmf
+
 
 def write_memory(processedMMF, blockOffset, processedImageSize, image_data, droneId, heading,
                  enable_debug=False, pace_s=0.06, pose=None, capture_time=0.0):
