@@ -80,6 +80,10 @@ import java.util.TimerTask;
  * besides the RTSP telemetry string, whose native 17-field signature is fixed):
  *   "LINK:sq:down:up"       — cached link quality, 1 Hz, unsolicited
  *   "LINKSCAN:band=..:..."  — full radio config + interference sweep, on demand
+ *   "AIRLINKRES:<text>"     — outcome of each AIRLINK: field (applied /
+ *                             NOT APPLIED / REJECTED + reason). tvStatus is one
+ *                             TextView so the next message overwrites it; the
+ *                             PC that asked for the change gets told directly.
  *
  * Operator lockout: the on-screen Disable VS button latches out ALL PC motion
  * commands (VS:, ENABLE_VS, TAKEOFF, LAND) until the on-screen Enable VS
@@ -144,6 +148,7 @@ public class SwarmActivity extends Activity {
     // Link diagnostics published back to the PC on MQTTEmbedded.DIAG_TOPIC.
     private static final String LINK_STATUS_PREFIX = "LINK:";
     private static final String LINK_SCAN_PREFIX = "LINKSCAN:";
+    private static final String AIRLINK_RESULT_PREFIX = "AIRLINKRES:";
     private static final long LINK_STATUS_INTERVAL_MS = 1000;   // 1 Hz
     private Timer linkStatusTimer;
 
@@ -319,7 +324,8 @@ public class SwarmActivity extends Activity {
         // broker-internal ones, so the link diagnostics we publish come straight
         // back here. Drop them before anything else looks at them.
         if (command.startsWith(LINK_STATUS_PREFIX)
-                || command.startsWith(LINK_SCAN_PREFIX)) {
+                || command.startsWith(LINK_SCAN_PREFIX)
+                || command.startsWith(AIRLINK_RESULT_PREFIX)) {
             return;
         }
 
@@ -406,7 +412,7 @@ public class SwarmActivity extends Activity {
                 if (key.equals("band"))       bandTok = val;
                 else if (key.equals("bw"))    bwTok = val;
                 else if (key.equals("video")) videoTok = val;
-                else updateStatus("AIRLINK: ignoring unknown field '" + key + "'");
+                else airlinkStatus("AIRLINK: ignoring unknown field '" + key + "'");
             }
 
             if (!bandTok.isEmpty() && !bandTok.equals("-")) {
@@ -415,7 +421,7 @@ public class SwarmActivity extends Activity {
                     bandTok.equals("5G8") ? FrequencyBand.BAND_5_DOT_8G :
                     bandTok.equals("DUAL") ? FrequencyBand.BAND_DUAL : null;
                 if (band == null) {
-                    updateStatus("AIRLINK: unknown band '" + bandTok + "'");
+                    airlinkStatus("AIRLINK: unknown band '" + bandTok + "'");
                 } else {
                     // Set straight through, WITHOUT forcing ChannelSelectionMode
                     // MANUAL first. DJI's docs say KeyFrequencyBand is "only
@@ -437,7 +443,7 @@ public class SwarmActivity extends Activity {
                     bwTok.equals("10") ? Bandwidth.BANDWIDTH_10MHZ :
                     bwTok.equals("5")  ? Bandwidth.BANDWIDTH_5MHZ : null;
                 if (bw == null) {
-                    updateStatus("AIRLINK: unknown bandwidth '" + bwTok + "' MHz");
+                    airlinkStatus("AIRLINK: unknown bandwidth '" + bwTok + "' MHz");
                 } else {
                     setAirlinkKeyAndVerify("bandwidth", AirLinkKey.KeyBandwidth, bw);
                 }
@@ -451,12 +457,27 @@ public class SwarmActivity extends Activity {
                     "RATE_" + videoTok.substring(at + 1) + "FPS");
                 droneSwarmStreamData.setVideoResolution(
                     new VideoResolutionFrameRate(res, rate));
-                updateStatus("AIRLINK video -> " + videoTok);
+                airlinkStatus("AIRLINK video -> " + videoTok);
             }
         } catch (Exception e) {
             // Never let a malformed one-shot kill the command listener
-            updateStatus("AIRLINK parse failed for '" + spec + "': " + e);
+            airlinkStatus("AIRLINK parse failed for '" + spec + "': " + e);
         }
+    }
+
+    /**
+     * Report an AirLink outcome to the RC screen, logcat AND the PC.
+     *
+     * The PC leg is the one that matters operationally: tvStatus is a single
+     * TextView, so the next message overwrites this one — during the
+     * 2026-08-07 bench run the bandwidth verdict was gone from the screen
+     * within 3 s, replaced by the LINKDIAG line. At ten aircraft, reading ten
+     * RC screens (or ten adb logcats) to find out whether a set took is not a
+     * workable answer; the PC asked for the change, so the PC gets told.
+     */
+    private void airlinkStatus(String msg) {
+        updateStatus(msg);                       // screen + logcat as before
+        MQTTEmbedded.publishDiagnostic(AIRLINK_RESULT_PREFIX + msg);
     }
 
     private <T> void setAirlinkKeyAndVerify(String what, DJIKeyInfo<T> keyInfo, T value) {
@@ -465,29 +486,38 @@ public class SwarmActivity extends Activity {
             new CommonCallbacks.CompletionCallback() {
                 @Override
                 public void onSuccess() {
-                    readBackAirlinkKey(what, keyInfo);
+                    // "Accepted" only means the SDK took the call. Read it back
+                    // and report BOTH values: a set that succeeds and leaves
+                    // the old value in place is a real firmware behaviour and
+                    // is invisible if only the request is reported.
+                    readBackAirlinkKey(what, keyInfo, String.valueOf(value));
                 }
 
                 @Override
                 public void onFailure(IDJIError error) {
-                    updateStatus("AIRLINK " + what + "=" + value
+                    airlinkStatus("AIRLINK " + what + "=" + value
                         + " REJECTED: " + error.description());
                 }
             });
     }
 
-    private <T> void readBackAirlinkKey(String what, DJIKeyInfo<T> keyInfo) {
+    private <T> void readBackAirlinkKey(String what, DJIKeyInfo<T> keyInfo,
+                                        final String asked) {
         KeyManager.getInstance().getValue(
             KeyTools.createKey(keyInfo),
             new CommonCallbacks.CompletionCallbackWithParam<T>() {
                 @Override
                 public void onSuccess(T readBack) {
-                    updateStatus("AIRLINK " + what + " -> " + readBack);
+                    boolean took = String.valueOf(readBack).equals(asked);
+                    airlinkStatus("AIRLINK " + what + " set accepted, reads "
+                        + readBack
+                        + (took ? " (applied)"
+                                : " — asked " + asked + ", NOT APPLIED"));
                 }
 
                 @Override
                 public void onFailure(IDJIError error) {
-                    updateStatus("AIRLINK " + what
+                    airlinkStatus("AIRLINK " + what
                         + " set OK but read-back failed: " + error.description());
                 }
             });

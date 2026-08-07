@@ -324,7 +324,16 @@ and has no source in-tree. The app publishes onto its own embedded broker via Mo
 ```
 LINK:<signal>:<down>:<up>              1 Hz, unsolicited, -1 = not reported yet
 LINKSCAN:band=..:mode=..:bw=..:freq=..:sq=..:down=..:up=..:if=<from>-<to>@<rssi>,...
+AIRLINKRES:<text>                      outcome of each AIRLINK: field
 ```
+`AIRLINKRES:` exists because the RC's `tvStatus` is a **single TextView** — the next
+message overwrites the previous one, and during the 2026-08-07 bench run the bandwidth
+verdict was gone within 3 s, replaced by the `LINKDIAG` line. Reading ten RC screens (or ten
+`adb logcat`s) to learn whether a set took is not workable, so the PC that asked for the
+change is told directly: `swarm_flocking.py` prints each drone's outcomes after the settle.
+Three outcomes are distinguished, and the difference matters: `REJECTED: <reason>` (the SDK
+refused), `reads <v> — asked <w>, NOT APPLIED` (the set *succeeded* and the aircraft ignored
+it), and `(applied)`.
 `LINK:` is served purely from the app's `KeyManager.listen()` cache (**no** `getValue()`
 round-trips — that polling is what got removed from `DroneSwarmStreamData`); `LINKSCAN:` is
 on-demand only and does five one-shot reads, with `?` for any key the firmware locks.
@@ -419,8 +428,10 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   `AIRLINK:` therefore reports the value from *before* the set, which looks exactly like a
   rejection (this bit during the 2026-08-07 bench run). `swarm_flocking.py` sleeps
   `AIRLINK_SETTLE_S` between the two and then compares requested vs reported, printing
-  `NOT APPLIED` on a mismatch. The RC status line is the authoritative accept/reject signal;
-  the scan is the independent second opinion, read through a different key path.
+  `NOT APPLIED` on a mismatch. Two independent reports now cover this: the app's own
+  per-field `AIRLINKRES:` (which sees the SDK's accept/reject *reason*) and the PC's
+  scan-based comparison (a different key path, read later). Neither replaces the other —
+  a set can be accepted and still not take.
 - **No manual channel selection on the Mini 3 Pro.** DJI does not support manual
   image-transmission channel selection on this airframe — the RC always picks the channel.
   The `AIRLINK:` protocol therefore has no channel field (the old `AirlinkChannels` config

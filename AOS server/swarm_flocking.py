@@ -2353,6 +2353,10 @@ def main():
     # older APK reports an unknown field instead of silently applying a value
     # to whatever used to occupy that position.
     airlink_sent = {}    # drone id -> {"band": tok, "bw": tok} actually sent
+    if cmd_sender is not None:
+        # Drop anything from a previous controller run so the outcomes printed
+        # below can only belong to the AIRLINK we are about to send.
+        cmd_sender.clear_airlink_results()
     if (airlink_bands or airlink_bw or video_mode) and not args.dry_run:
         for did in sorted(swarm.drones):
             fields = []
@@ -2387,6 +2391,17 @@ def main():
             print(f"  Letting AirLink settle {AIRLINK_SETTLE_S:.0f}s before "
                   f"reading it back...", flush=True)
             time.sleep(AIRLINK_SETTLE_S)
+            # What each RC made of the one-shot, reported over the diagnostic
+            # channel. The RC's own status line is a single TextView that the
+            # next message overwrites, so this is the only place the outcome is
+            # readable per drone without adb.
+            for did in sorted(airlink_sent):
+                results = cmd_sender.airlink_results(did)
+                if not results:
+                    print(f"    drone {did}: RC reported no AirLink outcome "
+                          f"(older APK — check its screen/logcat)", flush=True)
+                for text in results:
+                    print(f"    drone {did}: {text}", flush=True)
         print("  Requesting link scan from each RC (read-only)...", flush=True)
         cmd_sender.clear_scans()
         for did in sorted(swarm.drones):

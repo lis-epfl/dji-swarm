@@ -71,6 +71,10 @@ _WARN_INTERVAL_S = 1.0
 # against a capture window accidentally left open.
 _PROBE_BUFFER_MAX = 5000
 
+# Cap on AIRLINK outcome lines kept per drone. One AIRLINK: yields at most a
+# handful (band, bandwidth, video); the cap only guards against a chatty RC.
+_AIRLINK_RESULT_MAX = 50
+
 
 class MqttCommandSender:
     """Persistent per-drone MQTT publishers for drone command strings."""
@@ -99,6 +103,7 @@ class MqttCommandSender:
         self._diag_lock = threading.Lock()
         self._link = {}    # drone_id -> (monotonic_ts, {"sq":, "down":, "up":})
         self._scan = {}    # drone_id -> (monotonic_ts, raw scan string)
+        self._airlink = {}  # drone_id -> [result text, ...] since last clear
 
         for did, ip in self._ips.items():
             client = mqtt.Client(
@@ -169,8 +174,26 @@ class MqttCommandSender:
             elif payload.startswith("LINKSCAN:"):
                 with self._diag_lock:
                     self._scan[drone_id] = (time.monotonic(), payload)
+            elif payload.startswith("AIRLINKRES:"):
+                # One AIRLINK: can produce several of these (band, bandwidth,
+                # video), so accumulate rather than replace. Bounded so a
+                # misbehaving RC cannot grow this without limit.
+                text = payload[len("AIRLINKRES:"):]
+                with self._diag_lock:
+                    got = self._airlink.setdefault(drone_id, [])
+                    if len(got) < _AIRLINK_RESULT_MAX:
+                        got.append(text)
         except Exception:
             pass
+
+    def airlink_results(self, drone_id):
+        """AIRLINK outcomes reported by drone_id since the last clear."""
+        with self._diag_lock:
+            return list(self._airlink.get(drone_id, ()))
+
+    def clear_airlink_results(self):
+        with self._diag_lock:
+            self._airlink.clear()
 
     def link_of(self, drone_id, max_age=LINK_STALE_S):
         """Latest {"sq","down","up"} for drone_id, or None if stale/absent.
