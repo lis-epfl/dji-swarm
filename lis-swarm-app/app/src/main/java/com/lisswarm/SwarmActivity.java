@@ -22,6 +22,7 @@ import dji.sdk.keyvalue.key.FlightControllerKey;
 import dji.sdk.keyvalue.key.GimbalKey;
 import dji.sdk.keyvalue.key.KeyTools;
 import dji.sdk.keyvalue.value.airlink.Bandwidth;
+import dji.sdk.keyvalue.value.airlink.ChannelSelectionMode;
 import dji.sdk.keyvalue.value.airlink.FrequencyBand;
 import dji.sdk.keyvalue.value.airlink.FrequencyInterferenceInfo;
 import dji.sdk.keyvalue.value.camera.VideoFrameRate;
@@ -402,19 +403,67 @@ public class SwarmActivity extends Activity {
      */
     private void applyAirlinkSettings(String spec) {
         try {
-            String bandTok = "", bwTok = "", videoTok = "";
+            String modeTok = "", bandTok = "", bwTok = "", videoTok = "";
             for (String field : spec.split(":")) {
                 field = field.trim();
                 int eq = field.indexOf('=');
                 if (eq < 0) continue;              // ignore unknown/legacy tokens
                 String key = field.substring(0, eq).trim();
                 String val = field.substring(eq + 1).trim();
-                if (key.equals("band"))       bandTok = val;
+                if (key.equals("mode"))       modeTok = val;
+                else if (key.equals("band"))  bandTok = val;
                 else if (key.equals("bw"))    bwTok = val;
                 else if (key.equals("video")) videoTok = val;
                 else airlinkStatus("AIRLINK: ignoring unknown field '" + key + "'");
             }
 
+            // mode= must complete BEFORE the rest: the 2026-08-07 bench run
+            // showed the aircraft accepting bandwidth in AUTO, holding it for
+            // under 3 s, then reverting when its channel selection next ran.
+            // DJI documents bandwidth (and band) as manual-mode-only, so the
+            // radio fields are chained behind the mode change rather than
+            // fired alongside it. Without mode= the behaviour is unchanged.
+            if (!modeTok.isEmpty() && !modeTok.equals("-")) {
+                final ChannelSelectionMode mode =
+                    modeTok.equals("MANUAL") ? ChannelSelectionMode.MANUAL :
+                    modeTok.equals("AUTO") ? ChannelSelectionMode.AUTO : null;
+                if (mode == null) {
+                    airlinkStatus("AIRLINK: unknown mode '" + modeTok + "'");
+                } else {
+                    final String fBand = bandTok, fBw = bwTok, fVideo = videoTok;
+                    KeyManager.getInstance().setValue(
+                        KeyTools.createKey(AirLinkKey.KeyChannelSelectionMode),
+                        mode,
+                        new CommonCallbacks.CompletionCallback() {
+                            @Override
+                            public void onSuccess() {
+                                airlinkStatus("AIRLINK mode=" + mode + " accepted");
+                                applyRadioFields(fBand, fBw, fVideo);
+                            }
+
+                            @Override
+                            public void onFailure(IDJIError error) {
+                                // Still apply the rest: the outcome reports
+                                // then show whether the radio fields need the
+                                // mode at all, which is the open question.
+                                airlinkStatus("AIRLINK mode=" + mode
+                                    + " REJECTED: " + error.description());
+                                applyRadioFields(fBand, fBw, fVideo);
+                            }
+                        });
+                    return;
+                }
+            }
+            applyRadioFields(bandTok, bwTok, videoTok);
+        } catch (Exception e) {
+            // Never let a malformed one-shot kill the command listener
+            airlinkStatus("AIRLINK parse failed for '" + spec + "': " + e);
+        }
+    }
+
+    /** band / bw / video, applied after any mode= change has settled. */
+    private void applyRadioFields(String bandTok, String bwTok, String videoTok) {
+        try {
             if (!bandTok.isEmpty() && !bandTok.equals("-")) {
                 FrequencyBand band =
                     bandTok.equals("2G4") ? FrequencyBand.BAND_2_DOT_4G :
@@ -423,15 +472,9 @@ public class SwarmActivity extends Activity {
                 if (band == null) {
                     airlinkStatus("AIRLINK: unknown band '" + bandTok + "'");
                 } else {
-                    // Set straight through, WITHOUT forcing ChannelSelectionMode
-                    // MANUAL first. DJI's docs say KeyFrequencyBand is "only
-                    // available in manual mode", but the Mini 3 Pro does not
-                    // support manual channel selection at all while DJI Fly
-                    // still offers it 2.4/5.8/dual — i.e. band is settable in
-                    // AUTO on this airframe. Forcing MANUAL here would try to
-                    // enter a mode the aircraft rejects and could leave the
-                    // link half-configured; a rejected band is reported on the
-                    // status line instead, which is the honest outcome.
+                    // No implicit mode change here: band alone is what DJI Fly
+                    // offers on this airframe with channel selection on auto.
+                    // Callers who need manual mode ask for it with mode=.
                     setAirlinkKeyAndVerify("band", AirLinkKey.KeyFrequencyBand, band);
                 }
             }
@@ -460,8 +503,11 @@ public class SwarmActivity extends Activity {
                 airlinkStatus("AIRLINK video -> " + videoTok);
             }
         } catch (Exception e) {
-            // Never let a malformed one-shot kill the command listener
-            airlinkStatus("AIRLINK parse failed for '" + spec + "': " + e);
+            // Never let a malformed one-shot kill the command listener. Also
+            // catches the video= enum lookups, whose valueOf() throws on a
+            // resolution/fps the SDK does not name.
+            airlinkStatus("AIRLINK field apply failed (band='" + bandTok
+                + "' bw='" + bwTok + "' video='" + videoTok + "'): " + e);
         }
     }
 

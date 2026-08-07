@@ -2095,6 +2095,16 @@ def main():
                          "links share the band — and unlike manual channel "
                          "pinning it works with DJI's AUTO channel selection. "
                          "Empty (default) sends nothing.")
+    ap.add_argument("--airlink-manual-channel", action="store_true",
+                    help="EXPERIMENT (bench only): set ChannelSelectionMode "
+                         "MANUAL before the band/bandwidth. The 2026-08-07 "
+                         "bench run showed the Mini 3 Pro ACCEPTING a 10 MHz "
+                         "bandwidth and then reverting to 40 within 3 s while "
+                         "in AUTO, which matches DJI documenting bandwidth as "
+                         "manual-mode-only. This flag tests whether the "
+                         "airframe will enter MANUAL at all; if the bandwidth "
+                         "still does not hold, AUTO is restored automatically. "
+                         "DJI recommends AUTO — do not fly a fleet on this.")
     ap.add_argument("--no-link-scan", action="store_true",
                     help="Skip the read-only pre-flight link scan (the "
                          "LINKDIAG round-trip that reports each RC's radio "
@@ -2367,6 +2377,12 @@ def main():
             if airlink_bw and airlink_bw[did - 1] != "-":
                 fields.append("bw=" + airlink_bw[did - 1])
                 asked["bw"] = airlink_bw[did - 1]
+            # MANUAL is only worth entering to make a RADIO field stick, so it
+            # rides along with band/bw and never goes out on its own — a bare
+            # mode change would alter the aircraft's channel behaviour for
+            # nothing. video= is a camera setting and does not need it.
+            if asked and args.airlink_manual_channel:
+                fields.insert(0, "mode=MANUAL")
             if video_mode:
                 fields.append("video=" + video_mode)
             if not fields:
@@ -2417,6 +2433,7 @@ def main():
             if pending:
                 time.sleep(0.1)
         scans = {}
+        stuck = set()   # drones where a requested radio value did not take
         for did in sorted(swarm.drones):
             scan = cmd_sender.scan_of(did)
             scans[did] = scan
@@ -2440,14 +2457,32 @@ def main():
                           f"will not report {field} back, so it cannot be "
                           f"confirmed either way", flush=True)
                 elif have != want:
+                    stuck.add(did)
                     print(f"      WARNING: asked for {field}={tok} ({want}) "
                           f"but the aircraft reports {have} — NOT APPLIED. "
-                          f"Check the RC status line for the rejection "
-                          f"reason.", flush=True)
+                          f"See this drone's AIRLINK outcome above for the "
+                          f"SDK's own verdict.", flush=True)
+        # MANUAL was entered only to make a radio value stick. If it did not
+        # stick anyway, leaving the aircraft in MANUAL buys nothing and costs
+        # DJI's own channel selection, so put it back — an experiment that
+        # fails should not silently change how the fleet picks channels.
+        if args.airlink_manual_channel and stuck:
+            print(f"  MANUAL did not make the setting hold on "
+                  f"{sorted(stuck)} — restoring AUTO channel selection",
+                  flush=True)
+            for did in sorted(stuck):
+                swarm.drones[did].send_command("AIRLINK:mode=AUTO")
+        elif args.airlink_manual_channel:
+            print("  MANUAL channel mode is IN FORCE on this fleet (DJI "
+                  "recommends AUTO — this is a bench experiment)", flush=True)
+
         if logger:
             # A one-shot pre-flight fact, so it belongs in session.json next to
             # the rest of the run config — not in a per-tick CSV.
-            logger.update_meta({"link_scan": scans})
+            logger.update_meta({"link_scan": scans,
+                                "airlink_manual_channel":
+                                    bool(args.airlink_manual_channel),
+                                "airlink_not_applied": sorted(stuck)})
     elif cmd_sender is None and not args.dry_run and not args.no_link_scan:
         # Say so rather than silently skipping: the launcher banner prints
         # linkScan=True, which would otherwise look like it ran and found
