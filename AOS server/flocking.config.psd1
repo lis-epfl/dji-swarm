@@ -162,17 +162,23 @@
     # CLI: -NoLinkScan disables for one run.
     LinkScan = $true
 
-    # BENCH EXPERIMENT — leave $false for normal flying.
-    # Set ChannelSelectionMode MANUAL before applying band/bandwidth. Bench-
-    # tested 2026-08-07: the Mini 3 Pro ACCEPTS a 10 MHz bandwidth in AUTO
-    # mode, reports it back, then reverts to 40 MHz within 3 s — which matches
-    # DJI documenting bandwidth as manual-mode-only. This tests whether the
-    # airframe will enter MANUAL at all. If the value still does not hold, AUTO
-    # is restored automatically so a failed experiment cannot leave the fleet
-    # off DJI's own channel selection. DJI recommends AUTO; do not fly a fleet
-    # on MANUAL without knowing why. Only sent alongside a band/bandwidth
-    # request — never on its own. CLI: -AirlinkManualChannel
-    AirlinkManualChannel = $false
+    # AirLink channel-selection mode: '' (send nothing) | 'auto' | 'manual'.
+    #
+    # 'manual' is the ONLY way AirlinkBandwidth sticks — bench-tested
+    # 2026-08-07: in AUTO the Mini 3 Pro accepts a 10 MHz bandwidth, reports it
+    # back, then reverts to 40 MHz within ~3 s. But manual FREEZES the channel
+    # and gives up DJI's per-link interference adaptation, which DJI recommends
+    # keeping, and there is no on-aircraft interference measurement to plan an
+    # assignment from (KeyFrequencyInterference returns '?' on this airframe).
+    # So narrower bandwidth is bought with adaptivity — justify it against the
+    # logged link_sq/link_down/link_up, not from first principles. Only sent
+    # alongside a band/bandwidth request, never on its own, and AUTO is
+    # restored automatically for any drone where the value did not hold.
+    #
+    # 'auto' restores DJI's adaptive selection and is the way BACK OUT of a
+    # manual run — blanking this key sends nothing and leaves manual in force.
+    # CLI: -AirlinkMode auto|manual
+    AirlinkMode = ''
 
     # Skip the browser-GUI map pane and pass --no-gui to the controller so it
     # does not push telemetry. CLI: -NoGui

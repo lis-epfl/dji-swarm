@@ -57,10 +57,13 @@
 #                                     # the main lever when many links share the site
 #   .\dji-flocking.ps1 -VideoMode 1920x1080@24     # cap the camera stream on every RC
 #   .\dji-flocking.ps1 -NoLinkScan    # skip the read-only pre-flight link/interference scan
-#   .\dji-flocking.ps1 -AirlinkBandwidth 10 -AirlinkManualChannel   # BENCH EXPERIMENT: try
-#                                     # ChannelSelectionMode MANUAL so the bandwidth sticks
-#                                     # (it reverts in AUTO on the Mini 3 Pro). AUTO is
-#                                     # restored automatically if it still does not hold.
+#   .\dji-flocking.ps1 -AirlinkBandwidth 10 -AirlinkMode manual   # bandwidth only STICKS in
+#                                     # manual channel mode (in AUTO the aircraft accepts it
+#                                     # then reverts ~3 s later), but manual FREEZES the
+#                                     # channel and gives up DJI's interference adaptation.
+#   .\dji-flocking.ps1 -AirlinkMode auto   # put the radios BACK on DJI's adaptive channel
+#                                     # selection. Needed explicitly: blanking the config
+#                                     # sends nothing and leaves a manual run in force.
 #   .\dji-flocking.ps1 -RecordMaxSeconds 60 -RecordingDir 'D:\Flight clips'
 #                                     # GUI "Record clip" button: per-drone 1080p MP4 + a frame
 #                                     # index + the flight-data CSVs for that window only, in
@@ -104,7 +107,7 @@ param(
     [string[]]$AirlinkBandwidth,
     [string]$VideoMode,
     [switch]$NoLinkScan,
-    [switch]$AirlinkManualChannel,
+    [string]$AirlinkMode,
     [string]$Config = "$PSScriptRoot\flocking.config.psd1"
 )
 
@@ -121,7 +124,7 @@ $settings = @{
     IdentityCheck = $true; MinSeparation = 3.0
     PlaneMode = $false; PlaneGain = 0.25; PlaneLeash = 12.0; MaxAlt = 30.0
     AirlinkBands = @(); AirlinkBandwidth = @(); VideoMode = ''
-    LinkScan = $true; AirlinkManualChannel = $false
+    LinkScan = $true; AirlinkMode = ''
     RecordingDir = 'recordings'; RecordMaxSeconds = 120.0
 }
 
@@ -168,8 +171,7 @@ if ($DemoStitch)                                    { $settings.Heading = 'demos
 if ($NoIdentityCheck)                               { $settings.IdentityCheck = $false }
 # -NoLinkScan skips the read-only pre-flight link/interference scan for one run.
 if ($NoLinkScan)                                    { $settings.LinkScan = $false }
-# -AirlinkManualChannel: bench experiment, see the config key's comment.
-if ($AirlinkManualChannel)                          { $settings.AirlinkManualChannel = $true }
+if ($PSBoundParameters.ContainsKey('AirlinkMode'))  { $settings.AirlinkMode = $AirlinkMode }
 
 $Drones       = [int]$settings.Drones
 $HttpPort     = [int]$settings.HttpPort
@@ -198,7 +200,7 @@ $AirlinkBands     = @($settings.AirlinkBands | Where-Object { "$_".Trim() -ne ''
 $AirlinkBandwidth = @($settings.AirlinkBandwidth | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne '' })
 $VideoMode        = "$($settings.VideoMode)".Trim()
 $LinkScan         = [bool]$settings.LinkScan
-$AirlinkManualChannel = [bool]$settings.AirlinkManualChannel
+$AirlinkMode      = "$($settings.AirlinkMode)".Trim().ToLower()
 $RecordingDir     = "$($settings.RecordingDir)".Trim()
 $RecordMaxSeconds = [double]$settings.RecordMaxSeconds
 
@@ -253,6 +255,9 @@ if ($RecordMaxSeconds -lt 1 -or $RecordMaxSeconds -gt 900) {
 }
 if (-not $RecordingDir) { throw "RecordingDir must not be empty" }
 # Fail here rather than letting swarm_flocking.py reject it after the panes open.
+if ($AirlinkMode -and $AirlinkMode -notin @('auto', 'manual')) {
+    throw "AirlinkMode must be 'auto', 'manual' or '' (got '$AirlinkMode')"
+}
 foreach ($bw in $AirlinkBandwidth) {
     if ($bw -notin @('40', '20', '10', '5', '-')) {
         throw "AirlinkBandwidth entries must be 40, 20, 10, 5 or '-' (MHz) (got '$bw')"
@@ -274,7 +279,7 @@ Write-Host ("[dji-flocking] config $Config -> drones=$Drones slow=$Slow gimbal=$
             "planeMode=$PlaneMode planeGain=$PlaneGain planeLeash=$PlaneLeash maxAlt=$MaxAlt " +
             "dObs=$DObs r0Obs=$R0Obs cObs=$CObs " +
             "httpPort=$HttpPort cmdPath=$CmdPathDesc airlink=$AirlinkDesc " +
-            "linkScan=$LinkScan manualChan=$AirlinkManualChannel recordDir=$RecordingDir recordMax=${RecordMaxSeconds}s")
+            "linkScan=$LinkScan airlinkMode=$(if ($AirlinkMode) { $AirlinkMode } else { 'unchanged' }) recordDir=$RecordingDir recordMax=${RecordMaxSeconds}s")
 
 # --- Build the swarm_flocking.py CLI -----------------------------------------
 # Format doubles invariantly so the decimal point survives locales that use a
@@ -348,7 +353,7 @@ if ($AirlinkBandwidth.Count) { $AirlinkArg += " --airlink-bandwidth " + ($Airlin
 if ($VideoMode)              { $AirlinkArg += " --video-mode $VideoMode" }
 # Read-only pre-flight link/interference scan (on by default; forward the opt-out).
 $LinkScanArg = if (-not $LinkScan) { " --no-link-scan" } else { "" }
-$ManualChanArg = if ($AirlinkManualChannel) { " --airlink-manual-channel" } else { "" }
+$AirlinkModeArg = if ($AirlinkMode) { " --airlink-mode $AirlinkMode" } else { "" }
 
 # GUI clip recording. Single-quoted so an absolute path with spaces survives
 # the double-quoted -Command "..." string the panes are launched with.
@@ -356,7 +361,7 @@ $RecordArg = ""
 if ($RecordingDir -ne 'recordings') { $RecordArg += " --recording-dir '$RecordingDir'" }
 if ($RecordMaxSeconds -ne 120.0)    { $RecordArg += " --record-max-s " + (Inv $RecordMaxSeconds) }
 
-$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$PlaneArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg$IdentityArg$MinSepArg$DObsArg$R0ObsArg$CObsArg$AirlinkArg$LinkScanArg$ManualChanArg$RecordArg"
+$FlockArgs = "$SlowArg$GimbalArg$HeadingArg$PlaneArg$CvmArg$R0Arg$ScaleArg$ImageStreamArg$DroneIPsArg$IdentityArg$MinSepArg$DObsArg$R0ObsArg$CObsArg$AirlinkArg$LinkScanArg$AirlinkModeArg$RecordArg"
 
 # The readController pane sources the conda hook and activates this env
 # before launching the script. Edit if your miniconda lives elsewhere.

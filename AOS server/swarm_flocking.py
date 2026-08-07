@@ -2095,16 +2095,20 @@ def main():
                          "links share the band — and unlike manual channel "
                          "pinning it works with DJI's AUTO channel selection. "
                          "Empty (default) sends nothing.")
-    ap.add_argument("--airlink-manual-channel", action="store_true",
-                    help="EXPERIMENT (bench only): set ChannelSelectionMode "
-                         "MANUAL before the band/bandwidth. The 2026-08-07 "
-                         "bench run showed the Mini 3 Pro ACCEPTING a 10 MHz "
-                         "bandwidth and then reverting to 40 within 3 s while "
-                         "in AUTO, which matches DJI documenting bandwidth as "
-                         "manual-mode-only. This flag tests whether the "
-                         "airframe will enter MANUAL at all; if the bandwidth "
-                         "still does not hold, AUTO is restored automatically. "
-                         "DJI recommends AUTO — do not fly a fleet on this.")
+    ap.add_argument("--airlink-mode", default="", choices=["", "auto", "manual"],
+                    metavar="auto|manual",
+                    help="AirLink channel-selection mode. Empty (default) sends "
+                         "nothing and leaves whatever is in force. 'manual' is "
+                         "needed for --airlink-bandwidth to stick (in AUTO the "
+                         "aircraft accepts a bandwidth then reverts within "
+                         "~3 s) but FREEZES the channel and gives up DJI's "
+                         "per-link interference adaptation, which DJI "
+                         "recommends keeping; it is only sent alongside a "
+                         "band/bandwidth request, and AUTO is restored "
+                         "automatically for any drone where the value still "
+                         "did not hold. 'auto' restores DJI's adaptive "
+                         "selection — the way back out, since blanking the "
+                         "config does NOT undo a previous manual run.")
     ap.add_argument("--no-link-scan", action="store_true",
                     help="Skip the read-only pre-flight link scan (the "
                          "LINKDIAG round-trip that reports each RC's radio "
@@ -2367,7 +2371,8 @@ def main():
         # Drop anything from a previous controller run so the outcomes printed
         # below can only belong to the AIRLINK we are about to send.
         cmd_sender.clear_airlink_results()
-    if (airlink_bands or airlink_bw or video_mode) and not args.dry_run:
+    if ((airlink_bands or airlink_bw or video_mode or args.airlink_mode)
+            and not args.dry_run):
         for did in sorted(swarm.drones):
             fields = []
             asked = {}
@@ -2378,10 +2383,13 @@ def main():
                 fields.append("bw=" + airlink_bw[did - 1])
                 asked["bw"] = airlink_bw[did - 1]
             # MANUAL is only worth entering to make a RADIO field stick, so it
-            # rides along with band/bw and never goes out on its own — a bare
-            # mode change would alter the aircraft's channel behaviour for
-            # nothing. video= is a camera setting and does not need it.
-            if asked and args.airlink_manual_channel:
+            # rides along with band/bw and never alone — a bare mode change
+            # would freeze the channel for no benefit. AUTO is the opposite: it
+            # GIVES adaptivity back, so it goes out unconditionally and is the
+            # documented way to undo a manual run.
+            if args.airlink_mode == "auto":
+                fields.insert(0, "mode=AUTO")
+            elif args.airlink_mode == "manual" and asked:
                 fields.insert(0, "mode=MANUAL")
             if video_mode:
                 fields.append("video=" + video_mode)
@@ -2466,22 +2474,22 @@ def main():
         # stick anyway, leaving the aircraft in MANUAL buys nothing and costs
         # DJI's own channel selection, so put it back — an experiment that
         # fails should not silently change how the fleet picks channels.
-        if args.airlink_manual_channel and stuck:
+        if args.airlink_mode == "manual" and stuck:
             print(f"  MANUAL did not make the setting hold on "
                   f"{sorted(stuck)} — restoring AUTO channel selection",
                   flush=True)
             for did in sorted(stuck):
                 swarm.drones[did].send_command("AIRLINK:mode=AUTO")
-        elif args.airlink_manual_channel:
-            print("  MANUAL channel mode is IN FORCE on this fleet (DJI "
-                  "recommends AUTO — this is a bench experiment)", flush=True)
+        elif args.airlink_mode == "manual":
+            print("  MANUAL channel mode IS IN FORCE: the channel is frozen "
+                  "and DJI's per-link interference adaptation is off. "
+                  "--airlink-mode auto puts it back.", flush=True)
 
         if logger:
             # A one-shot pre-flight fact, so it belongs in session.json next to
             # the rest of the run config — not in a per-tick CSV.
             logger.update_meta({"link_scan": scans,
-                                "airlink_manual_channel":
-                                    bool(args.airlink_manual_channel),
+                                "airlink_mode": args.airlink_mode,
                                 "airlink_not_applied": sorted(stuck)})
     elif cmd_sender is None and not args.dry_run and not args.no_link_scan:
         # Say so rather than silently skipping: the launcher banner prints

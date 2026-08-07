@@ -337,14 +337,12 @@ refused), `reads <v> — asked <w>, NOT APPLIED` (the set *succeeded* and the ai
 it), and `(applied)`.
 `LINK:` is served purely from the app's `KeyManager.listen()` cache (**no** `getValue()`
 round-trips — that polling is what got removed from `DroneSwarmStreamData`); `LINKSCAN:` is
-on-demand only and does five one-shot reads, with `?` for any key the firmware locks.
-**On the Mini 3 Pro `if=` is always `?`** — `KeyFrequencyInterference` is not served by this
-airframe's firmware (bench-verified 2026-08-07), so there is no on-aircraft band scan to be
-had; `band`/`mode`/`bw`/`freq`/`sq`/`down`/`up` all return real values. A scan taken right
-after an `AIRLINK:` waits `AIRLINK_SETTLE_S` first and then flags any requested value the
-aircraft did not adopt — see the [AirLink read-back gotcha](#critical-gotchas).
-Quality scales are 0-100, DJI's reading: **<40 poor, 40-60 normal, >60 good**. Available
-only on the direct MQTT command path (the server path has no return channel).
+on-demand only, does five one-shot reads, and prints `?` for any key the firmware locks —
+which on this airframe is always `if=`, see the [AirLink gotchas](#critical-gotchas).
+A scan taken right after an `AIRLINK:` waits `AIRLINK_SETTLE_S` first and flags any requested
+value the aircraft did not adopt. Quality scales are 0-100, DJI's reading: **<40 poor,
+40-60 normal, >60 good**. Available only on the direct MQTT command path (the server path has
+no return channel).
 Surfaced as `meta["link"]` → the GUI's per-drone **RF link** row, logged to
 `swarm_debug.csv` (`link_sq`/`link_down`/`link_up`), and the startup scan lands in
 `session.json` under `link_scan`.
@@ -423,50 +421,34 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   (`AirlinkBands = @('DUAL')` is the DJI default). This is the first thing to check when
   the link "got worse" after an AirLink change. `LINKDIAG`/the startup link scan reports
   what is actually in force per RC.
-- **Bandwidth needs `mode=MANUAL`; in AUTO it reverts (Mini 3 Pro, bench-verified
-  2026-08-07).** In AUTO the aircraft *accepts* `bw=10`, reports `BANDWIDTH_10MHZ` on an
-  immediate read-back, then reverts to `BANDWIDTH_40MHZ` within 3 s when its channel
-  selection next runs — a revert, not a rejection, which is why the settle delay matters and
-  why the immediate read-back alone declares false success. With
-  `--airlink-manual-channel` / `AirlinkManualChannel` the mode set is **accepted** and
-  `bw=10` then **holds** (`mode=MANUAL:bw=BANDWIDTH_10MHZ`). Matches DJI documenting
-  `KeyBandwidth` as manual-channel-mode-only. `mode=` never goes out on its own, only
-  alongside a band/bandwidth request, and the PC restores AUTO automatically for any drone
-  where the value still did not hold.
-- **`ChannelSelectionMode.MANUAL` IS settable on the Mini 3 Pro via the SDK** — DJI's
-  support answer that manual channel selection is unsupported describes the **DJI Fly UI**,
-  not the MSDK, and bench-testing 2026-08-07 accepted MANUAL and held a 10 MHz bandwidth
-  under it. Do not repeat the earlier inference here that UI absence meant the aircraft
-  refuses it: that reasoning is what removed the old `AirlinkChannels`/`KeyFrequencyPoint`
-  path, and it was wrong. Two live consequences: (1) MANUAL **freezes the channel** — the
-  scan reports `freq=` — so entering it without also choosing a frequency point leaves the
-  aircraft pinned to whatever channel it happened to be on, with no adaptivity and no plan;
-  (2) DJI still recommends AUTO, and `KeyFrequencyInterference` returns `?` on this airframe,
-  so there is no on-aircraft measurement to plan a channel assignment from. Weigh a manual
-  plan against losing DJI's per-link adaptation using the logged `link_sq`/`link_down`/
-  `link_up`, which is the only outcome metric this fleet actually has.
-- **An AirLink set is ASYNC — never read it back immediately.**
-  `SwarmActivity.applyAirlinkSettings` fires `KeyManager.setValue` and returns; a bandwidth
-  change renegotiates the link and takes seconds. A `LINKDIAG` sent straight after the
-  `AIRLINK:` therefore reports the value from *before* the set, which looks exactly like a
-  rejection (this bit during the 2026-08-07 bench run). `swarm_flocking.py` sleeps
-  `AIRLINK_SETTLE_S` between the two and then compares requested vs reported, printing
-  `NOT APPLIED` on a mismatch. Two independent reports now cover this: the app's own
-  per-field `AIRLINKRES:` (which sees the SDK's accept/reject *reason*) and the PC's
-  scan-based comparison (a different key path, read later). Neither replaces the other —
-  a set can be accepted and still not take.
-- **The `AIRLINK:` protocol has no channel field, but NOT because the aircraft refuses
-  one.** The old `AirlinkChannels` key and the `channel=`/`KeyChannelNumber` path were
-  removed on the inference that DJI's "manual channel selection unsupported on the Mini 3
-  Pro" support answer described the airframe; it describes the **DJI Fly UI**, and the SDK
-  accepts `ChannelSelectionMode.MANUAL` (see above). Choosing a specific channel is
-  therefore probably reachable via the documented `KeyFrequencyPoint` (+ `KeyFrequencyPointRange`),
-  which is the correct key name — `KeyChannelNumber` is not in the public MSDK 5 AirLink
-  docs at all, so the old path may have been calling the wrong key as well as being
-  wrongly justified. Untested. If channel planning is ever wanted, start there rather than
-  re-adding `KeyChannelNumber`. `applyAirlinkSettings` still sets band without forcing
-  MANUAL, which is correct: DJI Fly offers 2.4/5.8/dual on this airframe with channel
-  selection on auto, so band does not need the mode change that bandwidth does.
+- **What the Mini 3 Pro actually does with AirLink sets** (bench-verified 2026-08-07 on
+  MSDK 5.3.0; the docs are contradictory, so trust this table):
+
+  | Set | Result |
+  | --- | --- |
+  | `band` in AUTO mode | applies (DJI Fly exposes 2.4/5.8/dual with channel on auto) |
+  | `bw` in AUTO mode | **accepted, then reverts** to 40 MHz within ~3 s |
+  | `mode=MANUAL` | accepted — DJI's "unsupported" answer is about the **DJI Fly UI**, not the SDK |
+  | `bw` in MANUAL mode | applies and holds (`mode=MANUAL:bw=BANDWIDTH_10MHZ`) |
+  | `KeyFrequencyInterference` | never served — `if=?` always, so **no on-aircraft band scan** |
+
+  So narrower bandwidth is only reachable via `--airlink-mode manual`, and it is bought with
+  DJI's per-link interference adaptation: MANUAL **freezes the channel** (the scan's `freq=`),
+  and with no interference measurement there is nothing to plan an assignment from. Entering
+  MANUAL without choosing a frequency point pins the aircraft to whatever channel it was on —
+  no adaptivity *and* no plan, worse than either alternative. Justify it against the logged
+  `link_sq`/`link_down`/`link_up`, the only outcome metric this fleet has. `--airlink-mode
+  auto` is the way back out. If channel planning is ever wanted, use the documented
+  `KeyFrequencyPoint`/`KeyFrequencyPointRange` — **not** the `KeyChannelNumber` the removed
+  `AirlinkChannels` path used, which is absent from the public MSDK 5 AirLink docs.
+- **An AirLink set is ASYNC — never read it back immediately.** `applyAirlinkSettings` fires
+  `KeyManager.setValue` and returns, and a bandwidth change renegotiates the link over
+  seconds, so a `LINKDIAG` sent straight after reports the value from *before* the set —
+  indistinguishable from a rejection, and the mistake that made the AUTO-mode revert above
+  look like a refusal. `swarm_flocking.py` sleeps `AIRLINK_SETTLE_S` first, then compares
+  requested vs reported. Two independent reports, and neither replaces the other because a
+  set can be accepted and still not take: the app's `AIRLINKRES:` sees the SDK's accept/reject
+  *reason*, the PC's scan re-reads the radio through a different key path later.
 - **Multi-drone = 1-based `drone_id`** everywhere, mapping to `DroneSwarmServer` shared-memory slots.
 - **Drone identity has TWO independent sources when `DroneIPs` is an explicit list — keep
   them reconciled.** Commands go to the N-th `DroneIPs` entry (RC/switch-port = the
@@ -586,7 +568,7 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 | Launcher | Starts | Params → script flags |
 | --- | --- | --- |
 | `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
-| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-DemoStitch`→`--heading demostitch` / `-StitchOffset`→`--stitch-offset` (demostitch fan offset deg/rank, config key `StitchOffset`), `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-DObs`→`--d-obs` / `-R0Obs`→`--r0-obs` / `-CObs`→`--c-obs` (virtual-obstacle/geofence repulsion cutoff, detection radius [physical m] and gain; config keys `DObs`/`R0Obs`/`CObs`; the shapes themselves are drawn in the GUI and persist in `shapes.json`), `-AirlinkBands`→`--airlink-bands` / `-AirlinkBandwidth`→`--airlink-bandwidth` / `-VideoMode`→`--video-mode` (per-drone RF band + channel bandwidth in MHz `40\|20\|10\|5` + camera-stream cap, sent to each RC as an `AIRLINK:` one-shot at startup; config keys `AirlinkBands`/`AirlinkBandwidth`/`VideoMode`; empty = send nothing, which leaves whatever was last applied — **not** a reset, see the [AirLink gotcha](#critical-gotchas)), `-NoLinkScan`→`--no-link-scan` (skip the read-only pre-flight link/interference scan; config key `LinkScan`), `-AirlinkManualChannel`→`--airlink-manual-channel` (**bench experiment**: `mode=MANUAL` before band/bandwidth so the value sticks — it reverts in AUTO on the Mini 3 Pro; AUTO restored automatically if it still does not hold; config key `AirlinkManualChannel`), `-RecordingDir`→`--recording-dir` / `-RecordMaxSeconds`→`--record-max-s` (root folder and per-clip duration cap for the GUI's **Record clip** button — per-drone 1080p MP4 + frame index + the flight-data CSVs for that window; config keys `RecordingDir`/`RecordMaxSeconds`; separate from `--log-dir` and gitignored), `-PlaneMode`→`--plane-mode` / `-PlaneGain`→`--plane-gain` / `-PlaneLeash`→`--plane-leash` / `-MaxAlt`→`--max-alt` (vertical-plane "wall" swarming seed, its restoring gain [m/s per m of out-of-plane offset] and vertical leash, plus the ceiling every commanded altitude is clamped to; config keys `PlaneMode`/`PlaneGain`/`PlaneLeash`/`MaxAlt`; the toggle and gain are live in the GUI — this only seeds them), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
+| `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-DemoStitch`→`--heading demostitch` / `-StitchOffset`→`--stitch-offset` (demostitch fan offset deg/rank, config key `StitchOffset`), `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-DObs`→`--d-obs` / `-R0Obs`→`--r0-obs` / `-CObs`→`--c-obs` (virtual-obstacle/geofence repulsion cutoff, detection radius [physical m] and gain; config keys `DObs`/`R0Obs`/`CObs`; the shapes themselves are drawn in the GUI and persist in `shapes.json`), `-AirlinkBands`→`--airlink-bands` / `-AirlinkBandwidth`→`--airlink-bandwidth` / `-VideoMode`→`--video-mode` (per-drone RF band + channel bandwidth in MHz `40\|20\|10\|5` + camera-stream cap, sent to each RC as an `AIRLINK:` one-shot at startup; config keys `AirlinkBands`/`AirlinkBandwidth`/`VideoMode`; empty = send nothing, which leaves whatever was last applied — **not** a reset, see the [AirLink gotcha](#critical-gotchas)), `-NoLinkScan`→`--no-link-scan` (skip the read-only pre-flight link/interference scan; config key `LinkScan`), `-AirlinkMode auto\|manual`→`--airlink-mode` (channel-selection mode; `manual` is the only way `-AirlinkBandwidth` sticks but freezes the channel, `auto` restores DJI's adaptation and is the way back out; config key `AirlinkMode`), `-RecordingDir`→`--recording-dir` / `-RecordMaxSeconds`→`--record-max-s` (root folder and per-clip duration cap for the GUI's **Record clip** button — per-drone 1080p MP4 + frame index + the flight-data CSVs for that window; config keys `RecordingDir`/`RecordMaxSeconds`; separate from `--log-dir` and gitignored), `-PlaneMode`→`--plane-mode` / `-PlaneGain`→`--plane-gain` / `-PlaneLeash`→`--plane-leash` / `-MaxAlt`→`--max-alt` (vertical-plane "wall" swarming seed, its restoring gain [m/s per m of out-of-plane offset] and vertical leash, plus the ceiling every commanded altitude is clamped to; config keys `PlaneMode`/`PlaneGain`/`PlaneLeash`/`MaxAlt`; the toggle and gain are live in the GUI — this only seeds them), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
 | `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
 
 `dji-flocking.ps1`'s launch settings live in **`AOS server/flocking.config.psd1`** (a
