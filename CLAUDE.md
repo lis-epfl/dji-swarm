@@ -423,18 +423,28 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   (`AirlinkBands = @('DUAL')` is the DJI default). This is the first thing to check when
   the link "got worse" after an AirLink change. `LINKDIAG`/the startup link scan reports
   what is actually in force per RC.
-- **Bandwidth does NOT hold in AUTO channel mode (Mini 3 Pro, bench-verified
-  2026-08-07).** The aircraft *accepts* `bw=10`, reports `BANDWIDTH_10MHZ` on an immediate
-  read-back, then reverts to `BANDWIDTH_40MHZ` within 3 s when its channel selection next
-  runs. It is a revert, not a rejection — which is why the settle delay matters, and why the
-  immediate read-back alone would have declared success. This matches DJI documenting
-  `KeyBandwidth` as manual-channel-mode-only. `--airlink-manual-channel` /
-  `AirlinkManualChannel` is the **bench experiment** for it: it sends `mode=MANUAL` ahead of
-  the radio fields (the app chains them behind the mode change), and if the value still does
-  not hold the PC restores AUTO automatically — a failed experiment must not leave the fleet
-  off DJI's own channel selection. `mode=` never goes out on its own, only alongside a
-  band/bandwidth request. Note manual channel selection is reportedly unsupported on this
-  airframe, so expect the mode set itself to be refused.
+- **Bandwidth needs `mode=MANUAL`; in AUTO it reverts (Mini 3 Pro, bench-verified
+  2026-08-07).** In AUTO the aircraft *accepts* `bw=10`, reports `BANDWIDTH_10MHZ` on an
+  immediate read-back, then reverts to `BANDWIDTH_40MHZ` within 3 s when its channel
+  selection next runs — a revert, not a rejection, which is why the settle delay matters and
+  why the immediate read-back alone declares false success. With
+  `--airlink-manual-channel` / `AirlinkManualChannel` the mode set is **accepted** and
+  `bw=10` then **holds** (`mode=MANUAL:bw=BANDWIDTH_10MHZ`). Matches DJI documenting
+  `KeyBandwidth` as manual-channel-mode-only. `mode=` never goes out on its own, only
+  alongside a band/bandwidth request, and the PC restores AUTO automatically for any drone
+  where the value still did not hold.
+- **`ChannelSelectionMode.MANUAL` IS settable on the Mini 3 Pro via the SDK** — DJI's
+  support answer that manual channel selection is unsupported describes the **DJI Fly UI**,
+  not the MSDK, and bench-testing 2026-08-07 accepted MANUAL and held a 10 MHz bandwidth
+  under it. Do not repeat the earlier inference here that UI absence meant the aircraft
+  refuses it: that reasoning is what removed the old `AirlinkChannels`/`KeyFrequencyPoint`
+  path, and it was wrong. Two live consequences: (1) MANUAL **freezes the channel** — the
+  scan reports `freq=` — so entering it without also choosing a frequency point leaves the
+  aircraft pinned to whatever channel it happened to be on, with no adaptivity and no plan;
+  (2) DJI still recommends AUTO, and `KeyFrequencyInterference` returns `?` on this airframe,
+  so there is no on-aircraft measurement to plan a channel assignment from. Weigh a manual
+  plan against losing DJI's per-link adaptation using the logged `link_sq`/`link_down`/
+  `link_up`, which is the only outcome metric this fleet actually has.
 - **An AirLink set is ASYNC — never read it back immediately.**
   `SwarmActivity.applyAirlinkSettings` fires `KeyManager.setValue` and returns; a bandwidth
   change renegotiates the link and takes seconds. A `LINKDIAG` sent straight after the
@@ -445,16 +455,18 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   per-field `AIRLINKRES:` (which sees the SDK's accept/reject *reason*) and the PC's
   scan-based comparison (a different key path, read later). Neither replaces the other —
   a set can be accepted and still not take.
-- **No manual channel selection on the Mini 3 Pro.** DJI does not support manual
-  image-transmission channel selection on this airframe — the RC always picks the channel.
-  The `AIRLINK:` protocol therefore has no channel field (the old `AirlinkChannels` config
-  key and `channel=`/`KeyChannelNumber` path were removed; the key still exists in the SDK
-  and still compiles, it is the *aircraft* that refuses). Band, bandwidth and the camera cap
-  are the levers that remain. Note DJI documents `KeyFrequencyBand` as "only available in
-  manual mode", but DJI Fly exposes 2.4/5.8/dual on this airframe with channel selection on
-  auto, so `applyAirlinkSettings` sets band directly and does **not** force
-  `ChannelSelectionMode.MANUAL` first — forcing a mode the aircraft rejects would leave the
-  link half-configured. A rejected band shows up on the RC status line.
+- **The `AIRLINK:` protocol has no channel field, but NOT because the aircraft refuses
+  one.** The old `AirlinkChannels` key and the `channel=`/`KeyChannelNumber` path were
+  removed on the inference that DJI's "manual channel selection unsupported on the Mini 3
+  Pro" support answer described the airframe; it describes the **DJI Fly UI**, and the SDK
+  accepts `ChannelSelectionMode.MANUAL` (see above). Choosing a specific channel is
+  therefore probably reachable via the documented `KeyFrequencyPoint` (+ `KeyFrequencyPointRange`),
+  which is the correct key name — `KeyChannelNumber` is not in the public MSDK 5 AirLink
+  docs at all, so the old path may have been calling the wrong key as well as being
+  wrongly justified. Untested. If channel planning is ever wanted, start there rather than
+  re-adding `KeyChannelNumber`. `applyAirlinkSettings` still sets band without forcing
+  MANUAL, which is correct: DJI Fly offers 2.4/5.8/dual on this airframe with channel
+  selection on auto, so band does not need the mode change that bandwidth does.
 - **Multi-drone = 1-based `drone_id`** everywhere, mapping to `DroneSwarmServer` shared-memory slots.
 - **Drone identity has TWO independent sources when `DroneIPs` is an explicit list — keep
   them reconciled.** Commands go to the N-th `DroneIPs` entry (RC/switch-port = the
