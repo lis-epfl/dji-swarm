@@ -223,18 +223,83 @@ no video.
     relatch the GPS origin and put the replay in a different frame from the recording.
     `--loop` for tuning against fixed footage, `--speed`, and `--pose-lead-s` to re-pair
     frames with earlier/later poses — the one knob for pose/video skew, which the sim's
-    error budget makes the dominant term. Needs **no `ds_wrapper`, no DroneSwarmServer,
-    no admin, no drones**. Supersedes `image_replay.py` for clips (that one reads
+    error budget makes the dominant term. Clips are addressed by **label**
+    (`--clip grass_nadir_long`): the folder keeps the recorder's `clip_<timestamp>` name —
+    that timestamp is what joins a clip back to `flight_logs/`, and `session.json`'s own
+    `clip` field references it — while the human name is stored **inside** the clip as
+    `meta.label` in its `session.json`, so it travels with the data instead of living in a
+    side index that can drift from the folders. `--list` prints the label→folder table
+    (duration, posed-frame counts, and a **video-health flag**: any drone below 80% of the
+    clip's nominal frame rate is `WARN`, below 50% `*BAD*`, with the starved drones named —
+    a replay of a flagged clip repeats the warning at startup, because one aircraft's link
+    starving its view costs the mosaic that panel and reads as a stitcher fault),
+    `--clip <c> --set-label <name>` writes one and
+    **refuses a name another clip already carries** (two clips answering to one `--clip`
+    would silently replay the wrong footage). `--clip` still accepts a path or folder name,
+    and `--recordings-dir` matches a non-default `RecordingDir`. Needs **no `ds_wrapper`,
+    no DroneSwarmServer, no admin, no drones**. Supersedes `image_replay.py` for clips (that one reads
     `saved_streams/` JPEGs and writes `poseStatus 0`, so it can't drive PLANAR).
     `PyUniSharingFast` must still be in the scene — it is the only writer of the wire
     version, intrinsics and scene plane, all three of which
     `StitcherThreading.planar_inputs_ready()` requires; the settings to match are printed
-    at startup. GUI state rides on `meta["recording"]`
+    at startup, including the **measured standoff** when the clip carries one
+    (`--set-plane-from-line` / `--set-plane-from-shape` / `--set-plane-standoff`, see
+    `clip_scene_plane.py`) and then **checked against what the scene is actually
+    publishing** (`unity_stitch_meta.py`): the startup banner lists the inspector fields
+    that disagree, `--check-unity` does only that check and exits (0 = ready, 1 = not), and
+    while replaying, edits made in the inspector are echoed as `[unity]` lines
+    (`--no-unity-watch` to silence) so hand-stepping the standoff under `--loop` leaves a
+    record of what was tried. The startup banner is one line per topic; `-v`/`--verbose`
+    gives the long form (per-drone counts, full checklist, whole plane report) and nothing
+    is only in the long form except wording. GUI state rides on `meta["recording"]`
     (`{on, finalizing, elapsed, remaining, frames, dropped, last, …}`); the button hides
     itself when a controller doesn't publish it. Recording is deliberately **independent of
     swarming**: a Stop, a min-separation auto-STOP or a geofence DISABLE_VS does not cut the
     clip, and it works in `--dry-run`. No `ds_wrapper` import; `python clip_recorder.py`
     runs a self-check that records a synthetic 2-drone fleet through a full auto-stop cycle.
+  - `clip_scene_plane.py` — the **scene plane** for a recorded clip: the one PLANAR input
+    the field cannot measure. `ScenePlaneMode.FormationRelative` takes the plane's normal
+    from the published poses and asks the operator for one scalar,
+    `planarStandoffMetres` — the perpendicular distance from the formation to the surface.
+    Nothing records it at capture time, but a clip does record every camera's position in a
+    georeferenced frame (`meta["pose_origin_latlon"]` + the `pos_*` columns), so the
+    standoff is a subtraction as soon as the **surface** has a lat/lon — computable
+    **after** the flight, which is what makes it retro-fittable to footage flown with no
+    obstacle drawn. Two georeferenced sources plus an escape hatch, wired into
+    `clip_replay.py`: `--set-plane-from-line LAT1,LON1,LAT2,LON2` (two points along the
+    wall, any bearing — the accurate route), `--set-plane-from-shape [ID]` (an obstacle
+    rectangle from `shapes.json`, which the GUI draws and persists with **no controller
+    running**, so no flight is needed to place one; its faces are axis-aligned, so the
+    wall's azimuth is snapped to N/S/E/W), and `--set-plane-standoff M` for a number
+    measured any other way. `--plane-offset M` moves the surface M metres beyond the traced
+    line, which is what makes a **drone hover track** (or a cadastral outline with a ledge
+    in front of it) usable as the trace — see the
+    [satellite-parallax gotcha](#critical-gotchas). The result is stored as `meta["scene_plane"]` **inside the
+    clip** — same reasoning as `meta.label`: it is a measurement of that footage in that
+    clip's latched pose frame. It refuses a trace it cannot describe the clip with (the
+    formation behind the wall, or the cameras pointing away from it) and reports what the
+    number is worth: the standoff's spread over the clip, the angle between the traced wall
+    and the normal `PlanarStitcher._plane_from_formation` will actually derive, and the
+    **seam cost in mosaic pixels per metre of plane error** (`f·B/Z²`) — see the
+    [scene-plane gotcha](#critical-gotchas). Pure module: no `ds_wrapper`, no numpy, no
+    OpenCV; `python clip_scene_plane.py` runs a self-check.
+  - `unity_stitch_meta.py` — read-only view of **what the Unity stitcher is currently set
+    to**, from `PyUniSharingFast`'s own `MetadataSharedMemory` mapping (412 B; the
+    `meta*Offset` layout is mirrored here, and `plausible()` cross-checks the mapping's
+    self-describing fields — block image size, header size, wire version — against this
+    repo's own so a revision skew is refused instead of misread). There is **no way to push
+    a setting into Unity from the PC**, and that is structural, not missing work: the values
+    live in serialized inspector fields and `WriteMetadata` republishes the whole mapping
+    every Unity frame, so anything written here is gone in ~16 ms and the inspector never
+    sees it. What is possible is the diff, which is what `clip_replay.py` prints. Opens the
+    section with `OpenFileMappingW` rather than `mmap`, deliberately: `mmap.mmap(-1, …)`
+    **creates** a missing named section, which would make "Unity is not running"
+    indistinguishable from "running with everything zeroed" — and a leftover section of the
+    wrong size would make Unity's own `CreateFileMapping` fail. Liveness is the heartbeat
+    advancing, not the mapping existing: a stopped editor's bytes stay readable forever.
+    Pure module, stdlib + `image_stream_feed`'s wire constants;
+    `python unity_stitch_meta.py` self-checks the parser and every catchable mis-setting
+    against a synthetic mapping, then reports on a live scene if one is up.
   - `mqtt_command_sender.py` — `MqttCommandSender`, used by `swarm_flocking.py` when
     `DroneIPs`/`--drone-ips` is set: one **persistent** paho-mqtt connection per RC broker
     (`tcp://<rc-ip>:1883`), publishing the command strings directly (the app's Moquette
@@ -543,6 +608,33 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   to force a constant rate, because that would destroy the frame↔telemetry correspondence.
   Stale-command handling matters — see the UDP staleness window in
   `udp_joystick_receiver.py`.
+- **Whether a traced scene plane is good enough is decided by the standoff, not the trace.**
+  PLANAR's plane error displaces a view by `f·B·δZ/Z²` px — **quadratic in standoff**,
+  linear in baseline. The 2026-08-11 MED facade clips
+  (`planarStandoffMetres` **34.3 / 33.9 m**, B ≈ 10.8 m, f = 525 px at the 800×450 wire
+  size) tolerate 1.0 m for a 5 px seam, so the swisstopo trace + DJI's ~2 m absolute GPS
+  lands at ~10 px — usable, with the last of it closed by stepping the standoff by hand
+  under `--loop`. The same 2 m at a 12 m standoff would be ~70 px, and there the stitcher's
+  own plane sweep cannot rescue it either (its basin is ≈ `L·Z/B`, ±0.2–0.6 m — narrower
+  than the trace error, so it starts outside the basin). Hence **film facades from 30 m+**;
+  the tolerance scales as `Z²/B`, so range and a tight formation both buy more than a
+  better trace. `clip_scene_plane.py` prints the pixel cost for each clip's own geometry
+  rather than a verdict, because the same trace is fine at 34 m and useless at 12.
+- **Satellite tiles are orthorectified to the ground, not to buildings — never trace a
+  roofline.** The GUI's Esri World Imagery is off-nadir, so anything with height is
+  displaced away from the tile's nadir point by `height × tan(off-nadir)` (~5–7 m for a
+  20 m building at 15°, which dwarfs every other term in the plane budget). Ground-level
+  detail — the wall/ground junction, kerbs, road markings — is where it belongs, so trace
+  **only** that. Consequences when drawing a facade on the map: all buildings in one tile
+  lean the same way, so the lean is measurable off any corner where a wall face is visible;
+  the base of the facade *facing* the sensor is visible and traceable, while the far side's
+  base is hidden under its own displaced roof and cannot be traced at all. Two ways round
+  it, both better than the tile: Swiss cadastral footprints (`map.geo.admin.ch`, true
+  ground outlines, right-click gives WGS84) — or fly a drone along the facade a metre or
+  two off it, trace **its GPS track**, and pass that offset as
+  `clip_replay.py --plane-offset`. The drone route is the most accurate available here
+  because the aircraft's absolute GPS bias is then common-mode with the clip's and cancels
+  out of the subtraction, leaving differential error (~0.5 m) instead of absolute (~2 m).
 - **The `.ps1` launchers are the real entry points — keep them in sync.** The operator does
   not run `python …` by hand; they run `.\dji-joystick.ps1` / `.\dji-flocking.ps1` /
   `.\dji-gui.ps1` (all in `AOS server/`). Each launcher hard-codes the `python` command line

@@ -66,6 +66,13 @@ resolution. They are a working default (DJI Mini 3 Pro wide, 16:9), not a
 calibration, and the pinhole model has no distortion term — so DJI's dewarping
 must be enabled on the camera.
 
+The folder name is the clip's identity and is not renamed after the fact — the
+timestamp is what joins it back to flight_logs/, and `meta.clip` references it.
+A human name for a clip goes in `meta.label`, written after the flight by
+`clip_replay.py --set-label` (which also enforces uniqueness) and used there to
+address the clip as `--clip <label>`. It lives inside the clip so it travels with
+the data; nothing in the recording path reads it.
+
 Flight data for the window comes from FlightLogger's mirror hook: a second
 FlightLogger rooted in the clip folder is attached as `logger.mirror` for the
 duration, so all four streams are captured with the timestamps the primary
