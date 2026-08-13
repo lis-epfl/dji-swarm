@@ -97,6 +97,10 @@ import cv2
 import numpy as np
 
 from flight_logger import FlightLogger
+# Pure module (stdlib only). The scene plane is derived at stop time from the same
+# facade auto-pick the live loop and the offline checker use, so a clip carries the
+# wall it was actually flown against instead of needing one retro-fitted by hand.
+import clip_scene_plane as scene_plane
 
 
 # Wrapper array geometry (see CLAUDE.md): YUV 1920x1080 image in [0:3110400].
@@ -191,7 +195,7 @@ class ClipRecorder:
     def __init__(self, drones, hw_decode, base_dir=DEFAULT_RECORDING_DIR,
                  max_seconds=DEFAULT_MAX_SECONDS, fps=DEFAULT_FPS,
                  logger=None, meta=None, queue_depth=DEFAULT_QUEUE_DEPTH,
-                 pose_solver=None):
+                 pose_solver=None, meta_source=None):
         """
         Args:
             drones: {drone_id (1-based int): DroneController} — each must expose
@@ -223,6 +227,17 @@ class ClipRecorder:
         self._fps = float(fps)
         self._logger = logger
         self._meta = dict(meta or {})
+        # A callable returning the controller's LIVE meta, or None.
+        #
+        # self._meta above is a snapshot taken at construction and a different dict
+        # object from the controller's swarm_meta, so it structurally cannot see
+        # anything that changes during a flight -- including meta["facades"], which
+        # the operator draws on the GUI map mid-session. That matters now that the
+        # scene plane is derived from those facades: without this a clip would be
+        # recorded with no record of which wall it was filming. Same callable pattern
+        # TelemetryFeedPublisher already uses (swarm_flocking passes
+        # meta_source=lambda: swarm_meta).
+        self._meta_source = meta_source
         self._queue_depth = int(queue_depth)
         self._pose_solver = pose_solver
         self._cvt = (cv2.COLOR_YUV2BGR_NV12 if hw_decode == 1
@@ -568,6 +583,15 @@ class ClipRecorder:
         else:
             self._write_own_session_json(clip, final_meta)
 
+        # Derive the PLANAR scene plane now, while the facade the operator was
+        # actually filming against is still known. Runs AFTER session.json is
+        # written because analyse() reads the clip back off disk, and it stores
+        # through store_scene_plane for the same reason: a clip's plane must be
+        # produced by exactly the code path `clip_replay --set-plane-from-facade`
+        # uses, warnings and all, or a recorded plane and a retro-fitted one would
+        # be two different measurements wearing one name.
+        self._store_scene_plane(clip)
+
         for did in sorted(clip.results):
             r = clip.results[did]
             if r['frames'] == 0:
@@ -629,6 +653,18 @@ class ClipRecorder:
 
     def _clip_meta(self, clip):
         meta = dict(self._meta)
+        # Fold in the live meta so the clip records what the operator had drawn at
+        # capture time -- the facades in particular, which is what lets the scene
+        # plane be derived at all. Best-effort: a broken meta_source must never stop
+        # a recording, which is the one thing here that cannot be redone later.
+        if self._meta_source is not None:
+            try:
+                live = self._meta_source() or {}
+                for key in ("facades", "obstacles", "geofence", "scene_plane"):
+                    if live.get(key):
+                        meta[key] = live[key]
+            except Exception:
+                pass
         meta.update({
             'clip': clip.name,
             'clip_started_iso': datetime.fromtimestamp(
@@ -663,16 +699,78 @@ class ClipRecorder:
         })
         return meta
 
+    def _store_scene_plane(self, clip):
+        """Measure and store this clip's scene plane, best-effort.
+
+        Which wall is chosen is the SAME rule the live loop and the offline checker
+        use (`clip_scene_plane.pick_facade`), against this clip's own poses -- so the
+        plane stored here is the one the flight was actually flown against, and
+        `python clip_scene_plane.py --clip <dir> --pick` re-derives it.
+
+        Never raises. A clip with no facade drawn, no GPS origin or a trace that
+        cannot describe the footage is simply a clip without a stored plane, exactly
+        as before this existed; `clip_replay --set-plane-*` still retro-fits one.
+        """
+        try:
+            live = (self._meta_source() or {}) if self._meta_source else {}
+            facades = live.get("facades") or self._meta.get("facades") or []
+            origin = (self._pose_solver.origin
+                      if self._pose_solver is not None else None)
+            if not facades or not origin:
+                return
+            track = scene_plane.formation_track(
+                scene_plane.load_posed_frames(clip.dir))
+            if not track:
+                return
+            state = None
+            for t, views in track:
+                pick, state = scene_plane.pick_facade(
+                    facades, tuple(origin), views, state, t - track[0][0])
+            if not pick or pick.get("facade_id", -1) < 0:
+                print("[clip] no facade fits this clip's poses ({}); no scene plane "
+                      "stored".format(pick.get("reason") if pick else "?"), flush=True)
+                return
+            rec = next((f for f in facades
+                        if f.get("id") == pick["facade_id"]), None)
+            if rec is None:
+                return
+            facade = scene_plane.facade_from_stored(
+                rec, tuple(origin), scene_plane.formation_centroid_xz(clip.dir))
+            report = scene_plane.analyse(clip.dir, facade)
+            stored = scene_plane.store_scene_plane(clip.dir, report)
+            print("[clip] scene plane: {:.2f} m from facade {}{}".format(
+                stored["standoff_m"], pick["facade_id"],
+                " ({})".format(rec.get("label")) if rec.get("label") else ""),
+                flush=True)
+        except Exception as e:
+            print("[clip] could not derive a scene plane: {}. Use clip_replay "
+                  "--set-plane-from-facade to add one.".format(e), flush=True)
+
     def _write_own_session_json(self, clip, extra=None):
         """Fallback session.json for the no-flight-log case. When a mirror
-        exists it writes this file instead — exactly one writer per path."""
+        exists it writes this file instead — exactly one writer per path.
+
+        The payload is nested under 'meta' to match what FlightLogger writes on the
+        other path. It used to be dumped FLAT, which every reader of a clip's
+        metadata gets wrong the same way: `_session_meta` does `doc.get('meta')`, so
+        on the --no-log path it read {} and the clip silently had no label, no
+        camera block and no pose origin. That was survivable when it only cost the
+        label; now it would silently cost the scene plane too.
+        """
         info = self._clip_meta(clip)
         info['flight_data'] = False
         if extra:
             info.update(extra)
+        doc = {
+            'session': '',
+            'started_iso': datetime.fromtimestamp(
+                clip.t_start_epoch).isoformat(timespec='seconds'),
+            'started_epoch': clip.t_start_epoch,
+            'meta': info,
+        }
         try:
             with open(os.path.join(clip.dir, 'session.json'), 'w') as f:
-                json.dump(info, f, indent=2, default=str)
+                json.dump(doc, f, indent=2, default=str)
         except OSError as e:
             print("[clip] session.json write failed: {}".format(e), flush=True)
 

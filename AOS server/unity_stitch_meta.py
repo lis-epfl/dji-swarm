@@ -84,6 +84,11 @@ OFF_STANDOFF = 364            # float32
 OFF_CANVAS_MODE = 380         # uint8
 OFF_HEARTBEAT = 384           # uint32, bumped every Unity frame
 OFF_SLOT_CAPACITY = 388       # int32, then int32 stride
+# Which source the standoff at 364 ACTUALLY came from this frame. Published because
+# the value alone cannot say -- it is a float either way -- so without it a tool that
+# supplies a standoff over the feed trailer cannot tell whether the scene took it or
+# is ignoring it in favour of a hand-typed one (planarStandoffSource = Inspector).
+OFF_STANDOFF_SOURCE = 396     # uint8
 
 # Enum mirrors. Values are explicit on the C# side precisely so they can be
 # mirrored by number.
@@ -94,6 +99,10 @@ BLEND_MODES = {0: "Feather", 1: "Nearest"}
 BLEND_NEAREST = 1
 POSE_SOURCES = {0: "GroundTruth", 1: "NoisyState", 2: "GroundTruthPlusGnss"}
 CANVAS_MODES = {0: "Fixed", 1: "AutoFit"}
+# The RESOLVED source, not the requested one: PyUniSharingFast.planarStandoffSource is
+# Auto/Inspector, but Auto still reads "inspector" whenever no live value is arriving.
+STANDOFF_SOURCES = {0: "inspector", 1: "PC"}
+STANDOFF_SOURCE_PC = 1
 
 # How closely a live value has to match before it is left alone. The standoff one
 # is deliberately loose enough that hand-stepping it under --loop does not get
@@ -103,7 +112,7 @@ STANDOFF_TOL_M = 0.05
 
 # Fields worth reporting a mid-replay change of, and how to render them.
 watch_fields = ("stitcher", "plane_mode", "standoff", "blend_mode",
-                "sweep_enabled", "sweep_range")
+                "sweep_enabled", "sweep_range", "standoff_source")
 
 # Parsed key -> the name of the field as it appears in the Unity inspector. Every
 # message aimed at the operator uses these: the parsed names are this module's
@@ -112,6 +121,7 @@ INSPECTOR_NAMES = {
     "stitcher": "typeOfStitcher",
     "plane_mode": "scenePlaneMode",
     "standoff": "planarStandoffMetres",
+    "standoff_source": "standoff in force",
     "blend_mode": "planarBlendMode",
     "sweep_enabled": "planarPlaneSweep",
     "sweep_range": "planarSweepRange",
@@ -189,6 +199,7 @@ def parse(raw):
         "sweep_range": u('<f', OFF_SWEEP_RANGE)[0],
         "sweep_steps": u('<i', OFF_SWEEP_RANGE + 4)[0],
         "standoff": u('<f', OFF_STANDOFF)[0],
+        "standoff_source": u('<B', OFF_STANDOFF_SOURCE)[0],
         "canvas_mode": u('<B', OFF_CANVAS_MODE)[0],
         "heartbeat": u('<I', OFF_HEARTBEAT)[0],
         "slot_capacity": u('<i', OFF_SLOT_CAPACITY)[0],
@@ -295,11 +306,12 @@ def compare(meta, want):
                     "the count is only a scan hint now, but check the scene "
                     "expects the whole fleet.".format(meta["block_count"],
                                                       want["drones"]))
-    info.append("live: stitcher {}, plane {} (valid={}), standoff {:.2f} m, "
+    info.append("live: stitcher {}, plane {} (valid={}), standoff {:.2f} m (from the {}), "
                 "blend {}, canvas {}, poseSource {}, wire v{} hdr {} B"
                 .format(meta["stitcher"] or "(unset)",
                         PLANE_MODES.get(meta["plane_mode"], meta["plane_mode"]),
                         meta["plane_valid"], meta["standoff"],
+                        STANDOFF_SOURCES.get(meta.get("standoff_source"), "?"),
                         BLEND_MODES.get(meta["blend_mode"], meta["blend_mode"]),
                         CANVAS_MODES.get(meta["canvas_mode"], meta["canvas_mode"]),
                         POSE_SOURCES.get(meta["pose_source"], meta["pose_source"]),
@@ -366,11 +378,20 @@ def _selftest():
                      PLANE_MODE_FORMATION_RELATIVE)
     struct.pack_into('<B', buf, OFF_BLEND_MODE, BLEND_NEAREST)
     struct.pack_into('<f', buf, OFF_STANDOFF, 33.88)
+    struct.pack_into('<B', buf, OFF_STANDOFF_SOURCE, STANDOFF_SOURCE_PC)
     struct.pack_into('<I', buf, OFF_HEARTBEAT, 1234)
 
     m = parse(bytes(buf))
     check("stitcher name parses", m["stitcher"] == "PLANAR", m["stitcher"])
     check("standoff parses", abs(m["standoff"] - 33.88) < 1e-4, m["standoff"])
+    check("standoff source parses", m["standoff_source"] == STANDOFF_SOURCE_PC,
+          m["standoff_source"])
+    # The source byte lives at 396, inside what used to be metadataReservedGap. If it
+    # ever collides with the two section-size fields the mapping ends with, the sizes
+    # are what get corrupted -- and those are what Python refuses to run on.
+    check("the source byte sits clear of the trailing size fields",
+          OFF_STANDOFF_SOURCE + 1 <= 404 and METADATA_SIZE == 412,
+          (OFF_STANDOFF_SOURCE, METADATA_SIZE))
     check("plane mode parses",
           m["plane_mode"] == PLANE_MODE_FORMATION_RELATIVE, m["plane_mode"])
     good, why = plausible(m)

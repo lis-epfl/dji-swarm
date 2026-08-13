@@ -50,12 +50,20 @@ failing.
     latched origin. They are NOT re-derived — re-deriving would relatch the origin
     from whichever row happened to be read first and put the replay in a different
     frame from the recording.
-  * `captureTime` is rebased to `t_epoch - t0`, with `t0` the earliest frame in the
-    whole clip. Absolute value is meaningless to the consumer (float32, read only as
-    a difference) but the CROSS-DRONE SKEW is preserved exactly as recorded, which is
-    what `PlanarStitcher.MAX_CAPTURE_SKEW_S` gates on.
+  * `captureTime` is seconds since the REPLAY started — the same "since the producer
+    started" clock `image_stream_feed.py` publishes live, so the consumer cannot tell a
+    replay from a flight. It is rebased off `t_epoch - t0` (`t0` = the earliest frame in
+    the whole clip) and then advances monotonically across loop passes. Absolute value is
+    meaningless to the consumer (float32, read only as a difference) but the CROSS-DRONE
+    SKEW is preserved exactly as recorded, which is what
+    `PlanarStitcher.MAX_CAPTURE_SKEW_S` gates on.
   * Frames are paced off the recorded `t_epoch`, so the per-drone rate, the jitter and
     the drift between aircraft all replay as they happened.
+  * Under `--loop` every drone shares ONE pass clock, whose period is the longest
+    drone's span (plus `LOOP_GAP_S`). Drones with shorter footage hold their last
+    frame until the shared boundary. Without this the cross-drone skew above holds
+    only on the first pass and then accumulates without bound, until the stitcher
+    drops the slowest drone's view as stale — see `_DroneReplay.run`.
 
 What the sim still needs (this tool cannot supply it)
 -----------------------------------------------------
@@ -105,6 +113,26 @@ OUT_W, OUT_H = 800, 450
 # on top would stretch the timeline and destroy the thing being replayed. The
 # flag handshake inside write_memory still gates each write on the consumer.
 PACE_S = 0.0
+
+# Slack added to every loop's pass period, identically for every drone.
+#
+# It absorbs the per-pass cv2.VideoCapture reopen (~33 ms measured on all three
+# aircraft of the MED clips) so that cost delays nobody's first frame.
+#
+# Kept small on purpose. It is paid as a HOLD on the last frame, and a drone
+# holding its last frame is genuinely stale by exactly that long -- so the gap
+# lands directly in the cross-drone capture_time spread the stitcher gates on.
+# At 0.15 s the spread on the MED clips peaked at 0.19 s against a 0.25 s gate,
+# which is too little margin for a constant that buys nothing above the reopen.
+LOOP_GAP_S = 0.08
+
+# Mirror of PlanarStitcher.MAX_CAPTURE_SKEW_S in the vr_swarm_simulation repo.
+# Not importable across the repo boundary, and only used to warn -- a clip whose
+# drones stop at very different times makes the shared pass boundary hold the
+# early finishers past what the stitcher will accept, and it drops those views
+# near every boundary. That is honest (their footage really has ended) but it
+# looks exactly like the accumulating-skew bug this pass clock removes, so say so.
+STITCHER_MAX_SKEW_S = 0.25
 
 # Where clips live by default. Matches clip_recorder's --recording-dir default; a
 # session started with a different RecordingDir needs --recordings-dir to match.
@@ -269,6 +297,12 @@ class _UnityWatch(threading.Thread):
             return unity_meta.PLANE_MODES.get(meta[field], meta[field])
         if field == "blend_mode":
             return unity_meta.BLEND_MODES.get(meta[field], meta[field])
+        if field == "standoff_source":
+            # The one watched field that is not an operator edit but a CONSEQUENCE of
+            # one: flipping planarStandoffSource to Inspector, or the scene losing our
+            # trailer, both show up here. Worth reporting for exactly that reason —
+            # it is the moment this replay stops being the thing driving the plane.
+            return unity_meta.STANDOFF_SOURCES.get(meta[field], meta[field])
         if field in ("standoff", "sweep_range"):
             return "{:.2f}".format(meta[field])
         return str(meta[field])
@@ -554,7 +588,7 @@ class _DroneReplay(threading.Thread):
     """
 
     def __init__(self, drone_id, rows, mp4_path, t0, speed, loop, pose_lead_s,
-                 stop_evt):
+                 stop_evt, epoch0, pass_period):
         threading.Thread.__init__(self, name="ClipReplay_{}".format(drone_id),
                                   daemon=True)
         self.drone_id = drone_id
@@ -565,6 +599,11 @@ class _DroneReplay(threading.Thread):
         self.loop = loop
         self.pose_lead_s = pose_lead_s
         self.stop_evt = stop_evt
+        # The pass clock is CLIP-WIDE and shared by every drone thread: one wall
+        # instant that maps to the clip's t0, and one period every drone's pass
+        # boundary lands on. See run() for why it cannot be per-thread.
+        self.epoch0 = epoch0
+        self.pass_period = pass_period
         self.image_bytes = OUT_W * OUT_H * 3
         self.block_bytes = BLOCK_HEADER_BYTES + self.image_bytes
         self.published = 0
@@ -591,17 +630,50 @@ class _DroneReplay(threading.Thread):
         return self.rows[j]
 
     def run(self):
-        mmf = mmap.mmap(-1, MAX_DRONES * self.block_bytes, BLOCK_MAP_NAME)
+        """Replay this drone's frames, pass after pass, on the SHARED pass clock.
+
+        Every pass k begins at ``epoch0 + k * pass_period`` for every drone, so a
+        frame's wall time is a pure function of the clip clock and never of how
+        long this thread's own previous passes happened to take.
+
+        That is the whole fix. This loop used to re-latch ``epoch0 =
+        time.monotonic()`` at the top of each pass, which made a pass last that
+        drone's OWN recorded span: 6.4503 s for d1, 6.4850 s for d2, 6.4655 s for
+        d3 on the MED clips. d2 therefore fell 34.6 ms further behind d1 every
+        loop, and after ~7 loops (~47 s) the cross-drone spread in ``capture_time``
+        exceeded ``PlanarStitcher.MAX_CAPTURE_SKEW_S`` (0.25 s) and the stitcher
+        dropped d2's view as stale -- for most of a ~20 minute beat cycle, and
+        with nothing in either process reporting why. A fresh replay looked fine
+        for the first 45 s, which is what made it intermittent.
+
+        Drones whose footage is shorter than the clip-wide period simply HOLD
+        their last frame at the end of each pass: nothing is published, so the
+        block keeps its final image and its final capture_time until the shared
+        boundary comes round. On the MED clips that hold is 0.15-0.19 s.
+
+        No barrier and no shared state between the threads: each derives the same
+        schedule independently from two constants, so a thread stalled inside
+        ``write_memory``'s handshake cannot hold up any other drone, and a late
+        pass corrects itself rather than displacing every pass after it.
+        """
+        mmf, _trailer_ok = imageSharingUtil.open_feed_map(BLOCK_MAP_NAME)
         offset = (self.drone_id - 1) * self.block_bytes
         try:
+            pass_index = 0
             while not self.stop_evt.is_set():
+                # Opened BEFORE the boundary wait, so the ~33 ms reopen is paid
+                # out of the hold rather than out of the next pass's first frame.
                 cap = cv2.VideoCapture(self.mp4_path)
                 if not cap.isOpened():
                     print("[replay] drone {}: cannot open {}".format(
                         self.drone_id, self.mp4_path), flush=True)
                     return
-                # Wall-clock instant that maps to the clip's t0 for this pass.
-                epoch0 = time.monotonic()
+                pass_start = self.epoch0 + pass_index * self.pass_period
+                # Hold the last frame until this pass is due. ~0 on pass 0.
+                hold = pass_start - time.monotonic()
+                if hold > 0 and self.stop_evt.wait(hold):
+                    cap.release()
+                    break
                 i = 0
                 try:
                     while not self.stop_evt.is_set():
@@ -611,7 +683,7 @@ class _DroneReplay(threading.Thread):
                         row = self.rows[i]
                         # Recorded offset from the clip's start, time-scaled.
                         due = ((float(row['t_epoch']) - self.t0) / self.speed)
-                        wait = (epoch0 + due) - time.monotonic()
+                        wait = (pass_start + due) - time.monotonic()
                         if wait > 0:
                             if self.stop_evt.wait(wait):
                                 break
@@ -623,20 +695,119 @@ class _DroneReplay(threading.Thread):
                         if pose is None:
                             self.unposed += 1
                         heading = float(row.get('heading') or 0.0)
-                        # capture_time: seconds since the clip's own start, so
-                        # cross-drone skew is preserved and float32 keeps its
-                        # resolution (see the module docstring).
+                        # capture_time: seconds since the REPLAY started, not since
+                        # this pass started -- the same "since the producer started"
+                        # clock image_stream_feed.py publishes live, so the consumer
+                        # cannot tell a replay from a flight.
+                        #
+                        # It must not reset each pass. At a boundary the first drone
+                        # to wrap would read ~0 while the others still held ~6.45,
+                        # and _drop_stale would drop the drone that had just been
+                        # refreshed -- briefly, but every loop, and for exactly the
+                        # views that were most up to date. Monotonic removes the
+                        # wrap entirely: the spread across drones is then always the
+                        # recorded one (9-72 ms here).
+                        #
+                        # Unbounded growth is fine at float32: the field is only ever
+                        # read as a difference, and its resolution stays under 10 ms
+                        # out past 23 hours of replay.
+                        capture_time = pass_index * self.pass_period + due
                         imageSharingUtil.write_memory(
                             mmf, offset, self.image_bytes, img,
                             self.drone_id - 1, heading, pace_s=PACE_S,
-                            pose=pose, capture_time=due)
+                            pose=pose, capture_time=capture_time)
                         self.published += 1
                         i += 1
                 finally:
                     cap.release()
                 if not self.loop:
                     break
+                pass_index += 1
         finally:
+            try:
+                mmf.close()
+            except Exception:
+                pass
+
+
+class _StandoffReplay(threading.Thread):
+    """Publish the clip's scene-plane standoff into the feed trailer, per frame.
+
+    Recomputed from the stored plane and the replayed poses rather than republished
+    as the stored scalar, because the stored scalar is a mean over the whole clip:
+    on any clip where the formation translates (grass_nadir_long has the operator
+    flying the flock throughout) it is wrong at both ends. `meta.scene_plane` already
+    records `plane_n`/`plane_d` in the clip's own latched pose frame — the same frame
+    the replayed poses are in — so this is a dot product per frame with no
+    re-projection and no origin arithmetic.
+
+    Falls back to the stored scalar when the clip's plane came from
+    --set-plane-standoff and so describes no plane anyone can re-measure.
+
+    Paced on the same shared pass clock as the drone threads, so --loop and --speed
+    need no handling of their own.
+    """
+
+    def __init__(self, track, plane, fallback_m, t0, speed, loop, stop_evt,
+                 epoch0, pass_period, period_s=0.1):
+        threading.Thread.__init__(self, name="ClipStandoff", daemon=True)
+        self.track = track
+        self.plane = plane
+        self.fallback_m = fallback_m
+        self.t0 = t0
+        self.speed = speed
+        self.loop = loop
+        self.stop_evt = stop_evt
+        self.epoch0 = epoch0
+        self.pass_period = pass_period
+        self.period_s = period_s
+        self.published = 0
+        self.min_m = None
+        self.max_m = None
+
+    def _standoff_at(self, t_rel):
+        """The clip's standoff at clip-time `t_rel`, from the nearest posed instant."""
+        if self.plane is None or not self.track:
+            return self.fallback_m
+        best = min(self.track, key=lambda it: abs((it[0] - self.t0) - t_rel))
+        return scene_plane.standoff_of(self.plane,
+                                       scene_plane.centroid_of(best[1]))
+
+    def run(self):
+        mmf, trailer_ok = imageSharingUtil.open_feed_map(BLOCK_MAP_NAME)
+        if not trailer_ok:
+            print("[replay] the feed map predates the scene-plane trailer; "
+                  "Unity will use its own planarStandoffMetres.", flush=True)
+            mmf.close()
+            return
+        seq = beat = 0
+        try:
+            while not self.stop_evt.is_set():
+                now = time.monotonic()
+                elapsed = now - self.epoch0
+                # Where in the clip we are, on the same clock the drones use.
+                t_rel = (elapsed % self.pass_period) if self.loop else elapsed
+                standoff = self._standoff_at(t_rel * self.speed)
+                beat += 1
+                seq = imageSharingUtil.write_standoff_trailer(
+                    mmf, seq, beat, standoff,
+                    imageSharingUtil.FEED_TR_STATUS_LOCKED,
+                    facade_id=0, view_count=len(self.track[0][1]) if self.track else 0)
+                self.published += 1
+                self.min_m = standoff if self.min_m is None else min(self.min_m, standoff)
+                self.max_m = standoff if self.max_m is None else max(self.max_m, standoff)
+                if self.stop_evt.wait(self.period_s):
+                    break
+        finally:
+            # Retire the plane on the way out, rather than leaving the last value
+            # sitting in a section that outlives this process. Unity's heartbeat
+            # watchdog would catch it within 2 s anyway; this makes it immediate.
+            try:
+                imageSharingUtil.write_standoff_trailer(
+                    mmf, seq, beat + 1, 0.0,
+                    imageSharingUtil.FEED_TR_STATUS_NO_FACADE)
+            except Exception:
+                pass
             try:
                 mmf.close()
             except Exception:
@@ -710,6 +881,12 @@ def main():
                             "with this clip, and exit. Nothing can be set from "
                             "here — PyUniSharingFast rewrites that mapping every "
                             "frame — so this is a diff, not an apply.")
+    plane.add_argument("--no-standoff", action="store_true",
+                       help="Don't publish the clip's standoff into the feed map's "
+                            "scene-plane trailer. Unity then falls back to whatever "
+                            "planarStandoffMetres its inspector holds, which is the "
+                            "pre-trailer behaviour — use it to compare a hand-typed "
+                            "standoff against the clip's measured one.")
     plane.add_argument("--no-unity-watch", action="store_true",
                        help="Don't report inspector edits made while replaying. "
                             "The watch is read-only and prints only on change; "
@@ -775,6 +952,14 @@ def main():
     posed = sum(1 for rows in drones.values() for r in rows if _pose_of(r))
     total = sum(len(rows) for rows in drones.values())
     skew = max(float(rows[0]['t_epoch']) - t0 for rows in drones.values())
+    # One pass clock for the whole clip. The period is the LONGEST drone's span, so
+    # no drone's footage is ever cut short; the others hold their last frame to the
+    # shared boundary. Every drone is scheduled against the same epoch, which is what
+    # stops the cross-drone capture_time skew accumulating under --loop -- see
+    # _DroneReplay.run for the failure it replaces.
+    pass_period = span / args.speed + LOOP_GAP_S
+    holds = {did: pass_period - (float(rows[-1]['t_epoch']) - t0) / args.speed
+             for did, rows in drones.items()}
     print("Clip replay -> {} ({} blocks x {}x{})".format(
         BLOCK_MAP_NAME, MAX_DRONES, OUT_W, OUT_H))
     if args.verbose:
@@ -802,6 +987,25 @@ def main():
             "  " if args.speed != 1.0 and args.pose_lead_s else "",
             "POSE LEAD {:+.3f} s — poses re-paired, not a faithful replay".format(
                 args.pose_lead_s) if args.pose_lead_s else ""))
+    if args.loop:
+        print("  loop: {:.3f} s pass, all drones on one clock{}".format(
+            pass_period,
+            ", holding {}".format(
+                " ".join("d{} {:.0f}ms".format(d, holds[d] * 1000)
+                         for d in sorted(holds)))
+            if args.verbose else ""))
+        worst = max(holds.values())
+        if worst > STITCHER_MAX_SKEW_S:
+            late = [d for d in sorted(holds) if holds[d] > STITCHER_MAX_SKEW_S]
+            print("  ! this clip's drones stop up to {:.2f} s apart, so {} hold past "
+                  "the stitcher's {:.2f} s staleness\n"
+                  "    gate near every loop boundary and PLANAR drops {} view{} "
+                  "there. Their footage really has\n"
+                  "    ended — this is not the accumulating skew the shared pass "
+                  "clock removes.".format(
+                      worst, ", ".join("d{}".format(d) for d in late),
+                      STITCHER_MAX_SKEW_S, "those" if len(late) > 1 else "that",
+                      "s" if len(late) > 1 else ""))
     # Said here as well as in --list because this is the moment it changes what
     # you conclude: a thin seam or a missing panel in the mosaic is the clip's
     # fault, not the stitcher's, and nothing downstream can recover the frames.
@@ -827,6 +1031,15 @@ def main():
     stored_plane = scene_plane.scene_plane_of(clip_dir)
     standoff = ("{:.2f}".format(stored_plane['standoff_m'])
                 if stored_plane and stored_plane.get('standoff_m') else None)
+    # Whether THIS process will be driving the standoff over the feed trailer. When
+    # it is, the inspector's planarStandoffMetres is overridden and comparing against
+    # it is meaningless — worse than meaningless, because the [unity] watch below
+    # would report our own writes as though an operator had typed them. So the field
+    # comes out of the checklist entirely and is reported as ours instead.
+    drives_standoff = bool(stored_plane) and not args.no_standoff
+    if drives_standoff:
+        want.pop("standoff", None)
+
     if args.verbose:
         print("\nSet these in the Unity scene (this tool cannot — PyUniSharingFast "
               "owns the metadata,\nand planar_inputs_ready() refuses PLANAR without "
@@ -834,13 +1047,20 @@ def main():
         print("  PyUniSharingFast: typeOfStitcher=PLANAR, useManualIntrinsics=true,")
         print("                    manualVerticalFovDeg={}, planarBlendMode=Nearest,"
               .format(cam.get('vfov_deg', 46.4)))
-        print("                    scenePlaneMode=FormationRelative, "
-              "planarStandoffMetres={}".format(
-                  standoff or "<distance to the surface>"))
+        print("                    scenePlaneMode=FormationRelative{}".format(
+            "" if drives_standoff else
+            ", planarStandoffMetres={}".format(
+                standoff or "<distance to the surface>")))
     else:
         print("  needs: PLANAR, manualVerticalFovDeg {}, blend Nearest, "
-              "FormationRelative, standoff {}".format(
-                  cam.get('vfov_deg', 46.4), standoff or "?"))
+              "FormationRelative{}".format(
+                  cam.get('vfov_deg', 46.4),
+                  "" if drives_standoff else ", standoff {}".format(standoff or "?")))
+    if drives_standoff:
+        print("  standoff: driven by this replay ({} m, recomputed per frame from "
+              "the clip's\n            stored plane). Unity uses it only with "
+              "planarStandoffSource = Auto;\n            set Inspector there to "
+              "override it, or --no-standoff here to not send it.".format(standoff))
     if standoff is None:
         print("  ! no plane measured for this clip: "
               "--set-plane-from-line LAT1,LON1,LAT2,LON2")
@@ -857,13 +1077,28 @@ def main():
     print("Ctrl+C to stop.\n")
 
     stop_evt = threading.Event()
+    epoch0 = time.monotonic()
     workers = [_DroneReplay(did, rows,
                             os.path.join(clip_dir, "drone{}.mp4".format(did)),
-                            t0, args.speed, args.loop, args.pose_lead_s, stop_evt)
+                            t0, args.speed, args.loop, args.pose_lead_s, stop_evt,
+                            epoch0, pass_period)
                for did, rows in sorted(drones.items())]
+    standoff_worker = None
+    if stored_plane and not args.no_standoff:
+        try:
+            track = scene_plane.formation_track(
+                scene_plane.load_posed_frames(clip_dir))
+        except (OSError, ValueError):
+            track = []
+        standoff_worker = _StandoffReplay(
+            track, scene_plane.plane_from_report(stored_plane),
+            stored_plane.get("standoff_m") or 0.0, t0, args.speed, args.loop,
+            stop_evt, epoch0, pass_period)
     if not args.no_unity_watch:
         workers_watch = _UnityWatch(want, stop_evt)
         workers_watch.start()
+    if standoff_worker is not None:
+        standoff_worker.start()
     for w in workers:
         w.start()
     try:
@@ -876,6 +1111,8 @@ def main():
     stop_evt.set()
     for w in workers:
         w.join(timeout=3)
+    if standoff_worker is not None:
+        standoff_worker.join(timeout=3)
 
     late = sum(w.late for w in workers)
     unposed = sum(w.unposed for w in workers)
@@ -884,6 +1121,11 @@ def main():
         ", {} unposed".format(unposed) if unposed else "",
         ", {} late >0.5 s (consumer handshake throttling: lower --speed, or "
         "check Unity is reading)".format(late) if late else ""))
+    if standoff_worker is not None and standoff_worker.published:
+        print("Standoff: {} writes, {:.2f}..{:.2f} m{}".format(
+            standoff_worker.published, standoff_worker.min_m, standoff_worker.max_m,
+            "" if standoff_worker.plane is not None else
+            " (stored scalar — this clip's plane has no normal to re-measure)"))
 
 
 if __name__ == "__main__":

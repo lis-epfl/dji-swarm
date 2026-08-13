@@ -149,6 +149,10 @@ from clip_recorder import (
     MAX_SECONDS_MIN, MAX_SECONDS_MAX,
 )
 from dji_camera_pose import CameraPoseSolver
+# Pure module (stdlib only, no ds_wrapper / numpy / cv2), so the flight loop can
+# import it. The facade auto-pick and the standoff maths live there because the
+# offline checker, the replayer and the recorder all need the SAME rule.
+import clip_scene_plane as scene_plane
 from mqtt_command_sender import MqttCommandSender
 from response_monitor import ResponseMonitor
 from joystick_controller import (
@@ -993,9 +997,14 @@ def command_listener(swarming, meta, host, port, shapes_path=None):
                       f"{len(meta['obstacles'])} obstacles total)")
             elif action == "add_facade":
                 # One wall of a footprint, kept as a PLANAR inspection plane.
-                # Inert for flight — nothing in run() reads meta["facades"];
-                # it is echoed only so the GUI and shapes.json agree, and so
-                # clip_replay.py --set-plane-from-facade can find it later.
+                #
+                # NO LONGER INERT. run() reads meta["facades"] every tick and
+                # auto-picks the wall the formation is filming, whose standoff is
+                # published to the Unity stitcher. So adding one MID-FLIGHT can step
+                # the published scene plane — bounded to one deliberate transition by
+                # pick_facade's dwell, and announced on the console and the GUI chip,
+                # but real. It still repels nothing: a facade is a measurement
+                # surface, not a keep-out shape.
                 if meta is None:
                     continue
                 pair = validate_facade(msg.get("p1"), msg.get("p2"))
@@ -1090,13 +1099,55 @@ def command_listener(swarming, meta, host, port, shapes_path=None):
             continue  # ignore malformed packets, keep listening
 
 
+# ---------- PLANAR scene plane ----------
+
+def _scene_plane_meta(pick):
+    """The GUI's view of the scene plane. JSON-safe, and without `candidates` --
+    that list is for the offline checker, not for a 5 Hz telemetry push."""
+    if not pick:
+        return None
+    out = {k: pick.get(k) for k in
+           ("facade_id", "label", "standoff_m", "look_off_deg", "tilt_deg",
+            "spread_m", "view_count", "state")}
+    out["reason"] = pick.get("reason") or ""
+    return out
+
+
+def _announce_scene_plane(pick, said):
+    """Print one line when the scene plane changes. Returns the new `said` key.
+
+    Prints on a CHANGE only, never per tick -- but note what counts as a change
+    includes falling back to nothing. With no operator override flag, a flight with
+    no facade traced silently uses whatever Unity's inspector holds and otherwise
+    looks exactly like success, so "no wall" has to be as loud as a wall.
+    """
+    fid = pick.get("facade_id", -1) if pick else -1
+    state = pick.get("state") if pick else "none"
+    key = (fid, state)
+    if key == said:
+        return said
+    if fid < 0:
+        print("[plane] no facade picked ({}). PLANAR will use Unity's own "
+              "planarStandoffMetres — trace the wall on the GUI map to drive it "
+              "from here.".format(pick.get("reason") or "no reason given"))
+    else:
+        print("[plane] facade {}{}: {:.2f} m standoff, {:.0f} deg off the wall, "
+              "{} views{}".format(
+                  fid, " ({})".format(pick["label"]) if pick.get("label") else "",
+                  pick.get("standoff_m") or 0.0, pick.get("look_off_deg") or 0.0,
+                  pick.get("view_count") or 0,
+                  " [settling]" if state == "dwelling" else ""))
+    return key
+
+
 # ---------- main loop ----------
 
 def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         logger=None, speed_scale=1.0, meta=None, heading_ctrl=None,
         stitch_ctrl=None, cmd_sender=None, identity_check=True,
         min_separation=DEFAULT_MIN_SEPARATION_M, avoid=None,
-        plane_ctrl=None, max_alt=MAX_ALT_M, recorder=None):
+        plane_ctrl=None, max_alt=MAX_ALT_M, recorder=None,
+        pose_solver=None, img_stream=None):
     print("\n--- Olfati-Saber Swarm Mode ---")
     print(f"  Drones: {sorted(swarm.drones.keys())}")
     print(f"  c_vm={olfati.c_vm}  r0_coh={olfati.r0_coh}  scale={olfati.scale}")
@@ -1169,6 +1220,11 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
     # GUI clip recorder (video + windowed flight data); the marker's timestamp
     # is what dedupes it, so a repeated UDP datagram is a no-op.
     last_record_req = ((meta or {}).get("record_req") or {}).get("t")
+    # Facade auto-pick carry-over: the incumbent, its dwelling challenger and the
+    # low-passed standoff. Held here rather than inside pick_facade so that function
+    # stays pure and the offline checker can reproduce this loop's decisions exactly.
+    plane_state = None
+    plane_said = None
 
     while True:
         now = time.time()
@@ -1618,6 +1674,36 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                     if ob.get("kind") == "poly" and ob.get("vertices")]
         fence_ne = (polygon_to_ne(fence, lat_ref, lon_ref)
                     if fence and len(fence) >= 3 else None)
+
+        # PLANAR scene plane: which traced wall is the formation filming, and how far
+        # in front of it is it? Published into the feed map's trailer for the Unity
+        # stitcher, replacing a number that used to be typed into an inspector field
+        # by hand -- and a wrong one there is the single largest error in the mosaic.
+        #
+        # Deliberately NOT in the per-tick lat_ref/lon_ref frame the obstacles above
+        # use. That reference drifts with the swarm, which is right for flocking and
+        # wrong here: the stitcher builds its plane from the poses the BLOCKS carry,
+        # which are in CameraPoseSolver's latched frame, and a standoff derived in a
+        # different frame would be describing a wall in one frame and cameras in
+        # another. Using the solver's own pose_for() also means the centroid here is
+        # byte-for-byte the centroid those poses describe -- and it is what latches
+        # the origin at all on a run with no --image-stream-pose.
+        if img_stream is not None and pose_solver is not None:
+            pose_views = []
+            for did, t in fixes:
+                p, q, st = pose_solver.pose_for(t)
+                if st:
+                    pose_views.append((did, p, scene_plane.forward_from_quat(q)))
+            plane_pick, plane_state = scene_plane.pick_facade(
+                (meta or {}).get("facades") or [], pose_solver.origin,
+                pose_views, plane_state, now)
+            if plane_pick.get("facade_id", -1) >= 0:
+                img_stream.set_standoff(plane_pick, now)
+            else:
+                img_stream.set_standoff(None, now)
+            if meta is not None:
+                meta["scene_plane"] = _scene_plane_meta(plane_pick)
+            plane_said = _announce_scene_plane(plane_pick, plane_said)
 
         # Minimum-separation failsafe: any pair too close -> auto-STOP swarming
         # (the falling edge above then zeroes velocities, brakes, and disables
@@ -2673,7 +2759,12 @@ def main():
                                   "plane_mode": args.plane_mode,
                                   "flight_log": (logger.session_dir
                                                  if logger else None)},
-                            pose_solver=pose_solver)
+                            pose_solver=pose_solver,
+                            # The live meta, so a clip records the facades the
+                            # operator had drawn AT CAPTURE TIME and can derive its
+                            # own scene plane. The `meta=` dict above is a snapshot
+                            # and cannot see a wall picked mid-flight.
+                            meta_source=lambda: swarm_meta)
     print(f"  Clip recording -> {recording_dir} "
           f"(GUI Record button, max {args.record_max_s:.0f} s per clip, "
           f"with per-frame camera pose)")
@@ -2782,9 +2873,11 @@ def main():
         # ids, refreshed each tick by run() for the GUI's FENCED OUT badges.
         "obstacles": obstacles,
         "geofence": geofence,
-        # PLANAR inspection walls picked off a building footprint. Inert for
-        # flight — nothing in run() reads them; they ride in meta only so the
-        # GUI echo and shapes.json stay symmetric with the obstacle lists.
+        # PLANAR inspection walls picked off a building footprint. READ EVERY TICK
+        # by run(), which auto-picks the one the formation is filming and publishes
+        # its standoff to the Unity stitcher (see _announce_scene_plane). They repel
+        # nothing — a facade is a measurement surface, not a keep-out shape — but
+        # they are no longer inert, and one added mid-flight moves the scene plane.
         "facades": facades,
         "removed": [],
         "obstacle_params": {
@@ -2819,7 +2912,12 @@ def main():
             stitch_ctrl=stitch_ctrl, cmd_sender=cmd_sender,
             identity_check=identity_check,
             min_separation=args.min_separation, avoid=avoid,
-            plane_ctrl=plane_ctrl, max_alt=args.max_alt, recorder=recorder)
+            plane_ctrl=plane_ctrl, max_alt=args.max_alt, recorder=recorder,
+            # Both needed for the PLANAR scene plane: the solver defines the frame
+            # the standoff must be measured in (and latches it), the publisher owns
+            # the mapping it is written to. Passed as arguments rather than through
+            # swarm_meta, which TelemetryFeedPublisher JSON-encodes at 5 Hz.
+            pose_solver=pose_solver, img_stream=img_stream)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:

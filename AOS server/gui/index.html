@@ -255,6 +255,9 @@
     <span class="chip" id="swarm-chip" style="display:none"></span>
     <span class="chip" id="joy-chip" style="display:none"></span>
     <span class="chip" id="plane-chip" style="display:none"></span>
+    <!-- PLANAR scene plane. Hidden entirely when the controller does not publish
+         meta.scene_plane, so an older controller degrades cleanly. -->
+    <span class="chip" id="scene-plane-chip" style="display:none"></span>
     <span class="chip" id="fence-chip" style="display:none"></span>
     <span class="chip" id="downwash-chip" style="display:none"></span>
     <span class="chip" id="rotcheck-chip" style="display:none"></span>
@@ -427,6 +430,22 @@ const linesLayer = L.layerGroup().addTo(map);
 // Obstacles + geofence as echoed back from the controller (meta.obstacles /
 // meta.geofence) — rebuilt each render outside the shapesPendingUntil window.
 const shapesLayer = L.layerGroup().addTo(map);
+// facade id -> its polyline, rebuilt on every shapes redraw. Lets the scene-plane
+// chip point at the wall the stitcher actually chose: with the auto-pick there is
+// no operator input saying which wall is in use, so the map is where that is read.
+let facadeLines = {};
+let highlightedFacade = null;
+
+function highlightFacade(id) {
+  if (id === highlightedFacade) return;
+  const prev = facadeLines[highlightedFacade];
+  if (prev) prev.setStyle({ color: '#ffd23f', weight: 5, opacity: 0.9 });
+  const now = facadeLines[id];
+  // Green and thicker, matching the "active/good" colour the swarm-on chip uses,
+  // so the chip and the map agree without needing a legend.
+  if (now) now.setStyle({ color: '#3fb950', weight: 8, opacity: 1.0 });
+  highlightedFacade = now ? id : null;
+}
 const markers = {};   // id -> L.marker
 
 // ---- helpers ----
@@ -727,6 +746,38 @@ function render(data) {
   } else {
     planeChip.style.display = 'none';
   }
+  // ----- PLANAR scene plane -----
+  // Stated NEGATIVELY when there is no facade, on purpose. There is no operator
+  // override for the auto-pick, so a flight with no wall traced falls back to
+  // whatever planarStandoffMetres the Unity inspector happens to hold and otherwise
+  // looks exactly like success — a wrong standoff there is the largest single error
+  // in the mosaic, and it is invisible from this end. "No wall" has to be as loud as
+  // a wall. Absent key -> chip hidden, so an older controller degrades cleanly.
+  const scenePlaneChip = document.getElementById('scene-plane-chip');
+  const sp = meta.scene_plane;
+  if (sp === undefined || sp === null) {
+    scenePlaneChip.style.display = 'none';
+  } else if (!(sp.facade_id >= 0)) {
+    scenePlaneChip.style.display = '';
+    scenePlaneChip.className = 'chip rot-run';
+    scenePlaneChip.textContent = 'PLANE: no facade — Unity’s typed standoff';
+    scenePlaneChip.title = sp.reason || '';
+  } else {
+    scenePlaneChip.style.display = '';
+    scenePlaneChip.className = 'chip ' + (sp.state === 'dwelling' ? 'rot-run' : 'swarm-on');
+    scenePlaneChip.textContent = `PLANE ${sp.standoff_m.toFixed(1)} m`
+      + (sp.label ? ` · ${sp.label}` : ` · facade ${sp.facade_id}`)
+      + (sp.state === 'dwelling' ? ' (settling)' : '');
+    scenePlaneChip.title =
+      `standoff ${sp.standoff_m.toFixed(2)} m from facade ${sp.facade_id}`
+      + (Number.isFinite(sp.look_off_deg) ? `, ${sp.look_off_deg.toFixed(1)}° off the wall` : '')
+      + (Number.isFinite(sp.tilt_deg) ? `, pose normal ${sp.tilt_deg.toFixed(1)}° off it` : '')
+      + (Number.isFinite(sp.spread_m) ? `, moved ${sp.spread_m.toFixed(2)} m` : '')
+      + `, ${sp.view_count} views`;
+  }
+  // Highlight the wall the stitcher is actually using, so "which facade is it on?"
+  // is answerable at a glance rather than from a console line that has scrolled.
+  highlightFacade(sp && sp.facade_id >= 0 ? sp.facade_id : null);
   // On a wall the hull collapses to a line and lateral ranking has no meaning,
   // so the controller forces manual heading — disable the options that can't
   // apply rather than letting the operator pick one that gets overridden.
@@ -819,11 +870,15 @@ function render(data) {
     // Inspection facades: one wall of a footprint, kept for PLANAR. Amber so
     // they read as a different kind of thing from the cyan keep-out shapes —
     // a facade repels nothing, it only defines the stitcher's scene plane.
+    // Rebuilt every redraw, so the id->line index is rebuilt with them.
+    facadeLines = {};
     for (const fa of (Array.isArray(shapeSrc.facades) ? shapeSrc.facades : [])) {
       if (!Array.isArray(fa.p1) || !Array.isArray(fa.p2)) continue;
       const geom = edgeBearing(fa.p1, fa.p2);
       const line = L.polyline([fa.p1, fa.p2],
         { color: '#ffd23f', weight: 5, opacity: 0.9 });
+      // Kept by id so highlightFacade can pick out the one the stitcher chose.
+      facadeLines[Number(fa.id)] = line;
       const coords = `${fa.p1[0].toFixed(6)},${fa.p1[1].toFixed(6)},`
                    + `${fa.p2[0].toFixed(6)},${fa.p2[1].toFixed(6)}`;
       line.bindPopup(

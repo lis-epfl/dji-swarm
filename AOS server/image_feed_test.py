@@ -63,7 +63,11 @@ def main():
     if len(headings) != args.drones:
         parser.error("need exactly one heading per drone")
 
-    mmf = mmap.mmap(-1, MAX_DRONES * BLOCK_BYTES, BLOCK_MAP_NAME)
+    # Through open_feed_map so this tool asks for the same section size every other
+    # producer does. A tool that asked for the pre-trailer size and happened to
+    # create the section first would leave Unity mapping a prefix, i.e. silently no
+    # scene plane, for as long as the tool ran.
+    mmf, _trailer_ok = imageSharingUtil.open_feed_map(BLOCK_MAP_NAME)
     print("Publishing {} fake drones to '{}' at {:.0f} fps (Ctrl+C to stop)"
           .format(args.drones, BLOCK_MAP_NAME, args.fps))
 

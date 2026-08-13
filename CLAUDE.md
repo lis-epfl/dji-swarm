@@ -207,6 +207,11 @@ no video.
     `enableImageWriting` must be off — its writer would fight this one.)
     The block header it writes is the **48-byte v2** `flag|droneId|heading|camPos[3]|
     camRot[4] xyzw|captureTime|poseStatus` (layout owned by `utils/imageSharingUtil.py`).
+    It also owns the map's **scene-plane trailer** (`set_standoff`/`clear_standoff`): the
+    PLANAR standoff the control loop computes, written at 10 Hz on its own mmap — never a
+    per-drone one, whose `seek()->write()` is not GIL-atomic — and never from a thread,
+    so a wedged control loop stops the heartbeat and Unity falls back, which is the whole
+    point of having one. See the [scene-plane trailer gotcha](#critical-gotchas).
     The pose fields are what the sim's pose-driven **`PLANAR`** stitcher needs and a
     compass heading cannot give (one scalar is no position and one of three rotation
     DoF); `dji_camera_pose.CameraPoseSolver` supplies them, gated behind
@@ -243,6 +248,15 @@ no video.
     the Mini 3 Pro's 46.4° vfov — a working default, **not** a calibration; the pinhole
     model has no distortion term, so **DJI dewarping must be ON at capture**). Frames
     taken without a GPS fix get `pose_status` 0 and are counted + warned about at stop.
+    A `meta_source` callable (the same pattern `TelemetryFeedPublisher` uses) gives it the
+    controller's LIVE meta, so the **facades the operator had drawn** land in `session.json`
+    — the constructor's `meta=` dict is a snapshot and structurally cannot see a wall picked
+    mid-flight — and at stop it derives and stores `meta["scene_plane"]` through the same
+    `pick_facade` + `analyse` path `clip_replay --set-plane-from-facade` uses, warnings and
+    all. Best-effort throughout: no facade, no fix or an unusable trace just means a clip
+    without a stored plane, exactly as before. Its **no-flight-log** `session.json` now
+    nests under `'meta'` like `FlightLogger`'s does; it used to write flat, which every
+    reader (`_session_meta` does `doc.get('meta')`) got wrong the same silent way.
   - `clip_replay.py` — replays a recorded clip into `DroneFeedSharedMemory` **as if the
     drones were flying**, so the Unity DJI scene + stitcher run with no change from a live
     flight: same map, same 48-byte v2 header, same 800×450 BGR payload, same per-frame
@@ -255,7 +269,19 @@ no video.
     relatch the GPS origin and put the replay in a different frame from the recording.
     `--loop` for tuning against fixed footage, `--speed`, and `--pose-lead-s` to re-pair
     frames with earlier/later poses — the one knob for pose/video skew, which the sim's
-    error budget makes the dominant term. Clips are addressed by **label**
+    error budget makes the dominant term. It also **publishes the clip's standoff** into
+    the feed map's scene-plane trailer, recomputed per frame from the clip's stored
+    `plane_n`/`plane_d` and the replayed poses rather than republished as the stored mean
+    (which is wrong at both ends of any clip where the formation translates);
+    `--no-standoff` hands the value back to Unity's inspector. While it is driving,
+    `standoff` is dropped from the `--check-unity` checklist and the `[unity]` watch —
+    otherwise the watch reports the replayer's own writes as operator edits.
+    **`--loop` runs every drone on ONE pass clock** whose period is the longest drone's
+    span; shorter feeds hold their last frame to the shared boundary. Each thread used to
+    re-latch its own epoch per pass, so a pass lasted that drone's own span and the
+    cross-drone `capture_time` skew grew ~35 ms per loop until the stitcher dropped the
+    slowest drone's view as stale — see the
+    [replay-loop gotcha](#critical-gotchas). Clips are addressed by **label**
     (`--clip grass_nadir_long`): the folder keeps the recorder's `clip_<timestamp>` name —
     that timestamp is what joins a clip back to `flight_logs/`, and `session.json`'s own
     `clip` field references it — while the human name is stored **inside** the clip as
@@ -312,7 +338,17 @@ no video.
     in front of it) usable as the trace — see the
     [satellite-parallax gotcha](#critical-gotchas). The result is stored as `meta["scene_plane"]` **inside the
     clip** — same reasoning as `meta.label`: it is a measurement of that footage in that
-    clip's latched pose frame. It refuses a trace it cannot describe the clip with (the
+    clip's latched pose frame. `clip_recorder.py` now stores one **at capture time** from
+    the facade the operator had drawn, so these flags are the way to re-measure or
+    retro-fit rather than a mandatory step.
+    Also owns **`pick_facade`**, the auto-pick that answers "which traced wall is this
+    formation filming?" — used live by `swarm_flocking.run()`, by the recorder, and by the
+    offline checker, so there is one rule rather than three. It is **pure**: `now` is an
+    argument and all carry-over is in a `state` the caller hands back, which is what lets
+    `python clip_scene_plane.py --clip <dir> --pick [-v]` replay a clip's own clock and
+    reproduce exactly what the live loop would have decided on that footage — printing
+    which wall won, for what fraction, how many switches, and every candidate's reject
+    reason. That is the offline half of verifying a rule whose entire job is to not flap. It refuses a trace it cannot describe the clip with (the
     formation behind the wall, or the cameras pointing away from it) and reports what the
     number is worth: the standoff's spread over the clip, the angle between the traced wall
     and the normal `PlanarStitcher._plane_from_formation` will actually derive, and the
@@ -324,10 +360,21 @@ no video.
     `meta*Offset` layout is mirrored here, and `plausible()` cross-checks the mapping's
     self-describing fields — block image size, header size, wire version — against this
     repo's own so a revision skew is refused instead of misread). There is **no way to push
-    a setting into Unity from the PC**, and that is structural, not missing work: the values
-    live in serialized inspector fields and `WriteMetadata` republishes the whole mapping
-    every Unity frame, so anything written here is gone in ~16 ms and the inspector never
-    sees it. What is possible is the diff, which is what `clip_replay.py` prints. Opens the
+    a setting into Unity through THIS mapping**, and that is structural, not missing work:
+    the values live in serialized inspector fields and `WriteMetadata` republishes the whole
+    mapping every Unity frame, so anything written here is gone in ~16 ms and the inspector
+    never sees it. What is possible is the diff, which is what `clip_replay.py` prints.
+    **One setting is nevertheless now driven from the PC — `planarStandoffMetres` — and it
+    does not contradict the above**: it does not go through this mapping at all. It rides
+    the `DroneFeedSharedMemory` trailer, which flows PC→Unity like the pixels do, and
+    `PyUniSharingFast` *republishes* it here. So this module still reads a value Unity
+    wrote — which is why `clip_replay.py` drops `standoff` from the checklist while it is
+    the one driving. Unity also publishes the **resolved source** at offset 396
+    (`standoff_source`, 0 = its own inspector field, 1 = us), because the value at 364 is a
+    float either way and the scene can override us outright with
+    `planarStandoffSource = Inspector`. It is reported on the live line
+    (`standoff 34.26 m (from the PC)`) and is in `watch_fields`, so a mid-replay takeover
+    prints an `[unity]` line rather than leaving the replayer claiming a plane it has lost. Opens the
     section with `OpenFileMappingW` rather than `mmap`, deliberately: `mmap.mmap(-1, …)`
     **creates** a missing named section, which would make "Unity is not running"
     indistinguishable from "running with everything zeroed" — and a leftover section of the
@@ -675,6 +722,42 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   the tolerance scales as `Z²/B`, so range and a tight formation both buy more than a
   better trace. `clip_scene_plane.py` prints the pixel cost for each clip's own geometry
   rather than a verdict, because the same trace is fine at 34 m and useless at 12.
+- **The scene-plane trailer grows `DroneFeedSharedMemory`, and it fits only because of page
+  rounding.** The PLANAR standoff is no longer typed into Unity's inspector; the PC computes it
+  and writes it into a 64-byte trailer after the 10 feed blocks, which `ImageSharing.cs` reads
+  and `PyUniSharingFast` republishes into its metadata. Growing an already-sized named section
+  is normally how you earn `ERROR_ACCESS_DENIED` — Windows never resizes one. It is safe here
+  *only* because Windows compares **page-rounded** sizes: 10 × 1,080,048 = 10,800,480 B rounds
+  to 10,801,152 (2637 × 4 KB), leaving **672 already-backed bytes**. Measured: create at the
+  block size, open at +672, succeeds in either order; +673 is denied. So a new Unity and an old
+  DJI_Swarm interoperate both ways round and the trailer reads zero.
+  `check_wire_layout.py` asserts `page(FeedSectionBytes) == page(FeedBlocksBytes)`, because past
+  672 bytes **both cross orders become fatal and the feed dies** — that bound is machine-checked,
+  not a comment. Every `FEED_*` constant lives in `utils/imageSharingUtil.py`, not
+  `image_stream_feed.py`, for the same reason: that checker parses the former and asserts it
+  against the C#, and does not parse the latter. All five writers of the map
+  (`image_stream_feed.py`, `clip_replay.py`, `image_feed_test.py`, the sim's
+  `planar_feed_bench.py`, `ImageSharing.cs`) must request the same size or the first one to
+  create it wins. Both sides carry a fallback to the pre-trailer size; on this side that is
+  **not optional**, because `ImageStreamPublisher.__init__` runs before the aircraft arm and an
+  unhandled `OSError` there takes down the flight controller, not merely the mosaic.
+  Consequence: **`clip_replay.py` and a live controller must not run together any more.** They
+  already fought over the blocks; now they would also fight over the trailer, with no handshake
+  to arbitrate.
+- **`--loop` needs one pass clock for the whole clip, or it starves a view.** Each
+  `_DroneReplay` thread used to re-latch `epoch0 = time.monotonic()` at the top of every pass,
+  so a pass lasted that drone's OWN recorded span. On the MED clips those are 6.4503 / 6.4850 /
+  6.4655 s, so drone 2 fell **34.6 ms further behind drone 1 every loop**; after ~7 loops (~47 s)
+  the cross-drone spread in `capture_time` passed `PlanarStitcher.MAX_CAPTURE_SKEW_S` (0.25 s)
+  and the stitcher dropped that view as stale — for most of a ~20 minute beat cycle, with
+  nothing in either process saying why, and looking fine for the first 45 s of every fresh run.
+  Now every drone is scheduled against one shared epoch and one period (the longest drone's span
+  plus `LOOP_GAP_S`), shorter feeds hold their last frame to the boundary, and `capture_time` is
+  **monotonic across passes** rather than restarting — a reset made the first drone to wrap read
+  ~0 while the others still held ~6.45, which dropped the view that had just been refreshed.
+  Measured over an hour of replay: worst spread 0.12 s, zero breaches. `LOOP_GAP_S` is kept small
+  (0.08 s) because it is paid as a hold, and a held frame is genuinely stale by that long, so it
+  lands directly in the spread the stitcher gates on.
 - **Satellite tiles are orthorectified to the ground, not to buildings — never trace a
   roofline.** The GUI's Esri World Imagery is off-nadir, so anything with height is
   displaced away from the tile's nadir point by `height × tan(off-nadir)` (~5–7 m for a

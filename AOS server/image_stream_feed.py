@@ -67,9 +67,11 @@ RAW_COLS = 1920
 
 BLOCK_MAP_NAME = "DroneFeedSharedMemory"
 # Re-exported rather than redefined: utils.imageSharingUtil owns the block layout
-# because it is what writes the bytes. image_feed_test.py imports this name.
+# because it is what writes the bytes -- and, unlike this file, it is parsed by
+# check_wire_layout.py, so a constant stated there is checked against the C# and a
+# constant stated here is not. image_feed_test.py and clip_replay.py import these.
 BLOCK_HEADER_BYTES = imageSharingUtil.BLOCK_HEADER_BYTES
-MAX_DRONES = 10            # fixed mapping capacity (must match ImageSharing.cs)
+MAX_DRONES = imageSharingUtil.FEED_MAX_DRONES
 
 
 class ImageStreamPublisher:
@@ -122,13 +124,28 @@ class ImageStreamPublisher:
         # reset wedges a block at flag=1 forever (that feed freezes). Separate
         # mmap objects give each worker its own position, so disjoint per-drone
         # blocks can never cross-write and no lock is needed.
-        # Fixed capacity: every map is MAX_DRONES blocks so its size matches
-        # what ImageSharing.cs creates regardless of fleet size or of which
-        # process creates the named mapping first.
-        self._mmfs = {
-            did: mmap.mmap(-1, MAX_DRONES * self._block_bytes, BLOCK_MAP_NAME)
-            for did in self._drones
-        }
+        # Fixed capacity: every map is MAX_DRONES blocks (plus the scene-plane
+        # trailer) so its size matches what ImageSharing.cs creates regardless of
+        # fleet size or of which process creates the named mapping first.
+        #
+        # Through open_feed_map rather than mmap.mmap directly, because this runs in
+        # swarm_flocking.main() BEFORE the aircraft are armed: an unhandled OSError
+        # here would not degrade the mosaic, it would take down the flight
+        # controller. open_feed_map falls back to the pre-trailer size instead.
+        self._mmfs = {}
+        self._trailer_ok = True
+        for did in self._drones:
+            self._mmfs[did], ok = imageSharingUtil.open_feed_map(BLOCK_MAP_NAME)
+            self._trailer_ok = self._trailer_ok and ok
+        # The trailer's own view. NOT one of the per-drone ones: those belong to
+        # worker threads, and the whole reason there is one each (see above) is that
+        # write_memory's seek()->write() is not GIL-atomic across a shared file
+        # position. This one is only ever touched by the caller's thread.
+        self._plane_mmf, ok = imageSharingUtil.open_feed_map(BLOCK_MAP_NAME)
+        self._trailer_ok = self._trailer_ok and ok
+        self._plane_seq = 0
+        self._plane_beat = 0
+        self._plane_next_due = 0.0
         # Per-drone latest-wins mailbox: {id: (yuv_copy, heading)} + an event
         # the worker sleeps on. A slow worker just drops frames, never queues.
         self._latest = {}
@@ -140,6 +157,67 @@ class ImageStreamPublisher:
         self._sinks = {}
         self._running = False
         self._threads = []
+
+    # Cadence of the scene-plane trailer. 10 Hz rather than 1-2 Hz because the
+    # standoff tracks the formation: at a 2 m/s closing speed half a second of lag
+    # is a metre, which is the entire plane-error budget at a 34 m standoff.
+    PLANE_PERIOD_S = 0.1
+
+    def set_standoff(self, result, now=None):
+        """
+        Publish the PLANAR scene-plane standoff for Unity to pick up.
+
+        `result` is a clip_scene_plane.pick_facade() result dict, or None when no
+        facade could be picked (which publishes the NO_FACADE status rather than
+        going silent -- Unity has to be able to tell "no wall" from "no producer").
+
+        Called straight from the control loop, deliberately, rather than from a
+        thread of its own. There is no flag handshake on the trailer -- nothing else
+        writes those bytes -- so this is ~48 bytes of struct.pack_into with no retry
+        and no sleep, and it cannot block. Being on the control loop is also what
+        makes the heartbeat honest: a wedged loop stops it and Unity falls back to
+        its inspector value, which is exactly what a heartbeat is for. A thread would
+        keep republishing a stale plane through a stall.
+        """
+        if not self._trailer_ok:
+            return
+        now = time.monotonic() if now is None else now
+        if now < self._plane_next_due:
+            return
+        self._plane_next_due = now + self.PLANE_PERIOD_S
+        self._plane_beat += 1
+        if result is None:
+            self._plane_seq = imageSharingUtil.write_standoff_trailer(
+                self._plane_mmf, self._plane_seq, self._plane_beat, 0.0,
+                imageSharingUtil.FEED_TR_STATUS_NO_FACADE)
+            return
+        status = (imageSharingUtil.FEED_TR_STATUS_DWELLING
+                  if result.get("state") == "dwelling"
+                  else imageSharingUtil.FEED_TR_STATUS_LOCKED)
+        self._plane_seq = imageSharingUtil.write_standoff_trailer(
+            self._plane_mmf, self._plane_seq, self._plane_beat,
+            result.get("standoff_m") or 0.0, status,
+            facade_id=result.get("facade_id", -1),
+            look_off_deg=result.get("look_off_deg") or 0.0,
+            spread_m=result.get("spread_m") or 0.0,
+            px_per_m=result.get("px_per_m") or 0.0,
+            tilt_deg=result.get("tilt_deg") or 0.0,
+            view_count=result.get("view_count") or 0)
+
+    def clear_standoff(self):
+        """Publish "no facade", unconditionally and off the rate limit.
+
+        Used on Stop and at close(): the operator has stopped supplying a plane and
+        Unity should return to its inspector value now, not after the heartbeat
+        happens to age out.
+        """
+        if not self._trailer_ok:
+            return
+        self._plane_beat += 1
+        self._plane_next_due = 0.0
+        self._plane_seq = imageSharingUtil.write_standoff_trailer(
+            self._plane_mmf, self._plane_seq, self._plane_beat, 0.0,
+            imageSharingUtil.FEED_TR_STATUS_NO_FACADE)
 
     def _make_sink(self, drone_id):
         """Build the frame_sink callable run on drone_id's telemetry thread.
@@ -221,9 +299,17 @@ class ImageStreamPublisher:
         for t in self._threads:
             t.join(timeout=1.5)
         self._threads = []
+        # Retire the scene plane BEFORE dropping the view: closing the handle does
+        # not clear the section, so a last "no facade" write is what tells Unity to
+        # go back to its inspector value rather than leaving it to time out on the
+        # heartbeat.
+        try:
+            self.clear_standoff()
+        except Exception:
+            pass
         # Close every per-worker mmap (workers no longer touch them once
-        # _running is False and their threads have joined).
-        for mmf in self._mmfs.values():
+        # _running is False and their threads have joined), then the trailer's.
+        for mmf in list(self._mmfs.values()) + [self._plane_mmf]:
             try:
                 mmf.close()
             except Exception:

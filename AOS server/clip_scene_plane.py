@@ -64,6 +64,9 @@ from olfati_saber import (gps_to_local, load_facades, load_shapes, rect_to_ne,
 __all__ = ["facade_from_line", "facade_from_obstacle", "facade_from_stored",
            "offset_facade", "analyse", "store_scene_plane", "scene_plane_of",
            "describe", "manual_report", "load_posed_frames", "formation_track",
+           "standoff_of", "measure", "plane_from_report", "seam_geometry",
+           "centroid_of", "mean_forward_of", "forward_from_quat",
+           "pick_facade", "PICK",
            "formation_centroid_xz", "obstacle_by_id", "facade_by_id",
            "wire_focal_px", "DEFAULT_SHAPES_FILE"]
 
@@ -495,7 +498,314 @@ def formation_normal(views):
     return _unit(n), rule
 
 
-# ---------- the measurement ----------
+# ---------- the measurement, shared by every caller ----------
+#
+# Live flight, clip replay, the recorder and the offline checker all need the same
+# arithmetic. It lives here, once, because the whole point of the exercise is that a
+# number measured in one of them is comparable with a number measured in another --
+# and two copies of "the standoff" that drift apart would quietly destroy that.
+
+def forward_from_quat(q):
+    """Unity `Transform.forward` for an (x, y, z, w) rotation."""
+    return _forward_from_quat(q)
+
+
+def centroid_of(views):
+    """Formation centroid as an (east, up, north) triple. `views` is
+    `[(drone_id, pos, forward), ...]` -- the shape load_posed_frames builds."""
+    return _centroid(views)
+
+
+def mean_forward_of(views):
+    """Unit mean camera forward, or None when the views cancel out."""
+    return _mean_forward(views)
+
+
+def standoff_of(plane, c):
+    """The standoff: perpendicular distance from point `c` to `plane`, signed.
+
+    THE measurement this whole path exists to produce, and the reason it is a named
+    function rather than an expression repeated at each call site. `plane["n"]` is
+    oriented toward the cameras, which is the convention
+    `PlanarStitcher._plane_from_formation` uses (`d = n.centroid - standoff`), so a
+    positive result is a formation in front of the wall.
+
+    Do NOT mistake this for the ray-plane hit distance `pick_facade` scores on: they
+    differ by 1/cos(look_off), which at 30 deg is 15% -- 4.5 m at a 30 m standoff,
+    four times the entire plane-error budget.
+    """
+    return _dot(plane["n"], c) - plane["d"]
+
+
+def measure(facade, views):
+    """One instant's geometry against a facade, or None if there are no views.
+
+    The live and replay counterpart of `analyse`, which does the same thing over a
+    whole clip and adds the warnings. Both take the standoff from `standoff_of`, so
+    a live reading and a post-hoc one describe the same quantity by construction.
+    """
+    if not views:
+        return None
+    c = centroid_of(views)
+    f = mean_forward_of(views)
+    n_form, rule = formation_normal(views)
+    return {
+        "standoff_m": standoff_of(facade, c),
+        "look_off_deg": (_angle_deg(f, _neg(facade["n"])) if f is not None else None),
+        "tilt_deg": (_angle_deg(n_form, facade["n"]) if n_form else None),
+        "plane_rule": rule,
+        "view_count": len(views),
+        "centroid": c,
+        "forward": f,
+    }
+
+
+def plane_from_report(report):
+    """`{"n", "d"}` from a stored `meta.scene_plane`, or None.
+
+    `analyse` already records `plane_n`/`plane_d` in the clip's own latched pose
+    frame, which is exactly the frame the replayed poses are in -- so a replay can
+    re-measure per frame with no re-projection and no origin arithmetic at all.
+    `manual_report` leaves both None, which is the correct signal to fall back to the
+    stored scalar: a hand-typed standoff describes no plane anyone can re-measure.
+    """
+    if not report:
+        return None
+    n, d = report.get("plane_n"), report.get("plane_d")
+    if not n or d is None or len(n) != 3:
+        return None
+    return {"n": (float(n[0]), float(n[1]), float(n[2])), "d": float(d)}
+
+
+def seam_geometry(track, meta, standoff_m):
+    """`(baseline, focal_px, px_per_m, tolerance_m)`. Public for the live read-out,
+    which wants the seam cost without having a clip to hand."""
+    return _seam_geometry(track, meta, standoff_m)
+
+
+# ---------- which wall is the formation filming? ----------
+
+# Tuning for pick_facade. A module-level dict so the live loop and the offline
+# checker share it by import rather than by two copies that drift.
+PICK = {
+    # A wall nearer than this is not something a 46-degree camera is imaging; one
+    # further is a different building that happens to line up.
+    "min_standoff_m": 5.0,
+    "max_range_m": 150.0,
+    # Past this the cameras are not pointed at it in any useful sense, and it is
+    # also what rejects a wall traced on the FAR side of the building -- see below.
+    "max_look_off_deg": 60.0,
+    # A trace shorter than this is a stray map click, not a facade.
+    "min_extent_m": 5.0,
+    # How far past a wall's ends the sight line may land and still count. Generous
+    # on purpose: an 800x450 view at 30 m is ~26 m wide, so a formation a few metres
+    # beyond a corner is still filming that wall.
+    "lateral_margin_frac": 0.35,
+    # A challenger must beat the incumbent by this much, continuously, for this
+    # long. Metre- and second-valued so the settings mean what they say, following
+    # PyUniSharingFast.SelectPlanarCentreCamera's metre-valued hysteresis.
+    "hysteresis_m": 3.0,
+    "dwell_s": 2.5,
+    # How long an incumbent that has stopped passing its gates is held before the
+    # pick is dropped, so one bad telemetry tick does not yank the plane.
+    "grace_s": 2.0,
+    # Low-pass on the VALUE. The pick itself is never filtered -- see below.
+    "standoff_tau_s": 0.5,
+}
+
+
+def _facade_candidate(rec, origin, views, c, f, cfg):
+    """Score one stored facade against the formation. Returns a dict, always --
+    with `reject` set when it fails a gate, so the checker can say why."""
+    out = {"facade_id": rec.get("id"), "label": rec.get("label"),
+           "reject": None, "t_m": None, "standoff_m": None,
+           "look_off_deg": None, "lateral_frac": None}
+    try:
+        fac = facade_from_stored(rec, origin, (c[0], c[2]))
+    except (ValueError, KeyError, TypeError) as e:
+        out["reject"] = "unusable trace ({})".format(e)
+        return out
+    out["facade"] = fac
+
+    if fac["extent_m"] < cfg["min_extent_m"]:
+        out["reject"] = "wall is only {:.1f} m long".format(fac["extent_m"])
+        return out
+
+    standoff = standoff_of(fac, c)
+    out["standoff_m"] = standoff
+
+    # THE BEHIND-THE-WALL TEST IS THE LOOK-OFF ANGLE, NOT A NEGATIVE STANDOFF.
+    # facade_from_line orients the normal toward `toward_xz`, which is the formation
+    # centroid -- so a wall traced on the far side of the building comes back with a
+    # flipped normal and a perfectly POSITIVE standoff. What actually flips is where
+    # the cameras are looking, which is why this gate is the angle. `analyse` raises
+    # on the same test past 90 degrees.
+    cos_look = None
+    if f is not None:
+        look_off = _angle_deg(f, _neg(fac["n"]))
+        out["look_off_deg"] = look_off
+        cos_look = math.cos(math.radians(look_off))
+        if look_off > cfg["max_look_off_deg"]:
+            out["reject"] = "cameras {:.0f} deg off it".format(look_off)
+            return out
+    if cos_look is None or cos_look <= 1e-6:
+        out["reject"] = "no usable camera forward"
+        return out
+
+    if standoff < cfg["min_standoff_m"]:
+        out["reject"] = "standoff {:.1f} m < {:.0f} m".format(
+            standoff, cfg["min_standoff_m"])
+        return out
+    if standoff > cfg["max_range_m"]:
+        out["reject"] = "standoff {:.0f} m > {:.0f} m".format(
+            standoff, cfg["max_range_m"])
+        return out
+
+    # Where the formation's sight line actually meets the plane, and whether that
+    # lands within the traced wall's extent. This is what makes "nearest hit" mean
+    # the right thing for a finite wall -- an infinite plane is always hit.
+    t = standoff / cos_look
+    hit = (c[0] + f[0] * t, c[1] + f[1] * t, c[2] + f[2] * t)
+    (x1, z1), (x2, z2) = fac["span"]
+    u = _unit((x2 - x1, 0.0, z2 - z1))
+    length = fac["extent_m"]
+    s = _dot(_sub(hit, (x1, 0.0, z1)), u)
+    margin = cfg["lateral_margin_frac"] * length
+    out["t_m"] = t
+    out["lateral_frac"] = (s / length) if length > 0 else 0.0
+    if s < -margin or s > length + margin:
+        out["reject"] = "sight line lands {:.0f} m off the end".format(
+            -s if s < 0 else s - length)
+        return out
+    return out
+
+
+def pick_facade(facades, origin, views, state=None, now=0.0, cfg=None):
+    """Which traced wall is this formation filming? -> `(result, state)`.
+
+    PURE. `now` is an argument and never read from the clock, and every scrap of
+    carry-over lives in `state`, which the caller hands back next tick. That is what
+    lets the offline checker replay a clip's own timeline and reproduce, exactly, the
+    switching the live loop would have done on that footage -- which is the only way
+    to validate a rule whose whole job is to not flap.
+
+    `views` is `[(drone_id, pos, forward), ...]` in the LATCHED pose frame (the one
+    `CameraPoseSolver.origin` defines and the blocks carry), and `origin` is that
+    frame's (lat, lon).
+
+    Score: the NEAREST positive ray-plane hit along the mean camera forward. This is
+    the analytic form of what the sim does with a raycast in UpdateScenePlane, so the
+    live rule and the sim rule are one rule; and unlike "smallest look-off" or
+    "nearest standoff" it gets two parallel walls of one building right, because the
+    near one occludes the far one along the actual line of sight.
+    """
+    cfg = dict(PICK, **(cfg or {}))
+    state = dict(state or {})
+    prev_id = state.get("facade_id")
+
+    if not facades:
+        return ({"facade_id": -1, "state": "none", "candidates": [],
+                 "reason": "no facade has been traced"}, {})
+    if origin is None:
+        return ({"facade_id": -1, "state": "none", "candidates": [],
+                 "reason": "no pose origin yet (no GPS fix)"}, state)
+    c = centroid_of(views) if views else None
+    f = mean_forward_of(views) if views else None
+    if c is None or f is None:
+        return ({"facade_id": -1, "state": "none", "candidates": [],
+                 "reason": "no posed drones"}, state)
+
+    cands = [_facade_candidate(r, origin, views, c, f, cfg) for r in facades]
+    ok = [x for x in cands if x["reject"] is None]
+
+    if not ok:
+        # Hold the incumbent through a short outage rather than dropping the plane on
+        # one bad tick. Same shape as the stitcher's 2 s REASON_PLANE_INVALID grace.
+        since = state.get("lost_since")
+        if prev_id is not None and since is not None and now - since <= cfg["grace_s"]:
+            held = dict(state.get("last_result") or {})
+            held["state"] = "grace"
+            held["candidates"] = cands
+            return held, state
+        if prev_id is not None and since is None:
+            state["lost_since"] = now
+            held = dict(state.get("last_result") or {})
+            held["state"] = "grace"
+            held["candidates"] = cands
+            return held, state
+        return ({"facade_id": -1, "state": "none", "candidates": cands,
+                 "reason": "; ".join(
+                     "{}: {}".format(x["facade_id"], x["reject"]) for x in cands)},
+                {})
+    state.pop("lost_since", None)
+
+    best = min(ok, key=lambda x: (x["t_m"], x["look_off_deg"] or 0.0,
+                                  x["facade_id"]))
+    incumbent = next((x for x in ok if x["facade_id"] == prev_id), None)
+
+    chosen, dwelling = best, False
+    if incumbent is not None and best["facade_id"] != incumbent["facade_id"]:
+        if best["t_m"] < incumbent["t_m"] - cfg["hysteresis_m"]:
+            # A real challenger, but it has to hold the claim. A formation yawing
+            # across a corner otherwise chatters between two walls, and every switch
+            # steps the published plane out from under the stitcher's plane sweep.
+            if state.get("challenger_id") != best["facade_id"]:
+                state["challenger_id"] = best["facade_id"]
+                state["challenger_since"] = now
+            if now - state.get("challenger_since", now) < cfg["dwell_s"]:
+                chosen, dwelling = incumbent, True
+            else:
+                state.pop("challenger_id", None)
+                state.pop("challenger_since", None)
+        else:
+            state.pop("challenger_id", None)
+            state.pop("challenger_since", None)
+            chosen = incumbent
+    elif incumbent is not None:
+        state.pop("challenger_id", None)
+        state.pop("challenger_since", None)
+
+    raw = chosen["standoff_m"]
+    prev_val = state.get("standoff_m")
+    dt = max(0.0, now - state.get("t", now))
+    if (prev_val is None or chosen["facade_id"] != prev_id
+            or cfg["standoff_tau_s"] <= 0.0):
+        # Snap on a switch, never filter across one: easing from one wall's standoff
+        # to another's walks the plane through half a second of distances that
+        # describe neither. Same reasoning as the sweep's ACQUIRE snapping.
+        value = raw
+    else:
+        alpha = 1.0 - math.exp(-dt / cfg["standoff_tau_s"]) if dt > 0 else 0.0
+        value = prev_val + alpha * (raw - prev_val)
+
+    lo = min(state.get("lo", raw), raw)
+    hi = max(state.get("hi", raw), raw)
+    if chosen["facade_id"] != prev_id:
+        lo = hi = raw
+
+    result = {
+        "facade_id": chosen["facade_id"],
+        "label": chosen.get("label"),
+        "standoff_m": value,
+        "raw_standoff_m": raw,
+        "look_off_deg": chosen.get("look_off_deg"),
+        "tilt_deg": None,
+        "lateral_frac": chosen.get("lateral_frac"),
+        "t_m": chosen.get("t_m"),
+        "spread_m": hi - lo,
+        "view_count": len(views),
+        "state": "dwelling" if dwelling else "locked",
+        "reason": "",
+        "candidates": cands,
+    }
+    n_form, _rule = formation_normal(views)
+    if n_form and chosen.get("facade"):
+        result["tilt_deg"] = _angle_deg(n_form, chosen["facade"]["n"])
+
+    state.update({"facade_id": chosen["facade_id"], "standoff_m": value,
+                  "t": now, "lo": lo, "hi": hi, "last_result": result})
+    return result, state
+
 
 def wire_focal_px(camera):
     """A clip's focal length in WIRE pixels.
@@ -561,7 +871,7 @@ def analyse(clip_dir, facade, meta=None):
     standoffs, forwards, view_counts = [], [], []
     for _t, views in track:
         c = _centroid(views)
-        standoffs.append(_dot(n_f, c) - d_f)
+        standoffs.append(standoff_of(facade, c))
         f = _mean_forward(views)
         if f is not None:
             forwards.append(f)
@@ -1007,11 +1317,220 @@ def _selftest():
     check("jacobi smallest eigenvector is the plane normal",
           abs(abs(vecs[0][2]) - 1.0) < 1e-9, vecs[0])
 
+    # ---------- pick_facade ----------
+    # Two walls of one building: a near one due east-west 12 m north, and a far one
+    # 40 m north. Cameras face north, so the near one must win on the sight line.
+    print()
+    north = lambda m_: [[origin[0] + dlat(m_), origin[1] - dlon(30.0)],
+                        [origin[0] + dlat(m_), origin[1] + dlon(30.0)]]
+    near_rec = {"id": 1, "label": "near", "p1": north(12.0)[0], "p2": north(12.0)[1]}
+    far_rec = {"id": 2, "label": "far", "p1": north(40.0)[0], "p2": north(40.0)[1]}
+    look_n = (0.0, 0.0, 1.0)
+    views_n = [(i, c, look_n) for i, c in enumerate(cams)]
+
+    res, st = pick_facade([near_rec, far_rec], origin, views_n, None, 0.0)
+    check("pick takes the nearer of two parallel walls", res["facade_id"] == 1,
+          res.get("facade_id"))
+    check("pick reports that wall's standoff, not its hit distance",
+          abs(res["standoff_m"] - 10.0) < 0.05, res.get("standoff_m"))
+    check("pick reports locked", res["state"] == "locked", res.get("state"))
+
+    # Facing SOUTH at the same two walls: both are now behind the cameras. The
+    # standoff is still positive (facade_from_line orients toward the formation),
+    # so only the look-off gate can catch this -- the point of that gate.
+    views_s = [(i, c, (0.0, 0.0, -1.0)) for i, c in enumerate(cams)]
+    res_s, _ = pick_facade([near_rec, far_rec], origin, views_s, None, 0.0)
+    check("cameras facing away pick nothing", res_s["facade_id"] == -1,
+          res_s.get("facade_id"))
+    check("...and the standoff was positive, so look-off is what caught it",
+          all(x["standoff_m"] > 0 for x in res_s["candidates"]),
+          [x.get("standoff_m") for x in res_s["candidates"]])
+
+    # A wall 200 m away is out of range; a 2 m scrap of trace is not a facade.
+    res_r, _ = pick_facade([{"id": 3, "label": "distant",
+                             "p1": north(200.0)[0], "p2": north(200.0)[1]}],
+                           origin, views_n, None, 0.0)
+    check("out-of-range wall is rejected", res_r["facade_id"] == -1,
+          res_r["candidates"][0].get("reject"))
+
+    # Lateral extent: a wall whose traced span is far to the east of the sight line.
+    east_rec = {"id": 4, "label": "off to one side",
+                "p1": [origin[0] + dlat(12.0), origin[1] + dlon(200.0)],
+                "p2": [origin[0] + dlat(12.0), origin[1] + dlon(260.0)]}
+    res_l, _ = pick_facade([east_rec], origin, views_n, None, 0.0)
+    check("sight line off the end of the wall is rejected",
+          res_l["facade_id"] == -1, res_l["candidates"][0].get("reject"))
+
+    # Hysteresis + dwell. Put the far wall 2.0 m nearer than the incumbent -- inside
+    # the 3 m hysteresis -- and it must NOT take over however long it holds.
+    close_rec = {"id": 2, "label": "barely nearer",
+                 "p1": north(10.0)[0], "p2": north(10.0)[1]}
+    st2 = {"facade_id": 1}
+    res_h, st2 = pick_facade([near_rec, close_rec], origin, views_n, st2, 0.0)
+    check("a challenger inside the hysteresis never switches",
+          res_h["facade_id"] == 1, res_h.get("facade_id"))
+
+    # Now clearly nearer: a wall 8 m north is a 6 m standoff, 4 m better than the
+    # incumbent's 10 and so past the 3 m hysteresis. It must still serve the dwell
+    # before switching -- this is what stops a formation yawing across a corner from
+    # chattering, and every switch steps the plane out from under the stitcher's
+    # sweep. (Not 4 m north: that is a 2 m standoff, which the min_standoff gate
+    # rejects outright, and the dwell would never come into it.)
+    nearer_rec = {"id": 2, "label": "clearly nearer",
+                  "p1": north(8.0)[0], "p2": north(8.0)[1]}
+    st3 = {"facade_id": 1}
+    seen = []
+    for k in range(9):
+        t = k * 0.5
+        r, st3 = pick_facade([near_rec, nearer_rec], origin, views_n, st3, t)
+        seen.append((t, r["facade_id"], r["state"]))
+    switched_at = next((t for t, fid, _s in seen if fid == 2), None)
+    check("a real challenger waits out the dwell",
+          switched_at is not None and switched_at >= PICK["dwell_s"] - 1e-9,
+          seen)
+    check("...and says it is dwelling while it waits",
+          any(s == "dwelling" for _t, _f, s in seen), seen)
+
+    # A switch must SNAP the value, never ease across it: filtering from one wall's
+    # standoff to another's walks the plane through distances describing neither.
+    # State set up mid-dwell so this call is the switching one.
+    st_sw = {"facade_id": 1, "standoff_m": 10.0, "t": 0.0,
+             "challenger_id": 2, "challenger_since": 0.0}
+    after, _ = pick_facade([near_rec, nearer_rec], origin, views_n, st_sw, 10.0)
+    check("the switch this sets up actually happened", after["facade_id"] == 2,
+          after.get("facade_id"))
+    check("the standoff snaps on a switch, not eases",
+          abs(after["standoff_m"] - after["raw_standoff_m"]) < 1e-6,
+          (after["standoff_m"], after["raw_standoff_m"]))
+
+    # Grace: the incumbent survives a tick with no usable candidate.
+    st4 = {"facade_id": 1}
+    pick_facade([near_rec], origin, views_n, st4, 0.0)
+    r_lost, st4b = pick_facade([near_rec], origin, views_s, st4, 0.5)
+    check("a one-tick outage holds the incumbent", r_lost["state"] == "grace",
+          r_lost.get("state"))
+
+    # Purity: the same inputs and the same clock give the same answer, so the
+    # offline checker's replay of a clip is the live loop's behaviour.
+    a, _ = pick_facade([near_rec, far_rec], origin, views_n, {"facade_id": 1}, 3.0)
+    b, _ = pick_facade([near_rec, far_rec], origin, views_n, {"facade_id": 1}, 3.0)
+    check("pick_facade is pure (same in, same out)",
+          a["facade_id"] == b["facade_id"]
+          and abs(a["standoff_m"] - b["standoff_m"]) < 1e-12)
+
     print("\n{}".format("SELF-CHECK PASSED" if ok[0] else "SELF-CHECK FAILED"))
     return 0 if ok[0] else 1
 
 
+def explain_pick(clip_dir, shapes_path, verbose=False, cfg=None):
+    """Replay `pick_facade` over a recorded clip and print what it chose, when.
+
+    The offline half of "which wall did it decide it was filming?". Because
+    `pick_facade` is pure and takes its clock as an argument, walking a clip's own
+    `t_epoch` timeline here reproduces exactly the switching the live loop would have
+    done on that footage -- so a rule whose entire job is to not flap can be checked
+    against real flights instead of against a hope.
+
+    Returns 0 when it settled on one facade for the whole clip.
+    """
+    facades = load_facades(shapes_path)
+    if not facades:
+        print("no facades in {} — pick a building on the GUI map and click the "
+              "wall you filmed".format(shapes_path))
+        return 1
+    meta = _session_meta(clip_dir)
+    origin = meta.get('pose_origin_latlon')
+    if not (isinstance(origin, (list, tuple)) and len(origin) == 2):
+        print("this clip has no pose_origin_latlon, so its poses cannot be "
+              "georeferenced and no facade can be measured against them")
+        return 1
+    track = formation_track(load_posed_frames(clip_dir))
+    if not track:
+        print("no posed frames in {}".format(os.path.basename(clip_dir)))
+        return 1
+
+    t0 = track[0][0]
+    state, rows, switches = None, [], []
+    for t, views in track:
+        res, state = pick_facade(facades, tuple(origin), views, state, t - t0, cfg)
+        rows.append((t - t0, res))
+        if not rows[:-1] or rows[-2][1].get("facade_id") != res.get("facade_id"):
+            switches.append((t - t0, res))
+
+    print("{} facades on file, {} posed instants over {:.1f} s"
+          .format(len(facades), len(track), track[-1][0] - t0))
+    held = {}
+    for i, (t, res) in enumerate(rows):
+        dt = (rows[i + 1][0] - t) if i + 1 < len(rows) else 0.0
+        held[res.get("facade_id")] = held.get(res.get("facade_id"), 0.0) + dt
+    total = sum(held.values()) or 1.0
+    for fid, secs in sorted(held.items(), key=lambda kv: -kv[1]):
+        name = next((f.get("label") for f in facades if f.get("id") == fid), None)
+        print("  facade {:<4} {:>5.1f}% of the clip  {}".format(
+            "-" if fid == -1 else fid, 100.0 * secs / total,
+            "(nothing picked)" if fid == -1 else (name or "")))
+    print("  {} change{} of pick".format(
+        len(switches) - 1, "" if len(switches) == 2 else "s"))
+
+    for t, res in switches:
+        so = res.get("standoff_m")
+        print("  t+{:6.2f}  -> facade {}{}{}".format(
+            t, res.get("facade_id"),
+            "  {:.2f} m".format(so) if so else "",
+            "  look-off {:.1f} deg".format(res["look_off_deg"])
+            if res.get("look_off_deg") is not None else ""))
+        if verbose:
+            for cand in res.get("candidates") or []:
+                print("      {:<3} {:<22} {}".format(
+                    cand.get("facade_id"),
+                    (cand.get("label") or "")[:22],
+                    cand["reject"] or "OK  t={:.1f} m  standoff={:.2f} m".format(
+                        cand.get("t_m") or 0.0, cand.get("standoff_m") or 0.0)))
+
+    steady = len(held) == 1 and -1 not in held
+    print("\n{}".format(
+        "Settled on one facade for the whole clip."
+        if steady else
+        "NOT steady — the pick changed or lapsed. Re-run with -v for the "
+        "per-candidate reasons at each change."))
+    return 0 if steady else 1
+
+
 if __name__ == "__main__":
+    import argparse
     import sys
+
+    ap = argparse.ArgumentParser(
+        description="Scene-plane maths for a recorded clip. With no arguments, "
+                    "runs the synthetic self-check (no clip, no Unity, no drones).")
+    ap.add_argument("--clip", help="clip folder to run the facade auto-pick over")
+    ap.add_argument("--pick", action="store_true",
+                    help="replay pick_facade over --clip's poses and report which "
+                         "wall it chose, when it changed, and why each candidate "
+                         "was rejected. The offline half of verifying the rule.")
+    ap.add_argument("--shapes", default=DEFAULT_SHAPES_FILE,
+                    help="shapes.json to read facades from (default: %(default)s)")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="per-candidate reject reasons at every change of pick")
+    args = ap.parse_args()
+
+    if args.pick:
+        if not args.clip:
+            sys.exit("--pick needs --clip")
+        clip = args.clip
+        if not os.path.isdir(clip):
+            here = os.path.dirname(os.path.abspath(__file__))
+            for cand in (os.path.join(here, clip),
+                         os.path.join(here, "recordings", clip)):
+                if os.path.isdir(cand):
+                    clip = cand
+                    break
+            else:
+                sys.exit("no clip folder {!r}".format(args.clip))
+        shapes = args.shapes
+        if not os.path.isabs(shapes):
+            shapes = os.path.join(os.path.dirname(os.path.abspath(__file__)), shapes)
+        sys.exit(explain_pick(clip, shapes, args.verbose))
+
     print("clip_scene_plane self-check\n")
     sys.exit(_selftest())
