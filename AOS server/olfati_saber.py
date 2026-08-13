@@ -9,8 +9,9 @@ one importable place:
                            (GetSwarmAcceleration, moved verbatim from
                            swarm_flocking.py).
   - `ObstacleAvoidance`  — the C# `GetObstacleForce` β-agent term, 2D, for
-                           axis-aligned rectangular virtual obstacles and one
-                           geofence polygon repelling inward from its edges.
+                           axis-aligned rectangular virtual obstacles, real
+                           building-footprint polygons, and one geofence
+                           polygon repelling inward from its edges.
   - Geometry helpers     — lat/lon → local-metres conversion for shapes,
                            closest-point-on-rect/polygon, point-in-polygon.
 
@@ -32,10 +33,13 @@ Frames & units (same conventions as swarm_flocking.py):
 Shape validation + shapes.json persistence also live here (bottom of the
 file) so the controller (swarm_flocking.command_listener) and the GUI server
 (swarm_gui.py, which must be able to save shapes with NO controller running)
-share one implementation and can never drift apart.
+share one implementation and can never drift apart. The file format is
+versioned and READ BY PROCESSES AT DIFFERENT VERSIONS — see the compatibility
+contract above `DEFAULT_SHAPES_FILE` before changing it.
 
 Pure Python (stdlib only), no ds_wrapper import — runs and is testable on any
-Python. Must stay Python 3.7-compatible (the controller runs cp37).
+Python: `python olfati_saber.py` runs the self-check at the bottom. Must stay
+Python 3.7-compatible (the controller runs cp37).
 """
 
 import json
@@ -421,6 +425,40 @@ class ObstacleAvoidance:
         cn, ce, inside = closest_point_on_rect(pos_ne[0], pos_ne[1], rect_ne)
         return self.beta_force(pos_ne, vel_ne, (cn, ce), inside=inside)
 
+    def poly_force(self, pos_ne, vel_ne, poly_ne):
+        """Repulsion from one arbitrary footprint polygon [(n, e), ...].
+
+        This is the rect_force semantic, NOT the fence one: it repels from
+        outside and ejects from inside. (fence_force is the inverse — silent
+        outside, because leaving the geofence is handled as a hard breach by
+        the caller, not as a force.) Concave footprints — courtyards, L-shaped
+        blocks — are fine: point_in_polygon is an even-odd ray cast and
+        closest_point_on_polygon scans every edge."""
+        if len(poly_ne) < 3:
+            return 0.0, 0.0
+        n, e = pos_ne[0], pos_ne[1]
+        # Bounding-box reject before the O(V) edge scan. min/max over the
+        # vertices costs no sqrt; the scan costs a hypot per edge. Buildings
+        # are far apart relative to r0_obs, so this skips nearly all of them.
+        n_min = n_max = poly_ne[0][0]
+        e_min = e_max = poly_ne[0][1]
+        for vn, ve in poly_ne:
+            if vn < n_min:
+                n_min = vn
+            elif vn > n_max:
+                n_max = vn
+            if ve < e_min:
+                e_min = ve
+            elif ve > e_max:
+                e_max = ve
+        r0_m = self.r0_obs * self.scale
+        if (n < n_min - r0_m or n > n_max + r0_m
+                or e < e_min - r0_m or e > e_max + r0_m):
+            return 0.0, 0.0
+        inside = point_in_polygon(n, e, poly_ne)
+        cn, ce, _ = closest_point_on_polygon(n, e, poly_ne)
+        return self.beta_force(pos_ne, vel_ne, (cn, ce), inside=inside)
+
     def fence_force(self, pos_ne, vel_ne, poly_ne):
         """Soft inward repulsion from the geofence edges, ONLY while inside
         the polygon. The closest boundary point acts as the β-agent: u points
@@ -435,16 +473,21 @@ class ObstacleAvoidance:
         cn, ce, _ = closest_point_on_polygon(pos_ne[0], pos_ne[1], poly_ne)
         return self.beta_force(pos_ne, vel_ne, (cn, ce), inside=False)
 
-    def GetObstacleForce(self, pos_ne, vel_ne, rects_ne, fence_ne=None):
+    def GetObstacleForce(self, pos_ne, vel_ne, rects_ne, fence_ne=None,
+                         polys_ne=None):
         """Total obstacle + geofence force for one drone (C# GetObstacleForce;
         the Unity version finds obstacles via Physics.OverlapSphere — here the
-        rects/fence come in as explicit geometry).
+        rects/polys/fence come in as explicit geometry).
 
         Args:
             pos_ne:   (n, e) metres
             vel_ne:   (vn, ve) m/s world frame
             rects_ne: iterable of (n_min, n_max, e_min, e_max) rects
             fence_ne: [(n, e), ...] geofence polygon or None
+            polys_ne: iterable of [(n, e), ...] footprint polygons, or None.
+                      A polygon obstacle must appear here XOR in rects_ne —
+                      it carries a bbox for old readers, and feeding both to
+                      one call would count its repulsion twice.
 
         Returns (fn, fe) world N/E m/s to be added to the drone's command
         (before the caller's magnitude clamp)."""
@@ -452,6 +495,10 @@ class ObstacleAvoidance:
         total_e = 0.0
         for rect in rects_ne:
             fn, fe = self.rect_force(pos_ne, vel_ne, rect)
+            total_n += fn
+            total_e += fe
+        for poly in (polys_ne or ()):
+            fn, fe = self.poly_force(pos_ne, vel_ne, poly)
             total_n += fn
             total_e += fe
         if fence_ne:
@@ -467,16 +514,42 @@ class ObstacleAvoidance:
 # ---------- shape validation + shapes.json persistence ----------
 # Shared by swarm_flocking.command_listener (controller) and swarm_gui.py
 # (which persists shapes even when no controller is running). File format:
-#   {"version": 1,
-#    "obstacles": [{"id":1,"lat_min":..,"lat_max":..,"lon_min":..,"lon_max":..}],
+#   {"version": 2,
+#    "obstacles": [
+#      {"id":1,"lat_min":..,"lat_max":..,"lon_min":..,"lon_max":..},
+#      {"id":2,"lat_min":..,"lat_max":..,"lon_min":..,"lon_max":..,
+#       "kind":"poly","vertices":[[lat,lon],...],
+#       "label":"ME D","source":"osm:way/407504253"}],
+#    "facades": [{"id":1,"obstacle_id":2,"p1":[lat,lon],"p2":[lat,lon],
+#                 "label":"ME D south","source":"osm:way/407504253#edge3"}],
 #    "geofence": [[lat, lon], ...] | null}
+#
+# COMPATIBILITY CONTRACT — read before touching this format. load_shapes below
+# raises on a missing lat_min/lat_max/lon_min/lon_max and its except clause
+# discards the WHOLE file (every obstacle AND the geofence, which is a hard
+# flight failsafe). This file is read by three processes — swarm_gui.py,
+# swarm_flocking.py and clip_scene_plane.py — that can be at different
+# versions on one machine. So a polygon obstacle ALWAYS also carries the four
+# bbox keys, recomputed from its own ring by normalize_polygon_obstacle and
+# never trusted from the wire. An old reader then sees a plain rectangle: a
+# degraded but strictly CONSERVATIVE shape, because the bbox contains the
+# footprint, so avoidance is never weaker than the file describes. New readers
+# branch on `kind`. Do not add a shape type that cannot state a bbox.
 
 DEFAULT_SHAPES_FILE = "shapes.json"
 MAX_OBSTACLES = 32
 MAX_FENCE_VERTICES = 100
+# Cap on a footprint ring. OSM traces of large/ornate buildings can run to
+# hundreds of nodes; past this the per-tick edge scan stops being free and the
+# extra detail is far below the dataset's own accuracy anyway.
+MAX_POLY_VERTICES = 64
+MAX_FACADES = 32
 # Reject rectangles thinner than this on either axis (a stray click-drag must
 # not create an invisible sliver that still repels drones).
 MIN_OBSTACLE_SPAN_M = 0.5
+# Same intent for a ring: a degenerate/collapsed footprint must not become an
+# invisible obstacle. No building is 1 m².
+MIN_POLY_AREA_M2 = 1.0
 
 
 def finite_latlon(lat, lon):
@@ -505,6 +578,72 @@ def normalize_obstacle(lat1, lon1, lat2, lon2):
             "lon_min": lon_min, "lon_max": lon_max}
 
 
+def ring_area_m2(ring):
+    """Absolute area of a [[lat, lon], ...] ring in square metres (shoelace in
+    local metres about the ring's own first vertex)."""
+    pts = [gps_to_local(v[0], v[1], ring[0][0], ring[0][1]) for v in ring]
+    acc = 0.0
+    num = len(pts)
+    for i in range(num):
+        n1, e1 = pts[i]
+        n2, e2 = pts[(i + 1) % num]
+        acc += n1 * e2 - n2 * e1
+    return abs(acc) * 0.5
+
+
+def normalize_polygon_obstacle(vertices, label=None, source=None):
+    """Validate a building-footprint ring and return the polygon-obstacle dict
+    (WITHOUT an id — the caller assigns it), or None when rejected.
+
+    The returned dict carries BOTH the ring and its bounding box, and the bbox
+    is always recomputed here rather than taken from the caller — see the
+    compatibility contract above."""
+    if not isinstance(vertices, list) or len(vertices) < 3:
+        return None
+    try:
+        ring = [[float(v[0]), float(v[1])] for v in vertices]
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not all(finite_latlon(la, lo) for la, lo in ring):
+        return None
+    # OSM closes a way by repeating its first node; the ring is stored open,
+    # the way point_in_polygon/closest_point_on_polygon expect it.
+    if len(ring) > 3 and ring[0] == ring[-1]:
+        ring.pop()
+    if not (3 <= len(ring) <= MAX_POLY_VERTICES):
+        return None
+    if ring_area_m2(ring) < MIN_POLY_AREA_M2:
+        return None
+    ob = {"lat_min": min(v[0] for v in ring), "lat_max": max(v[0] for v in ring),
+          "lon_min": min(v[1] for v in ring), "lon_max": max(v[1] for v in ring),
+          "kind": "poly", "vertices": ring}
+    if label:
+        ob["label"] = str(label)[:80]
+    if source:
+        ob["source"] = str(source)[:120]
+    return ob
+
+
+def validate_facade(p1, p2):
+    """Validate an inspection wall's two endpoints and return
+    [[lat, lon], [lat, lon]], or None when rejected.
+
+    The pair is the wall's BASE line — the two points that go on to
+    clip_scene_plane.facade_from_line, whose azimuth is the wall's true
+    bearing, unlike facade_from_obstacle's, which can only be 0 or 90."""
+    try:
+        a = [float(p1[0]), float(p1[1])]
+        b = [float(p2[0]), float(p2[1])]
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not (finite_latlon(a[0], a[1]) and finite_latlon(b[0], b[1])):
+        return None
+    n, e = gps_to_local(b[0], b[1], a[0], a[1])
+    if math.hypot(n, e) < MIN_OBSTACLE_SPAN_M:
+        return None
+    return [a, b]
+
+
 def validate_fence(vertices):
     """Validate a geofence vertex list and return it as [[lat, lon], ...]
     floats, or None when rejected (not a list, <3 or >MAX_FENCE_VERTICES
@@ -530,11 +669,21 @@ def load_shapes(path):
             data = json.load(f)
         obstacles = []
         for ob in data.get("obstacles") or []:
-            obstacles.append({
+            rec = {
                 "id": int(ob["id"]),
                 "lat_min": float(ob["lat_min"]), "lat_max": float(ob["lat_max"]),
                 "lon_min": float(ob["lon_min"]), "lon_max": float(ob["lon_max"]),
-            })
+            }
+            # v2 polygon footprint. A ring that fails to validate is DROPPED
+            # and the record stays a usable rectangle — degrade, never lose.
+            # Nothing in here may raise: a KeyError would cost the whole file,
+            # geofence included (see the except clause below).
+            if ob.get("kind") == "poly":
+                poly = normalize_polygon_obstacle(
+                    ob.get("vertices"), ob.get("label"), ob.get("source"))
+                if poly is not None:
+                    rec.update(poly)   # also re-asserts the bbox invariant
+            obstacles.append(rec)
         fence = data.get("geofence")
         if fence is not None:
             fence = [[float(v[0]), float(v[1])] for v in fence]
@@ -547,16 +696,251 @@ def load_shapes(path):
         return [], None
 
 
-def save_shapes(path, obstacles, geofence):
+def load_facades(path):
+    """Load the inspection-wall list from `path` (a v2 key, absent in v1
+    files). Kept separate from load_shapes so that function's 2-tuple return —
+    and its three call sites — stay untouched. Corrupt entries are skipped
+    individually rather than costing the list."""
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print("WARNING: could not load facades from %s: %s" % (path, e))
+        return []
+    out = []
+    for fa in data.get("facades") or []:
+        try:
+            pair = validate_facade(fa["p1"], fa["p2"])
+            if pair is None:
+                continue
+            rec = {"id": int(fa["id"]), "p1": pair[0], "p2": pair[1]}
+            if fa.get("obstacle_id") is not None:
+                rec["obstacle_id"] = int(fa["obstacle_id"])
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        for k in ("label", "source"):
+            if fa.get(k):
+                rec[k] = str(fa[k])
+        out.append(rec)
+        if len(out) >= MAX_FACADES:
+            break
+    return out
+
+
+def save_shapes(path, obstacles, geofence, facades=None):
     """Atomically persist the current shapes (tmp file + os.replace). Each
     process calls this only from one thread (the controller's command_listener
     / the GUI's locked shapes store); when the controller and GUI both save
-    the same edit the contents are identical, so last-writer-wins is safe."""
+    the same edit the contents are identical, so last-writer-wins is safe.
+
+    `facades=None` means "leave whatever is on disk alone" — a read-modify-
+    write. That is what lets any caller which knows nothing about facades (a
+    pre-v2 three-argument call site) save an obstacle edit without silently
+    erasing them. Pass [] to clear them explicitly."""
+    if facades is None:
+        facades = load_facades(path)
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"version": 1, "obstacles": obstacles,
-                       "geofence": geofence}, f, indent=2)
+            json.dump({"version": 2, "obstacles": obstacles,
+                       "geofence": geofence, "facades": facades}, f, indent=2)
         os.replace(tmp, path)
     except OSError as e:
         print("WARNING: could not save shapes file %s: %s" % (path, e))
+
+
+# ---------- self-check ----------
+
+def _selftest():
+    """Synthetic checks: no drones, no GUI, no network.
+
+    Covers the polygon β-agent force (outside/inside/concave/range), the
+    shapes.json v2 schema, and — most importantly — that a v2 file stays
+    readable by a pre-v2 loader.
+    """
+    import shutil
+    import tempfile
+
+    ok = [True]
+
+    def check(name, cond, detail=""):
+        print("  {:<52} {}{}".format(name, "PASS" if cond else "FAIL",
+                                     "" if cond else "  <- " + str(detail)))
+        if not cond:
+            ok[0] = False
+
+    # ---- polygon force -------------------------------------------------
+    av = ObstacleAvoidance()            # d_obs 5 m, r0_obs 6 m, c_obs 4.3
+    square = [(0.0, 0.0), (0.0, 20.0), (20.0, 20.0), (20.0, 0.0)]   # (n, e)
+
+    fn, fe = av.poly_force((10.0, 23.0), (0.0, 0.0), square)
+    check("outside: pushed away from the near edge (+E)",
+          fe > 0.1 and abs(fn) < 1e-6, (fn, fe))
+
+    fn, fe = av.poly_force((10.0, 18.0), (0.0, 0.0), square)
+    check("inside: ejected out through the near edge (+E)",
+          fe > 0.1 and abs(fn) < 1e-6, (fn, fe))
+
+    far = av.poly_force((10.0, 28.0), (0.0, 0.0), square)
+    check("beyond r0_obs: exactly zero", far == (0.0, 0.0), far)
+
+    # The bbox pre-reject must not change any answer, only skip work: every
+    # point inside detection range still reports a force.
+    ring_hits = [av.poly_force((10.0, 20.0 + d), (0.0, 0.0), square)
+                 for d in (1.0, 2.0, 3.0, 4.0)]
+    check("in-range ring: bbox guard skips nothing",
+          all(f[1] > 0.0 for f in ring_hits), ring_hits)
+
+    # Concave L: n in [0,10] over e in [0,30], plus n in [10,30] over e in [0,10].
+    ell = [(0.0, 0.0), (0.0, 30.0), (10.0, 30.0),
+           (10.0, 10.0), (30.0, 10.0), (30.0, 0.0)]
+    check("concave: notch point reads as OUTSIDE",
+          not point_in_polygon(12.0, 15.0, ell))
+    fn, fe = av.poly_force((12.0, 15.0), (0.0, 0.0), ell)
+    check("concave: reflex corner repels away (+N)",
+          fn > 0.1 and abs(fe) < 1e-6, (fn, fe))
+    fn, fe = av.poly_force((3.0, 25.0), (0.0, 0.0), ell)
+    check("concave: interior point ejects to nearest edge (-N)",
+          fn < -0.1 and abs(fe) < 1e-6, (fn, fe))
+
+    # A polygon must never be fed to both paths — this is what that would cost.
+    once = av.GetObstacleForce((10.0, 23.0), (0.0, 0.0), [], polys_ne=[square])
+    twice = av.GetObstacleForce((10.0, 23.0), (0.0, 0.0),
+                                [(0.0, 20.0, 0.0, 20.0)], polys_ne=[square])
+    check("rect+poly double-count is real (partition by kind!)",
+          abs(twice[1] - 2.0 * once[1]) < 1e-9, (once, twice))
+
+    # ---- validation ----------------------------------------------------
+    lat0, lon0 = 46.5197, 6.5665
+    dlat = lambda m: m / EARTH_M_PER_DEG
+    dlon = lambda m: m / (EARTH_M_PER_DEG * math.cos(math.radians(lat0)))
+    ring = [[lat0, lon0], [lat0, lon0 + dlon(40)],
+            [lat0 + dlat(20), lon0 + dlon(40)], [lat0 + dlat(20), lon0]]
+
+    ob = normalize_polygon_obstacle(ring, "ME D", "osm:way/407504253")
+    check("polygon normalizes", ob is not None)
+    check("bbox invariant holds",
+          ob is not None
+          and abs(ob["lat_min"] - lat0) < 1e-12
+          and abs(ob["lat_max"] - (lat0 + dlat(20))) < 1e-12
+          and abs(ob["lon_min"] - lon0) < 1e-12
+          and abs(ob["lon_max"] - (lon0 + dlon(40))) < 1e-12, ob)
+    check("label/source kept", ob.get("label") == "ME D"
+          and ob.get("source") == "osm:way/407504253")
+
+    closed = normalize_polygon_obstacle(ring + [list(ring[0])])
+    check("OSM closing vertex dropped",
+          closed is not None and len(closed["vertices"]) == 4,
+          closed and len(closed["vertices"]))
+
+    check("degenerate ring rejected",
+          normalize_polygon_obstacle([[lat0, lon0]] * 3) is None)
+    check("too many vertices rejected",
+          normalize_polygon_obstacle(
+              [[lat0 + dlat(i), lon0 + dlon(i)]
+               for i in range(MAX_POLY_VERTICES + 2)]) is None)
+    check("non-finite vertex rejected",
+          normalize_polygon_obstacle(
+              [[lat0, lon0], [float("nan"), lon0], [lat0, lon0 + dlon(9)]])
+          is None)
+
+    check("facade validates", validate_facade(ring[0], ring[1]) is not None)
+    check("zero-length facade rejected",
+          validate_facade(ring[0], list(ring[0])) is None)
+
+    # ---- persistence + version skew ------------------------------------
+    tmpdir = tempfile.mkdtemp(prefix="olfati_selftest_")
+    try:
+        path = os.path.join(tmpdir, "shapes.json")
+        rect = normalize_obstacle(lat0, lon0, lat0 + dlat(10), lon0 + dlon(10))
+        rect["id"] = 1
+        poly = dict(ob)
+        poly["id"] = 2
+        fence = [[lat0 - dlat(50), lon0 - dlon(50)],
+                 [lat0 - dlat(50), lon0 + dlon(90)],
+                 [lat0 + dlat(70), lon0 + dlon(90)]]
+        facades = [{"id": 1, "obstacle_id": 2,
+                    "p1": ring[0], "p2": ring[1], "label": "ME D south"}]
+        save_shapes(path, [rect, poly], fence, facades)
+
+        obs2, fence2 = load_shapes(path)
+        check("v2 round-trip: both obstacles", len(obs2) == 2, obs2)
+        check("v2 round-trip: ring survives",
+              obs2[1].get("kind") == "poly" and len(obs2[1]["vertices"]) == 4)
+        check("v2 round-trip: geofence survives",
+              fence2 is not None and len(fence2) == 3)
+        check("v2 round-trip: facade survives", len(load_facades(path)) == 1)
+
+        # A three-argument save (any pre-v2 call site) must not erase facades.
+        save_shapes(path, [rect, poly], fence)
+        check("3-arg save preserves facades", len(load_facades(path)) == 1)
+        save_shapes(path, [rect, poly], fence, [])
+        check("facades=[] clears explicitly", load_facades(path) == [])
+
+        # THE regression guard. The pre-v2 loader raised on a missing bbox key
+        # and its caller swallowed that into ([], None) — losing every obstacle
+        # AND the geofence, which is a hard flight failsafe. A polygon obstacle
+        # carries a bbox precisely so this cannot happen.
+        def load_shapes_pre_v2(p):
+            with open(p, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            out = []
+            for o in data.get("obstacles") or []:
+                out.append({
+                    "id": int(o["id"]),
+                    "lat_min": float(o["lat_min"]), "lat_max": float(o["lat_max"]),
+                    "lon_min": float(o["lon_min"]), "lon_max": float(o["lon_max"]),
+                })
+            f = data.get("geofence")
+            if f is not None:
+                f = [[float(v[0]), float(v[1])] for v in f]
+            return out, f
+
+        try:
+            old_obs, old_fence = load_shapes_pre_v2(path)
+            skew = (len(old_obs) == 2 and old_fence is not None
+                    and len(old_fence) == 3)
+            detail = (len(old_obs), old_fence and len(old_fence))
+        except Exception as e:          # noqa: BLE001 - that IS the failure
+            skew, detail = False, "pre-v2 loader raised: %r" % (e,)
+        check("VERSION SKEW: pre-v2 reader keeps obstacles + fence",
+              skew, detail)
+
+        # And the bbox it falls back to must CONTAIN the footprint, never clip it.
+        contains = all(old_obs[1]["lat_min"] <= v[0] <= old_obs[1]["lat_max"]
+                       and old_obs[1]["lon_min"] <= v[1] <= old_obs[1]["lon_max"]
+                       for v in poly["vertices"])
+        check("VERSION SKEW: fallback bbox contains the ring", contains)
+
+        # A v1 file must still load unchanged.
+        v1 = os.path.join(tmpdir, "v1.json")
+        with open(v1, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "obstacles": [rect], "geofence": fence}, fh)
+        obs1, f1 = load_shapes(v1)
+        check("v1 file still loads", len(obs1) == 1 and f1 is not None
+              and load_facades(v1) == [])
+
+        # A corrupt ring degrades to its rectangle instead of losing the file.
+        bad = os.path.join(tmpdir, "bad.json")
+        broken = dict(poly)
+        broken["vertices"] = [[lat0, lon0]]        # too few to be a ring
+        with open(bad, "w", encoding="utf-8") as fh:
+            json.dump({"version": 2, "obstacles": [broken],
+                       "geofence": fence}, fh)
+        obs3, f3 = load_shapes(bad)
+        check("corrupt ring degrades to its bbox rect",
+              len(obs3) == 1 and "vertices" not in obs3[0] and f3 is not None,
+              obs3)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    print("\n%s" % ("ALL PASS" if ok[0] else "FAILURES ABOVE"))
+    return 0 if ok[0] else 1
+
+
+if __name__ == "__main__":
+    import sys
+    print("olfati_saber self-check")
+    sys.exit(_selftest())

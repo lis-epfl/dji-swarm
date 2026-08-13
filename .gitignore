@@ -66,6 +66,9 @@ flight_logs/
 # GUI-triggered clip recordings from clip_recorder.py (per-drone MP4 + frame
 # index + a windowed copy of the flight-data CSVs)
 recordings/
-# GUI-drawn virtual obstacles / geofence persisted by swarm_flocking.py
-# (field-session data, recreated by drawing on the map)
+# GUI-drawn virtual obstacles / geofence / inspection facades persisted by
+# swarm_flocking.py (field-session data, recreated by drawing on the map)
 shapes.json
+# Building outlines the GUI's "Pick building" tool fetched from OSM Overpass
+# (a cache — refetched on demand, and site-specific)
+footprint_cache.json

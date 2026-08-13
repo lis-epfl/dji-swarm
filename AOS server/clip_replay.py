@@ -331,10 +331,12 @@ def set_scene_plane(clip_dir, args):
     """
     given = [bool(args.set_plane_from_line),
              args.set_plane_from_shape is not None,
+             args.set_plane_from_facade is not None,
              args.set_plane_standoff is not None]
     if sum(given) > 1:
         sys.exit("give one plane source: --set-plane-from-line, "
-                 "--set-plane-from-shape or --set-plane-standoff")
+                 "--set-plane-from-facade, --set-plane-from-shape or "
+                 "--set-plane-standoff")
 
     if args.set_plane_standoff is not None:
         try:
@@ -367,6 +369,26 @@ def set_scene_plane(clip_dir, args):
                                                      origin, toward)
             except ValueError as e:
                 sys.exit(str(e))
+        elif args.set_plane_from_facade is not None:
+            # A wall of a real building footprint, picked on the GUI map. This
+            # routes to facade_from_line, so the azimuth is the wall's true
+            # bearing — the reason to prefer it over --set-plane-from-shape,
+            # whose rectangle can only answer due N/S/E/W.
+            shapes = args.shapes
+            if not os.path.isabs(shapes):
+                shapes = os.path.join(HERE, shapes)
+            want = (None if args.set_plane_from_facade == -1
+                    else args.set_plane_from_facade)
+            rec, err = scene_plane.facade_by_id(shapes, want)
+            if rec is None:
+                sys.exit("{}. In the GUI, press 'Pick building', click the "
+                         "building, then click the wall you filmed (it "
+                         "persists to shapes.json with no controller "
+                         "running).".format(err))
+            try:
+                facade = scene_plane.facade_from_stored(rec, origin, toward)
+            except ValueError as e:
+                sys.exit(str(e))
         else:
             shapes = args.shapes
             if not os.path.isabs(shapes):
@@ -374,9 +396,10 @@ def set_scene_plane(clip_dir, args):
             want = None if args.set_plane_from_shape == -1 else args.set_plane_from_shape
             rect, err = scene_plane.obstacle_by_id(shapes, want)
             if rect is None:
-                sys.exit("{}. Draw the wall with the GUI's 'Add obstacle' "
-                         "(it persists to shapes.json with no controller "
-                         "running), or use --set-plane-from-line.".format(err))
+                sys.exit("{}. Pick the building with the GUI's 'Pick building' "
+                         "and click its wall (--set-plane-from-facade, and the "
+                         "azimuth is not snapped), draw a box with 'Add "
+                         "obstacle', or use --set-plane-from-line.".format(err))
             try:
                 facade = scene_plane.facade_from_obstacle(rect, origin, toward)
             except ValueError as e:
@@ -650,13 +673,22 @@ def main():
                             "roofline — satellite imagery displaces a roof from "
                             "its footprint by height x tan(off-nadir)). Any "
                             "bearing. Computes the standoff and exits.")
+    plane.add_argument("--set-plane-from-facade", metavar="ID", nargs="?",
+                       const=-1, type=int,
+                       help="Use a wall saved by the GUI's 'Pick building' tool "
+                            "(shapes.json). The building's real footprint edge, "
+                            "so the azimuth is the wall's TRUE bearing — this is "
+                            "the easy accurate route, equivalent to typing that "
+                            "edge into --set-plane-from-line. ID is optional "
+                            "when only one facade is on file.")
     plane.add_argument("--set-plane-from-shape", metavar="ID", nargs="?",
                        const=-1, type=int,
-                       help="Use an obstacle drawn on the GUI map instead "
+                       help="Use an obstacle RECTANGLE drawn on the GUI map "
                             "(shapes.json). The face nearest the formation wins; "
-                            "its azimuth is snapped to N/S/E/W, so prefer "
-                            "--set-plane-from-line for a wall on a bearing. ID "
-                            "is optional when only one obstacle is on file.")
+                            "a rectangle has no rotation, so its azimuth is "
+                            "snapped to N/S/E/W — prefer --set-plane-from-facade "
+                            "or --set-plane-from-line for a wall on a bearing. "
+                            "ID is optional when only one obstacle is on file.")
     plane.add_argument("--set-plane-standoff", metavar="METRES", type=float,
                        help="Store a standoff measured by other means (site "
                             "plan, laser). Nothing checks it against the clip.")
@@ -670,8 +702,8 @@ def main():
                             "map can do — or when the filmed surface stands "
                             "proud of a cadastral footprint.")
     plane.add_argument("--shapes", default=DEFAULT_SHAPES_FILE,
-                       help="shapes.json --set-plane-from-shape reads "
-                            "(default: %(default)s)")
+                       help="shapes.json --set-plane-from-facade / "
+                            "--set-plane-from-shape read (default: %(default)s)")
     plane.add_argument("--check-unity", action="store_true",
                        help="Read the running Unity scene's own published "
                             "settings, print the inspector fields that disagree "
@@ -715,6 +747,7 @@ def main():
         set_label(clip_dir, args.set_label, root)
         return
     if (args.set_plane_from_line or args.set_plane_from_shape is not None
+            or args.set_plane_from_facade is not None
             or args.set_plane_standoff is not None):
         set_scene_plane(clip_dir, args)
         return

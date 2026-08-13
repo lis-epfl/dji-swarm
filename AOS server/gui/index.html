@@ -205,6 +205,43 @@
     font-variant-numeric: tabular-nums; }
   #cp-canvas { width: 100%; height: 210px; display: block; }
   @media (max-width: 760px) { #cohesion-panel { right: 10px; } }
+
+  /* ---- building picker ---- */
+  /* Preview panel for a footprint fetched by "Pick building", before it is
+     committed as an obstacle and before one of its walls is kept as a facade. */
+  #building-panel {
+    position: absolute; left: 10px; bottom: 10px; z-index: 1000; width: 310px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: 0 2px 14px rgba(0,0,0,.5); padding: 10px 12px;
+    display: none; flex-direction: column; gap: 7px; font-size: 12px;
+  }
+  #building-panel.on { display: flex; }
+  #building-panel .bp-title { font-weight: 700; font-size: 13px; }
+  #building-panel .bp-sub, #building-panel .bp-hint {
+    color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums;
+  }
+  #building-panel .bp-hint { line-height: 1.45; }
+  #building-panel .bp-edge {
+    color: #ffd23f; font-variant-numeric: tabular-nums; min-height: 1.2em;
+  }
+  #building-panel .bp-row { display: flex; gap: 6px; }
+  #building-panel button {
+    background: #21262d; border: 1px solid var(--line); color: var(--text);
+    border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+  }
+  #building-panel button:hover { border-color: #3fc0ff; color: #9fd8ff; }
+  #building-panel button.primary { border-color: #3fc0ff; color: #9fd8ff; }
+  #building-panel.err .bp-title { color: var(--bad); }
+  .facade-popup button {
+    background: #21262d; border: 1px solid var(--bad); color: var(--bad);
+    border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer;
+    margin-top: 4px;
+  }
+  .facade-popup code {
+    display: block; margin: 4px 0; padding: 3px 5px; background: #0d1117;
+    border: 1px solid var(--line); border-radius: 4px; font-size: 11px;
+    user-select: all;
+  }
 </style>
 </head>
 <body>
@@ -271,9 +308,12 @@
       Gimbal <input type="range" id="gimbal-slider" min="-90" max="60" step="1" value="-10" />
       <span id="gimbal-val">-10&deg;</span>
     </label>
+    <button id="btn-pick-building"
+            title="Click a building on the map to add its real outline as an obstacle, then click one wall of that outline to keep it as a PLANAR inspection facade (Esc cancels). Outlines come from OpenStreetMap — crowd-sourced, so check one against the swisstopo Cadastral basemap before trusting it as a wall.">&#127970; Pick building</button>
     <button id="btn-add-obstacle"
             title="Draw a rectangular virtual obstacle: click and drag on the map (Esc cancels)">&#9635; Add obstacle</button>
     <button id="btn-clear-obstacles" title="Delete all obstacles">Clear obstacles</button>
+    <button id="btn-clear-facades" title="Remove all saved inspection facades">Clear facades</button>
     <button id="btn-add-fence"
             title="Draw the geofence: click the polygon vertices on the map, then double-click or press Finish (Esc cancels). Drones crossing outside get VS disabled and leave the flock until Stop/Start.">&#11040; Add geofence</button>
     <button id="btn-finish-fence" style="display:none"
@@ -294,6 +334,19 @@
       <span class="cp-sub" id="cp-sub"></span>
     </div>
     <canvas id="cp-canvas"></canvas>
+  </div>
+
+  <!-- "Pick building": the fetched footprint before it is committed, and the
+       per-wall readout used to choose a PLANAR inspection facade. -->
+  <div id="building-panel">
+    <div class="bp-title" id="bp-title">…</div>
+    <div class="bp-sub" id="bp-sub"></div>
+    <div class="bp-edge" id="bp-edge"></div>
+    <div class="bp-hint" id="bp-hint"></div>
+    <div class="bp-row">
+      <button id="bp-add" class="primary">Add obstacle</button>
+      <button id="bp-cancel">Cancel</button>
+    </div>
   </div>
 
 <script>
@@ -332,7 +385,43 @@ const labels = L.tileLayer(
   { maxZoom: 21, maxNativeZoom: 19 }
 ).addTo(map);
 
-L.control.layers(null, { 'Place & road labels': labels }, { collapsed: true }).addTo(map);
+// swisstopo basemaps (EPSG:3857 XYZ, no key). Coverage is Switzerland +
+// Liechtenstein ONLY — blank anywhere else, which is why Esri stays the
+// default. The cadastral webmap is the useful one for facade work: it renders
+// the official cadastral survey, so its building and parcel outlines are TRUE
+// GROUND outlines with none of the off-nadir roof lean that makes tracing a
+// roofline off satellite imagery worth 5-7 m of error. Use it to eyeball a
+// picked footprint before trusting it as an inspection wall.
+const SWISSTOPO_ATTR = '&copy; <a href="https://www.swisstopo.admin.ch">swisstopo</a>';
+const swissImage = L.tileLayer(
+  'https://wmts.geo.admin.ch/1.0.0/ch.swisstopo.swissimage/default/current/3857/{z}/{x}/{y}.jpeg',
+  { maxZoom: 21, maxNativeZoom: 20, attribution: SWISSTOPO_ATTR + ' SWISSIMAGE' });
+const swissCadastral = L.tileLayer(
+  'https://wmts.geo.admin.ch/1.0.0/ch.kantone.cadastralwebmap-farbe/default/current/3857/{z}/{x}/{y}.png',
+  { maxZoom: 21, maxNativeZoom: 19,
+    attribution: SWISSTOPO_ATTR + ' / cantons, CadastralWebMap' });
+
+const baseLayers = {
+  'Satellite (Esri)': imagery,
+  'SWISSIMAGE (swisstopo)': swissImage,
+  'Cadastral (swisstopo)': swissCadastral,
+};
+L.control.layers(baseLayers, { 'Place & road labels': labels },
+                 { collapsed: true }).addTo(map);
+
+// Remember the basemap across reloads — the operator picks one to suit the
+// site, and having it reset to satellite on every refresh is a nuisance.
+const BASEMAP_KEY = 'lis_swarm_basemap';
+try {
+  const saved = localStorage.getItem(BASEMAP_KEY);
+  if (saved && baseLayers[saved] && baseLayers[saved] !== imagery) {
+    map.removeLayer(imagery);
+    baseLayers[saved].addTo(map);
+  }
+} catch (e) { /* localStorage blocked (private mode) — keep the default */ }
+map.on('baselayerchange', (e) => {
+  try { localStorage.setItem(BASEMAP_KEY, e.name); } catch (err) { /* ignore */ }
+});
 
 const linesLayer = L.layerGroup().addTo(map);
 // Obstacles + geofence as echoed back from the controller (meta.obstacles /
@@ -341,6 +430,14 @@ const shapesLayer = L.layerGroup().addTo(map);
 const markers = {};   // id -> L.marker
 
 // ---- helpers ----
+// Escape before interpolating into a popup's HTML string. Building labels and
+// sources come from OpenStreetMap tags — arbitrary text written by strangers —
+// so they are never trusted as markup.
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 // Horizontal distance in metres (equirectangular; exact enough at swarm scale,
 // and matches the N/E hypot that swarm_flocking.py prints).
 function distMeters(a, b) {
@@ -700,12 +797,44 @@ function render(data) {
     shapesLayer.clearLayers();
     if (tempRect && drawMode !== 'obstacle') { map.removeLayer(tempRect); tempRect = null; }
     for (const ob of (Array.isArray(shapeSrc.obstacles) ? shapeSrc.obstacles : [])) {
-      const r = L.rectangle([[ob.lat_min, ob.lon_min], [ob.lat_max, ob.lon_max]],
-        { color: '#3fc0ff', weight: 2, fillColor: '#3fc0ff', fillOpacity: 0.18 });
+      // kind 'poly' = a real building footprint (from "Pick building"); it
+      // also carries lat_min/max as a bbox for readers that predate polygons,
+      // so draw the ring when present and fall back to the rectangle.
+      const isPoly = ob.kind === 'poly' && Array.isArray(ob.vertices)
+                     && ob.vertices.length >= 3;
+      const style = { color: '#3fc0ff', weight: 2, fillColor: '#3fc0ff',
+                      fillOpacity: 0.18 };
+      const r = isPoly
+        ? L.polygon(ob.vertices, style)
+        : L.rectangle([[ob.lat_min, ob.lon_min], [ob.lat_max, ob.lon_max]], style);
+      const name = isPoly && ob.label
+        ? `${esc(ob.label)} <span style="color:var(--muted)">#${Number(ob.id)}</span>`
+        : `Obstacle ${Number(ob.id)}`;
       r.bindPopup(
-        `<div class="obstacle-popup"><b>Obstacle ${ob.id}</b><br>` +
-        `<button onclick="deleteObstacle(${Number(ob.id)})">Delete</button></div>`);
+        `<div class="obstacle-popup"><b>${name}</b>` +
+        (isPoly && ob.source ? `<br><span style="color:var(--muted)">${esc(ob.source)}</span>` : '') +
+        `<br><button onclick="deleteObstacle(${Number(ob.id)})">Delete</button></div>`);
       shapesLayer.addLayer(r);
+    }
+    // Inspection facades: one wall of a footprint, kept for PLANAR. Amber so
+    // they read as a different kind of thing from the cyan keep-out shapes —
+    // a facade repels nothing, it only defines the stitcher's scene plane.
+    for (const fa of (Array.isArray(shapeSrc.facades) ? shapeSrc.facades : [])) {
+      if (!Array.isArray(fa.p1) || !Array.isArray(fa.p2)) continue;
+      const geom = edgeBearing(fa.p1, fa.p2);
+      const line = L.polyline([fa.p1, fa.p2],
+        { color: '#ffd23f', weight: 5, opacity: 0.9 });
+      const coords = `${fa.p1[0].toFixed(6)},${fa.p1[1].toFixed(6)},`
+                   + `${fa.p2[0].toFixed(6)},${fa.p2[1].toFixed(6)}`;
+      line.bindPopup(
+        `<div class="facade-popup"><b>Facade ${Number(fa.id)}</b>` +
+        (fa.label ? ` — ${esc(fa.label)}` : '') +
+        `<br><span style="color:var(--muted)">bearing ${geom.deg.toFixed(1)}°, ` +
+        `${geom.len.toFixed(1)} m</span>` +
+        `<code>--set-plane-from-facade ${Number(fa.id)}</code>` +
+        `<code>--set-plane-from-line ${coords}</code>` +
+        `<button onclick="deleteFacade(${Number(fa.id)})">Delete</button></div>`);
+      shapesLayer.addLayer(line);
     }
     if (Array.isArray(shapeSrc.geofence) && shapeSrc.geofence.length >= 3) {
       shapesLayer.addLayer(L.polygon(shapeSrc.geofence,
@@ -960,6 +1089,23 @@ async function postCommand(payload) {
     });
   } catch (e) { /* controller/GUI down — banner already shows feed health */ }
 }
+
+// Same POST, but the reply is read. Used where the caller needs the id the
+// server assigned (a facade must name the footprint it came from, and only
+// the store knows what number that footprint got) or needs to show a
+// rejection instead of failing silently the way postCommand does.
+async function postCommandJson(payload) {
+  try {
+    const r = await fetch('/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: 'GUI server unreachable' };
+  }
+}
 document.getElementById('btn-start').addEventListener('click', () => postCommand({ action: 'start' }));
 document.getElementById('btn-stop').addEventListener('click', () => postCommand({ action: 'stop' }));
 document.getElementById('btn-rotcheck').addEventListener('click', () => postCommand({ action: 'rotation_check' }));
@@ -1064,13 +1210,15 @@ document.getElementById('btn-epfl').addEventListener('click', () => {
 // zoom in fence mode) is disabled while drawing; Escape cancels. Confirmed
 // shapes come back from the controller via meta.obstacles / meta.geofence and
 // are drawn in render() — the temp layers here are just live feedback.
+const btnPickBuilding   = document.getElementById('btn-pick-building');
 const btnAddObstacle    = document.getElementById('btn-add-obstacle');
 const btnClearObstacles = document.getElementById('btn-clear-obstacles');
+const btnClearFacades   = document.getElementById('btn-clear-facades');
 const btnAddFence       = document.getElementById('btn-add-fence');
 const btnFinishFence    = document.getElementById('btn-finish-fence');
 const btnClearFence     = document.getElementById('btn-clear-fence');
 
-let drawMode = null;          // null | 'obstacle' | 'fence'
+let drawMode = null;          // null | 'obstacle' | 'fence' | 'building'
 let dragStart = null, tempRect = null;
 let fenceVerts = [], tempFence = null, tempFenceDots = [];
 let shapesPendingUntil = 0;   // debounce for render()'s shape redraw
@@ -1080,11 +1228,20 @@ function setShapesPending() { shapesPendingUntil = Date.now() + 1500; }
 function enterMode(mode) {
   exitMode();
   drawMode = mode;
-  map.dragging.disable();
+  // 'building' is a single click, and the operator needs to pan around
+  // looking for the right structure. Leaflet does not fire 'click' after a
+  // drag, so panning and picking coexist — only the drag-based modes need
+  // dragging off.
+  if (mode !== 'building') map.dragging.disable();
   if (mode === 'fence') map.doubleClickZoom.disable();
   map.getContainer().classList.add('drawing');
-  (mode === 'obstacle' ? btnAddObstacle : btnAddFence).classList.add('armed');
+  const btn = mode === 'obstacle' ? btnAddObstacle
+            : mode === 'building' ? btnPickBuilding : btnAddFence;
+  btn.classList.add('armed');
   if (mode === 'fence') btnFinishFence.style.display = '';
+  if (mode === 'building') showBuildingPanel('Click a building', '',
+    'Outlines come from OpenStreetMap. Cross-check one against the ' +
+    'Cadastral (swisstopo) basemap before flying a facade against it.', false);
 }
 
 // keepRect: a just-submitted obstacle keeps its temp rectangle on screen
@@ -1096,6 +1253,7 @@ function exitMode(keepRect) {
   map.getContainer().classList.remove('drawing');
   btnAddObstacle.classList.remove('armed');
   btnAddFence.classList.remove('armed');
+  btnPickBuilding.classList.remove('armed');
   btnFinishFence.style.display = 'none';
   dragStart = null;
   if (!keepRect && tempRect) { map.removeLayer(tempRect); tempRect = null; }
@@ -1103,19 +1261,185 @@ function exitMode(keepRect) {
   tempFenceDots.forEach(d => map.removeLayer(d));
   tempFenceDots = [];
   fenceVerts = [];
+  clearBuildingPreview();
 }
 
 btnAddObstacle.addEventListener('click', () =>
   drawMode === 'obstacle' ? exitMode() : enterMode('obstacle'));
 btnAddFence.addEventListener('click', () =>
   drawMode === 'fence' ? exitMode() : enterMode('fence'));
+btnPickBuilding.addEventListener('click', () =>
+  drawMode === 'building' ? exitMode() : enterMode('building'));
 btnClearObstacles.addEventListener('click', () =>
   postCommand({ action: 'clear_obstacles' }));
+btnClearFacades.addEventListener('click', () =>
+  postCommand({ action: 'clear_facades' }));
 btnClearFence.addEventListener('click', () =>
   postCommand({ action: 'clear_geofence' }));
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && drawMode) exitMode();
 });
+
+// ---- pick a building, then pick the wall to inspect ----
+// Two steps, because they answer different questions. The FOOTPRINT becomes a
+// polygon obstacle so the flock avoids the real building rather than a
+// bounding box. One EDGE of it becomes a facade: two lat/lons that
+// clip_replay.py --set-plane-from-facade feeds to
+// clip_scene_plane.facade_from_line, whose azimuth is the wall's true
+// bearing. (--set-plane-from-shape, the rectangle route, can only report 0 or
+// 90 because an obstacle rect has no rotation to report.)
+const bpTitle  = document.getElementById('bp-title');
+const bpSub    = document.getElementById('bp-sub');
+const bpEdge   = document.getElementById('bp-edge');
+const bpHint   = document.getElementById('bp-hint');
+const bpAdd    = document.getElementById('bp-add');
+const bpCancel = document.getElementById('bp-cancel');
+const buildingPanel = document.getElementById('building-panel');
+
+let pickedFootprint = null;   // {vertices, label, source} from /footprint
+let previewPoly = null, previewEdges = [];
+let pickedObstacleId = null;  // set once the footprint is committed
+
+function showBuildingPanel(title, sub, hint, isErr) {
+  bpTitle.textContent = title;
+  bpSub.textContent = sub || '';
+  bpHint.textContent = hint || '';
+  bpEdge.textContent = '';
+  buildingPanel.classList.toggle('err', !!isErr);
+  buildingPanel.classList.add('on');
+  bpAdd.style.display = 'none';
+}
+
+function clearBuildingPreview() {
+  if (previewPoly) { map.removeLayer(previewPoly); previewPoly = null; }
+  previewEdges.forEach(l => map.removeLayer(l));
+  previewEdges = [];
+  pickedFootprint = null;
+  pickedObstacleId = null;
+  buildingPanel.classList.remove('on');
+}
+
+// Compass bearing (deg, 0 = North, clockwise) and length of one wall — the
+// same quantities clip_scene_plane reports for the plane it derives, so a
+// mismatch there is visible here first.
+function edgeBearing(a, b) {
+  const d2r = Math.PI / 180;
+  const dN = (b[0] - a[0]) * 111320;
+  const dE = (b[1] - a[1]) * 111320 * Math.cos(a[0] * d2r);
+  return { deg: (Math.atan2(dE, dN) / d2r + 360) % 360,
+           len: Math.hypot(dN, dE) };
+}
+
+async function fetchFootprint(lat, lon) {
+  showBuildingPanel('Looking up…', lat.toFixed(6) + ', ' + lon.toFixed(6), '');
+  let res;
+  try {
+    const r = await fetch('/footprint?lat=' + lat + '&lon=' + lon);
+    res = await r.json();
+  } catch (e) {
+    res = { ok: false, error: 'GUI server unreachable' };
+  }
+  if (drawMode !== 'building') return;      // cancelled while we waited
+  if (!res.ok) {
+    showBuildingPanel('No outline', '', res.error || 'lookup failed', true);
+    return;
+  }
+  pickedFootprint = res;
+  drawBuildingPreview(res);
+}
+
+function drawBuildingPreview(fp) {
+  if (previewPoly) map.removeLayer(previewPoly);
+  previewEdges.forEach(l => map.removeLayer(l));
+  previewEdges = [];
+
+  previewPoly = L.polygon(fp.vertices,
+    { color: '#3fc0ff', weight: 2, dashArray: '5 4', fillColor: '#3fc0ff',
+      fillOpacity: 0.12, interactive: false }).addTo(map);
+
+  // One clickable line per wall. Hover reads out its bearing and length;
+  // clicking keeps it as the inspection facade.
+  const n = fp.vertices.length;
+  for (let i = 0; i < n; i++) {
+    const a = fp.vertices[i], b = fp.vertices[(i + 1) % n];
+    const geom = edgeBearing(a, b);
+    const line = L.polyline([a, b],
+      { color: '#3fc0ff', weight: 10, opacity: 0.001 }).addTo(map);
+    line.on('mouseover', () => {
+      line.setStyle({ color: '#ffd23f', weight: 6, opacity: 0.95 });
+      bpEdge.textContent = 'wall ' + (i + 1) + '/' + n + ' — bearing '
+                         + geom.deg.toFixed(1) + '°, ' + geom.len.toFixed(1) + ' m';
+    });
+    line.on('mouseout', () => {
+      line.setStyle({ color: '#3fc0ff', weight: 10, opacity: 0.001 });
+      bpEdge.textContent = '';
+    });
+    line.on('click', (e) => {
+      L.DomEvent.stop(e);          // don't let the map treat it as a new pick
+      keepFacade(i, a, b, geom);
+    });
+    previewEdges.push(line);
+  }
+
+  bpAdd.style.display = '';
+  buildingPanel.classList.remove('err');
+  bpTitle.textContent = fp.label || 'building';
+  bpSub.textContent = (fp.source || '') + ' · ' + fp.vertices.length
+                    + ' walls · ' + (fp.area_m2 || 0) + ' m²'
+                    + (fp.cached ? ' · cached' : '');
+  bpHint.textContent = fp.note
+    ? fp.note
+    : 'Click a wall to keep it as an inspection facade, or Add obstacle to '
+      + 'take the outline only.';
+}
+
+// Commit the footprint as a polygon obstacle. Returns its server-assigned id
+// (the store owns the numbering), or null.
+async function commitFootprint() {
+  if (pickedObstacleId !== null) return pickedObstacleId;
+  if (!pickedFootprint) return null;
+  const res = await postCommandJson({
+    action: 'add_building', vertices: pickedFootprint.vertices,
+    label: pickedFootprint.label, source: pickedFootprint.source });
+  setShapesPending();
+  if (!res || !res.ok) {
+    showBuildingPanel('Rejected', '',
+      (res && res.error) || 'the server would not store that outline', true);
+    return null;
+  }
+  pickedObstacleId = res.id;
+  return res.id;
+}
+
+async function keepFacade(idx, a, b, geom) {
+  // The obstacle first: a facade records which footprint it came from, and
+  // only the server can say what id that footprint got.
+  const obId = await commitFootprint();
+  if (obId === null) return;
+  const label = (pickedFootprint.label || 'building') + ' wall ' + (idx + 1);
+  const res = await postCommandJson({
+    action: 'add_facade', obstacle_id: obId, p1: a, p2: b, label: label,
+    source: (pickedFootprint.source || '') + '#edge' + idx });
+  setShapesPending();
+  if (!res || !res.ok) {
+    showBuildingPanel('Facade rejected', '',
+      (res && res.error) || 'those two points are not a wall', true);
+    return;
+  }
+  exitMode();
+  showBuildingPanel('Facade ' + res.id + ' saved',
+    label + ' — bearing ' + geom.deg.toFixed(1) + '°, '
+      + geom.len.toFixed(1) + ' m',
+    'Use it with:  clip_replay.py --clip <label> --set-plane-from-facade '
+      + res.id);
+  bpAdd.style.display = 'none';
+  setTimeout(() => buildingPanel.classList.remove('on'), 9000);
+}
+
+bpAdd.addEventListener('click', async () => {
+  if (await commitFootprint() !== null) exitMode();
+});
+bpCancel.addEventListener('click', () => exitMode());
 
 // Obstacle: click-drag a rectangle (panning is off in this mode).
 map.on('mousedown', (e) => {
@@ -1146,7 +1470,9 @@ map.on('mouseup', (e) => {
 });
 
 // Fence: click vertices; double-click or the Finish button closes it.
+// Building: one click resolves the footprint under the cursor.
 map.on('click', (e) => {
+  if (drawMode === 'building') { fetchFootprint(e.latlng.lat, e.latlng.lng); return; }
   if (drawMode !== 'fence') return;
   fenceVerts.push(e.latlng);
   if (tempFence) map.removeLayer(tempFence);
@@ -1176,6 +1502,10 @@ function finishFence() {
 window.deleteObstacle = function (id) {
   postCommand({ action: 'delete_obstacle', id: id });
   map.closePopup();   // the echo removes the rectangle on the next poll
+};
+window.deleteFacade = function (id) {
+  postCommand({ action: 'delete_facade', id: id });
+  map.closePopup();
 };
 
 // ---- cohesion-force plot (port of Unity TuneOlfatiSaber.cs) ----

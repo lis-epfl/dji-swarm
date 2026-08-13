@@ -23,8 +23,17 @@ To view from a tablet/phone on the same network, bind all interfaces:
     python swarm_gui.py --http-host 0.0.0.0
     # then browse to http://<this-PC-ip>:8000
 
-The map tiles (Esri World Imagery) are fetched from the internet, so the GUI PC
-needs connectivity; no API key is required.
+The map tiles are fetched from the internet, so the GUI PC needs connectivity;
+no API key is required. The layer control offers Esri World Imagery (the
+default) plus two swisstopo basemaps — SWISSIMAGE and the cadastral webmap,
+whose ground-true building and parcel outlines are the visual cross-check for a
+picked footprint. The swisstopo layers cover Switzerland/Liechtenstein only.
+
+The map's "Pick building" tool resolves a click to a real building outline via
+/footprint (see building_footprint.py) and stores it as a polygon obstacle; one
+edge of that outline can then be kept as a PLANAR inspection wall, which is what
+gives clip_replay.py --set-plane-from-facade a wall azimuth that is not snapped
+to a compass axis.
 """
 
 import argparse
@@ -33,6 +42,7 @@ import os
 import socket
 import threading
 import time
+import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -41,11 +51,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # obstacles/geofence can be drawn, saved, and shown with NO controller running.
 from olfati_saber import (
     DEFAULT_SHAPES_FILE,
+    MAX_FACADES,
     MAX_OBSTACLES,
     normalize_obstacle,
+    normalize_polygon_obstacle,
+    validate_facade,
     validate_fence,
+    load_facades,
     load_shapes,
     save_shapes,
+)
+
+# Click-a-building footprint lookup (OSM Overpass + an on-disk cache). Pure
+# stdlib like the rest of this server's imports — see building_footprint.py for
+# why OSM rather than a swisstopo layer.
+from building_footprint import (
+    DEFAULT_CACHE_FILE,
+    DEFAULT_RADIUS_M,
+    FootprintCache,
+    lookup as lookup_footprint,
 )
 
 # Demostitch offset bounds shared with the controller (heading_demostitch.py
@@ -109,7 +133,7 @@ class SwarmState:
 
 
 class ShapesStore:
-    """Thread-safe obstacles/geofence store persisted to shapes.json.
+    """Thread-safe obstacles/facades/geofence store persisted to shapes.json.
 
     Exists so the operator can draw (and keep) shapes with NO controller
     running: every edit is applied here, saved to disk, and ALSO forwarded to
@@ -118,16 +142,23 @@ class ShapesStore:
     controller persisted that edit itself), so ids and content converge on the
     controller's view. Both processes default to the same file in this folder,
     and duplicate saves of the same edit write identical content atomically.
+
+    An obstacle is either the hand-drawn axis-aligned rectangle or a real
+    building footprint (`kind: "poly"`); a facade is one edge of a footprint,
+    stored so clip_replay.py --set-plane-from-facade can turn it into a PLANAR
+    scene plane with the wall's true bearing. Facades are inert for flight.
     """
 
     def __init__(self, path):
         self.path = path
         self._lock = threading.Lock()
         self._obstacles, self._geofence = load_shapes(path)
+        self._facades = load_facades(path)
 
     def get(self):
         with self._lock:
             return {"obstacles": list(self._obstacles),
+                    "facades": list(self._facades),
                     "geofence": self._geofence}
 
     def sync_from_feed(self, meta):
@@ -139,21 +170,67 @@ class ShapesStore:
                 self._obstacles = list(meta.get("obstacles") or [])
             if "geofence" in meta:
                 self._geofence = meta.get("geofence")
+            # Absent key => leave alone, so a controller too old to echo
+            # facades cannot silently wipe the ones drawn here.
+            if "facades" in meta:
+                self._facades = list(meta.get("facades") or [])
 
     def _save(self):
-        save_shapes(self.path, self._obstacles, self._geofence)
+        save_shapes(self.path, self._obstacles, self._geofence, self._facades)
+
+    def _add_locked(self, ob):
+        """Assign the next id, append, persist. Caller holds the lock.
+        Returns the new id, or None when the cap is reached."""
+        if len(self._obstacles) >= MAX_OBSTACLES:
+            return None
+        ob["id"] = max([o["id"] for o in self._obstacles] or [0]) + 1
+        self._obstacles = self._obstacles + [ob]
+        self._save()
+        return ob["id"]
 
     def add_obstacle(self, lat1, lon1, lat2, lon2):
         ob = normalize_obstacle(lat1, lon1, lat2, lon2)
         if ob is None:
-            return False
+            return None
         with self._lock:
-            if len(self._obstacles) >= MAX_OBSTACLES:
-                return False
-            ob["id"] = max([o["id"] for o in self._obstacles] or [0]) + 1
-            self._obstacles = self._obstacles + [ob]
+            return self._add_locked(ob)
+
+    def add_building(self, vertices, label=None, source=None):
+        """Add a building footprint as a polygon obstacle. Returns its id."""
+        ob = normalize_polygon_obstacle(vertices, label, source)
+        if ob is None:
+            return None
+        with self._lock:
+            return self._add_locked(ob)
+
+    def add_facade(self, p1, p2, obstacle_id=None, label=None, source=None):
+        pair = validate_facade(p1, p2)
+        if pair is None:
+            return None
+        with self._lock:
+            if len(self._facades) >= MAX_FACADES:
+                return None
+            rec = {"id": max([f["id"] for f in self._facades] or [0]) + 1,
+                   "p1": pair[0], "p2": pair[1]}
+            if obstacle_id is not None:
+                rec["obstacle_id"] = int(obstacle_id)
+            if label:
+                rec["label"] = str(label)[:80]
+            if source:
+                rec["source"] = str(source)[:120]
+            self._facades = self._facades + [rec]
             self._save()
-        return True
+            return rec["id"]
+
+    def delete_facade(self, fa_id):
+        with self._lock:
+            self._facades = [f for f in self._facades if f["id"] != fa_id]
+            self._save()
+
+    def clear_facades(self):
+        with self._lock:
+            self._facades = []
+            self._save()
 
     def delete_obstacle(self, ob_id):
         with self._lock:
@@ -180,6 +257,15 @@ class ShapesStore:
             self._save()
 
 
+def _by_id(records, want_id):
+    """The record with `want_id`, or None. Used to echo back what the store
+    actually saved rather than what was asked for."""
+    for rec in records or []:
+        if rec.get("id") == want_id:
+            return rec
+    return None
+
+
 def udp_listener(state, host, port, shapes=None):
     """Receive telemetry datagrams from the flight controller forever."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -197,7 +283,8 @@ def udp_listener(state, host, port, shapes=None):
             continue  # ignore malformed packets, keep listening
 
 
-def make_handler(state, cmd_sock=None, cmd_addr=None, shapes=None):
+def make_handler(state, cmd_sock=None, cmd_addr=None, shapes=None,
+                 footprints=None):
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype):
             self.send_response(code)
@@ -222,6 +309,31 @@ def make_handler(state, cmd_sock=None, cmd_addr=None, shapes=None):
                     snap["shapes"] = shapes.get()
                 body = json.dumps(snap).encode("utf-8")
                 self._send(200, body, "application/json")
+                return
+
+            if path == "/footprint":
+                # Building lookup for the map's "Pick building" tool. Proxied
+                # here rather than fetched by the browser so the result can be
+                # cached to disk — a site surveyed at the office then answers
+                # in the field with no connectivity. Blocking network I/O is
+                # safe: this is a ThreadingHTTPServer, so /telemetry keeps
+                # being served while Overpass is slow or down.
+                if footprints is None:      # --no-footprint-lookup
+                    self._send(200, b'{"ok":false,"error":"building lookup is '
+                                    b'disabled (--no-footprint-lookup)"}',
+                               "application/json")
+                    return
+                q = urllib.parse.parse_qs(
+                    self.path.split("?", 1)[1] if "?" in self.path else "")
+                res = lookup_footprint(
+                    q.get("lat", [None])[0], q.get("lon", [None])[0],
+                    radius_m=q.get("radius", [DEFAULT_RADIUS_M])[0],
+                    cache=footprints,
+                    refresh=q.get("refresh", ["0"])[0] not in ("0", "", "false"))
+                # Failures ride on a 200 with ok:false so the GUI can show the
+                # reason instead of a bare network error.
+                self._send(200, json.dumps(res).encode("utf-8"),
+                           "application/json")
                 return
 
             if path in ("/", ""):
@@ -329,11 +441,76 @@ def make_handler(state, cmd_sock=None, cmd_addr=None, shapes=None):
                 # to shapes.json — works with no controller) and forwarded so
                 # a running controller applies the identical edit.
                 corners = {k: msg.get(k) for k in ("lat1", "lon1", "lat2", "lon2")}
-                if shapes is None or not shapes.add_obstacle(**corners):
+                new_id = shapes.add_obstacle(**corners) if shapes else None
+                if new_id is None:
                     self._send(400, b'{"ok":false,"error":"bad value"}', "application/json")
                     return
                 out = {k: float(v) for k, v in corners.items()}
                 out["action"] = "add_obstacle"
+                out["id"] = new_id
+            elif action == "add_building":
+                # A real building footprint picked off the map (see
+                # building_footprint.py). Stored as a polygon obstacle that
+                # ALSO carries its bounding box, so a process on an older
+                # shapes.json revision still reads a valid — and conservative
+                # — rectangle. See olfati_saber.py's compatibility contract.
+                verts = msg.get("vertices")
+                label = msg.get("label")
+                source = msg.get("source")
+                new_id = (shapes.add_building(verts, label, source)
+                          if shapes else None)
+                if new_id is None:
+                    self._send(400, b'{"ok":false,"error":"bad footprint"}',
+                               "application/json")
+                    return
+                # Echo the stored (validated, bbox-stamped) ring, not the raw
+                # request, so the controller applies exactly what was saved.
+                # `or {}` because a controller's meta echo can replace the list
+                # between the add and this read (sync_from_feed); the id is
+                # already assigned either way, so fall back to the request.
+                stored = _by_id(shapes.get()["obstacles"], new_id) or {}
+                out = {"action": "add_building", "id": new_id,
+                       "vertices": stored.get("vertices") or verts}
+                for k in ("label", "source"):
+                    if stored.get(k) or msg.get(k):
+                        out[k] = stored.get(k) or msg.get(k)
+            elif action == "add_facade":
+                # One edge of a footprint, kept as the PLANAR inspection wall.
+                # Inert for flight — it exists so clip_replay.py
+                # --set-plane-from-facade can route it through
+                # clip_scene_plane.facade_from_line, whose azimuth is the
+                # wall's TRUE bearing rather than the nearest compass axis.
+                ob_id = msg.get("obstacle_id")
+                try:
+                    ob_id = int(ob_id) if ob_id is not None else None
+                except (TypeError, ValueError):
+                    ob_id = None
+                new_id = (shapes.add_facade(msg.get("p1"), msg.get("p2"),
+                                            ob_id, msg.get("label"),
+                                            msg.get("source"))
+                          if shapes else None)
+                if new_id is None:
+                    self._send(400, b'{"ok":false,"error":"bad facade"}',
+                               "application/json")
+                    return
+                stored = _by_id(shapes.get()["facades"], new_id)
+                out = dict(stored) if stored else {"id": new_id,
+                                                   "p1": msg.get("p1"),
+                                                   "p2": msg.get("p2")}
+                out["action"] = "add_facade"
+            elif action == "delete_facade":
+                try:
+                    fa_id = int(msg.get("id"))
+                except (TypeError, ValueError):
+                    self._send(400, b'{"ok":false,"error":"bad value"}', "application/json")
+                    return
+                if shapes is not None:
+                    shapes.delete_facade(fa_id)
+                out = {"action": "delete_facade", "id": fa_id}
+            elif action == "clear_facades":
+                if shapes is not None:
+                    shapes.clear_facades()
+                out = {"action": action}
             elif action == "delete_obstacle":
                 try:
                     ob_id = int(msg.get("id"))
@@ -367,7 +544,14 @@ def make_handler(state, cmd_sock=None, cmd_addr=None, shapes=None):
                     cmd_sock.sendto(json.dumps(out).encode("utf-8"), cmd_addr)
                 except Exception:
                     pass  # controller not up yet; button is best-effort
-            self._send(200, b'{"ok":true}', "application/json")
+            # Echo the id the store assigned. The map needs it to link a facade
+            # to the footprint it was picked from, and it is the id the
+            # delete button and clip_replay.py --set-plane-from-facade use.
+            reply = {"ok": True}
+            if "id" in out:
+                reply["id"] = out["id"]
+            self._send(200, json.dumps(reply).encode("utf-8"),
+                       "application/json")
 
         def log_message(self, *args):
             pass  # quiet; telemetry polling would otherwise spam the console
@@ -396,6 +580,17 @@ def main():
                          f"(default {DEFAULT_SHAPES_FILE}; relative paths "
                          "resolve against this script's directory — keep it "
                          "matching swarm_flocking.py --shapes-file)")
+    ap.add_argument("--footprint-cache", default=DEFAULT_CACHE_FILE,
+                    metavar="PATH",
+                    help="JSON file the picked building footprints are cached "
+                         f"to (default {DEFAULT_CACHE_FILE}; relative paths "
+                         "resolve against this script's directory). Lets a "
+                         "building picked once be re-picked offline.")
+    ap.add_argument("--no-footprint-lookup", action="store_true",
+                    help="Disable the 'Pick building' tool's outbound OSM "
+                         "Overpass queries (the map's Pick building button "
+                         "then reports the lookup as unavailable). Hand-drawn "
+                         "obstacles and geofences are unaffected.")
     ap.add_argument("--open", action="store_true",
                     help="Open the GUI in the default browser on startup")
     args = ap.parse_args()
@@ -412,7 +607,16 @@ def main():
     shapes = ShapesStore(shapes_path)
     loaded = shapes.get()
     print(f"  Shapes: {len(loaded['obstacles'])} obstacle(s), "
+          f"{len(loaded['facades'])} facade(s), "
           f"geofence {'set' if loaded['geofence'] else 'none'} ({shapes_path})")
+
+    # Footprints picked off the map are cached beside shapes.json so a site
+    # surveyed with connectivity still answers in the field without it.
+    cache_path = args.footprint_cache
+    if not os.path.isabs(cache_path):
+        cache_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), cache_path)
+    footprints = None if args.no_footprint_lookup else FootprintCache(cache_path)
 
     t = threading.Thread(target=udp_listener,
                          args=(state, args.udp_host, args.udp_port, shapes),
@@ -425,8 +629,9 @@ def main():
     cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     cmd_addr = (args.cmd_host, args.cmd_port)
 
-    httpd = ThreadingHTTPServer((args.http_host, args.http_port),
-                                make_handler(state, cmd_sock, cmd_addr, shapes))
+    httpd = ThreadingHTTPServer(
+        (args.http_host, args.http_port),
+        make_handler(state, cmd_sock, cmd_addr, shapes, footprints))
     url = f"http://{'127.0.0.1' if args.http_host in ('0.0.0.0', '') else args.http_host}:{args.http_port}"
     print("LIS_Swarm GUI server")
     print(f"  Open: {url}")

@@ -29,12 +29,15 @@ What it cannot do
   imagery displaces a roof from its footprint by `height x tan(off-nadir)` —
   about 7 m for a 20 m building, which at these standoffs is a bigger error than
   everything else in the pipeline combined.
-* **Obstacles are axis-aligned lat/lon rectangles**, so a facade on an arbitrary
-  bearing gets its azimuth snapped to due N/S/E/W. `facade_from_line` takes two
-  arbitrary points and is the accurate route; the rectangle is the convenient
-  one. (The geofence polygon would also carry an arbitrary bearing, but it is a
-  hard flight boundary that ejects drones outside it — a facade does not belong
-  in it.)
+* **Obstacle RECTANGLES are axis-aligned lat/lon boxes**, so a facade taken from
+  one (`facade_from_obstacle`) gets its azimuth snapped to due N/S/E/W — a
+  rectangle has no rotation to report. Two routes avoid that, and both end up in
+  `facade_from_line`: pass two arbitrary points, or — the easy one — pick the
+  building on the GUI map and click the wall you filmed, which saves the two
+  endpoints of that footprint edge as a stored facade (`facade_by_id` /
+  `facade_from_stored`). Prefer either over the rectangle. (The geofence polygon
+  would also carry an arbitrary bearing, but it is a hard flight boundary that
+  ejects drones outside it — a facade does not belong in it.)
 * **Absolute GPS is the floor.** The standoff is `formation position - traced
   wall`, and the aircraft's own fix is good to a metre or three however well the
   wall is drawn. `analyse` prints what that costs in mosaic pixels at the clip's
@@ -55,14 +58,14 @@ import math
 import os
 from datetime import datetime
 
-from olfati_saber import (gps_to_local, load_shapes, rect_to_ne,
+from olfati_saber import (gps_to_local, load_facades, load_shapes, rect_to_ne,
                           DEFAULT_SHAPES_FILE)
 
-__all__ = ["facade_from_line", "facade_from_obstacle", "offset_facade",
-           "analyse", "store_scene_plane", "scene_plane_of", "describe",
-           "manual_report", "load_posed_frames", "formation_track",
-           "formation_centroid_xz", "obstacle_by_id", "wire_focal_px",
-           "DEFAULT_SHAPES_FILE"]
+__all__ = ["facade_from_line", "facade_from_obstacle", "facade_from_stored",
+           "offset_facade", "analyse", "store_scene_plane", "scene_plane_of",
+           "describe", "manual_report", "load_posed_frames", "formation_track",
+           "formation_centroid_xz", "obstacle_by_id", "facade_by_id",
+           "wire_focal_px", "DEFAULT_SHAPES_FILE"]
 
 
 # The wire resolution PLANAR actually solves at (ImageSharing.cs
@@ -92,6 +95,10 @@ FORMATION_PLANARITY_MAX = 0.2
 # Below this the traced wall and the formation-derived normal disagree enough
 # that a single perpendicular scalar cannot describe the surface.
 TILT_WARN_DEG = 10.0
+# Past this tilt the across-formation depth is a tangent running to infinity;
+# report it as unbounded rather than as a huge number. 90 deg exactly is
+# reachable (a formation flown at one altitude fits a horizontal plane).
+TILT_DEPTH_MAX_DEG = 89.0
 
 # A standoff that moves by more than this fraction of itself during the clip is
 # not one number. FormationRelative re-derives the plane from the live centroid
@@ -291,6 +298,45 @@ def offset_facade(facade, offset_m):
     out["d"] = facade["d"] - float(offset_m)
     out["offset_m"] = round(float(offset_m), 3)
     return out
+
+
+def facade_from_stored(rec, origin, toward_xz):
+    """The plane for a facade saved by the GUI's "Pick building" tool.
+
+    A stored facade is one EDGE of a real building footprint, so this is
+    facade_from_line with the two endpoints already chosen — and that is the
+    whole point: the azimuth is the wall's true bearing, where
+    facade_from_obstacle can only ever answer 0 or 90 because the rectangle it
+    reads has no rotation to report. No new geometry lives here.
+    """
+    out = facade_from_line(rec["p1"], rec["p2"], origin, toward_xz)
+    out["kind"] = "facade"
+    out["facade_id"] = rec.get("id")
+    for key in ("label", "source", "obstacle_id"):
+        if rec.get(key) is not None:
+            out[key] = rec[key]
+    return out
+
+
+def facade_by_id(shapes_path, want_id=None):
+    """One stored facade from a shapes.json, or None. `want_id=None` and a
+    single facade on file is unambiguous; anything else must be named."""
+    facades = load_facades(shapes_path)
+    if not facades:
+        return None, ("no saved facades in {} — pick a building on the GUI map "
+                      "and click the wall you filmed".format(shapes_path))
+    if want_id is None:
+        if len(facades) == 1:
+            return facades[0], None
+        return None, ("{} facades in {} ({}) — say which one"
+                      .format(len(facades), shapes_path,
+                              ", ".join("{}={}".format(f["id"],
+                                                       f.get("label", "?"))
+                                        for f in facades)))
+    for fa in facades:
+        if fa["id"] == want_id:
+            return fa, None
+    return None, "no facade with id {} in {}".format(want_id, shapes_path)
 
 
 def obstacle_by_id(shapes_path, want_id=None):
@@ -547,9 +593,17 @@ def analyse(clip_dir, facade, meta=None):
 
     baseline, focal, px_per_m, tol_m = _seam_geometry(track, meta, mean_standoff)
     # A normal tilted off the wall cannot be fixed by any scalar: across the
-    # formation's own span the plane departs from the wall by this much.
-    tilt_depth_m = ((baseline / 2.0) * math.tan(math.radians(tilt_deg))
-                    if tilt_deg else 0.0)
+    # formation's own span the plane departs from the wall by this much. The
+    # tangent runs away at 90 deg, which is a REACHABLE case — drones all at one
+    # altitude fit a horizontal plane, perpendicular to any wall normal — so
+    # past TILT_DEPTH_MAX_DEG the depth is reported as unbounded (None) instead
+    # of as a number with sixteen digits in it.
+    if tilt_deg and tilt_deg < TILT_DEPTH_MAX_DEG:
+        tilt_depth_m = (baseline / 2.0) * math.tan(math.radians(tilt_deg))
+    elif tilt_deg:
+        tilt_depth_m = None
+    else:
+        tilt_depth_m = 0.0
 
     spread = max(standoffs) - min(standoffs)
     warnings = []
@@ -566,6 +620,13 @@ def analyse(clip_dir, facade, meta=None):
                 "the formation is off the end of that face. It is looking past "
                 "a corner of the rectangle, so the wall it sees may not be this "
                 "one.")
+    if facade["kind"] == "facade" and str(facade.get("source", "")).startswith("osm:"):
+        warnings.append(
+            "this wall was traced from OpenStreetMap ({}), which is "
+            "crowd-sourced rather than surveyed. The bearing is real (unlike an "
+            "obstacle face) but the position is not guaranteed; compare it "
+            "against the GUI's Cadastral basemap, and note the tolerance below."
+            .format(facade.get("source")))
     if look_off_deg is not None and look_off_deg > 30.0:
         warnings.append(
             "the views are {:.0f} deg oblique to the wall. The mosaic's scale "
@@ -573,10 +634,20 @@ def analyse(clip_dir, facade, meta=None):
     if tilt_deg is not None and tilt_deg > TILT_WARN_DEG:
         warnings.append(
             "the pose-derived normal ({} rule) is {:.1f} deg off the traced "
-            "wall, i.e. {:.2f} m of depth across the formation's {:.1f} m span. "
+            "wall, i.e. {} across the formation's {:.1f} m span. "
             "No standoff can correct a tilt; check the trace's bearing and the "
             "drones' differential GPS."
-            .format(rule, tilt_deg, tilt_depth_m, baseline))
+            .format(rule, tilt_deg,
+                    "{:.2f} m of depth".format(tilt_depth_m)
+                    if tilt_depth_m is not None else "unbounded depth",
+                    baseline))
+        if tilt_depth_m is None and rule == "positions":
+            warnings.append(
+                "that normal is perpendicular to the wall, which is what a "
+                "formation flown at ONE altitude gives — its cameras fit a "
+                "horizontal plane, so their positions say nothing about a "
+                "vertical wall. Stagger the drones in height (vertical-plane "
+                "mode does this) or PLANAR has no formation normal to use.")
     if spread > STANDOFF_SPREAD_WARN * mean_standoff:
         warnings.append(
             "the standoff moved {:.2f} m during the clip ({:.0f}% of it), so one "
@@ -613,7 +684,8 @@ def analyse(clip_dir, facade, meta=None):
         "baseline_m": round(baseline, 3),
         "plane_rule": rule,
         "tilt_deg": None if tilt_deg is None else round(tilt_deg, 2),
-        "tilt_depth_m": round(tilt_depth_m, 3),
+        # None = unbounded (the normal is perpendicular to the wall).
+        "tilt_depth_m": None if tilt_depth_m is None else round(tilt_depth_m, 3),
         "look_off_deg": None if look_off_deg is None else round(look_off_deg, 2),
         "normal_bearing_deg": round(_bearing_deg(n_f) % 360.0, 2),
         "focal_px_wire": round(focal, 1),
@@ -864,6 +936,54 @@ def _selftest():
     fo_off = facade_from_obstacle(rect, origin, (200.0, centroid_xz[1]))
     check("off-the-end formation is flagged",
           not fo_off["face_within_extent"])
+
+    # A wall on a REAL bearing — the whole reason the stored-facade route
+    # exists. Build one at 108 deg, exactly 10 m from the cameras, then read it
+    # back both ways: the footprint edge reports the truth, and the obstacle
+    # rectangle enclosing that same edge cannot.
+    az = 108.0
+    u_e, u_n = (math.sin(math.radians(az)), math.cos(math.radians(az)))
+    # Outward normal (wall -> cameras) is the wall bearing + 90 deg, negated.
+    nb = math.radians(az + 90.0)
+    base_e = centroid_xz[0] - 10.0 * math.sin(nb)
+    base_n = centroid_xz[1] - 10.0 * math.cos(nb)
+    ends = [(base_e - 20.0 * u_e, base_n - 20.0 * u_n),
+            (base_e + 20.0 * u_e, base_n + 20.0 * u_n)]
+    stored = {"id": 3, "label": "ME D south",
+              "source": "osm:way/407504253#edge3", "obstacle_id": 2,
+              "p1": [origin[0] + dlat(ends[0][1]), origin[1] + dlon(ends[0][0])],
+              "p2": [origin[0] + dlat(ends[1][1]), origin[1] + dlon(ends[1][0])]}
+
+    fs = facade_from_stored(stored, origin, centroid_xz)
+    so_s = _dot(fs["n"], (centroid_xz[0], 0.0, centroid_xz[1])) - fs["d"]
+    check("stored facade standoff = 10 m", abs(so_s - 10.0) < 0.05, so_s)
+    check("stored facade azimuth is the WALL'S TRUE bearing (108 deg)",
+          abs(fs["azimuth_deg"] - az) < 0.5, fs["azimuth_deg"])
+    check("stored facade keeps its identity",
+          fs["kind"] == "facade" and fs["facade_id"] == 3
+          and fs["label"] == "ME D south" and fs["obstacle_id"] == 2, fs)
+
+    # The same wall as an axis-aligned obstacle: this is what the operator got
+    # before, and it is wrong twice over — snapped azimuth AND a face that is
+    # the bounding box's edge rather than the wall.
+    lats = [stored["p1"][0], stored["p2"][0]]
+    lons = [stored["p1"][1], stored["p2"][1]]
+    bbox = {"id": 8, "lat_min": min(lats), "lat_max": max(lats) + dlat(20.0),
+            "lon_min": min(lons), "lon_max": max(lons)}
+    fb2 = facade_from_obstacle(bbox, origin, centroid_xz)
+    check("obstacle route snaps that same wall to a compass axis",
+          abs(fb2["azimuth_deg"] % 90.0) < 0.5
+          and abs(fb2["azimuth_deg"] - az) > 15.0, fb2["azimuth_deg"])
+    so_b = _dot(fb2["n"], (centroid_xz[0], 0.0, centroid_xz[1])) - fb2["d"]
+    check("obstacle route also mis-reads the standoff", abs(so_b - 10.0) > 1.0,
+          so_b)
+
+    # offset_facade must work on a stored facade exactly as on a traced line —
+    # the cadastral-footprint / hover-track correction is the same subtraction.
+    fs_off = offset_facade(fs, 1.5)
+    so_fo = _dot(fs_off["n"], (centroid_xz[0], 0.0, centroid_xz[1])) - fs_off["d"]
+    check("stored facade honours --plane-offset", abs(so_fo - 11.5) < 0.05,
+          so_fo)
 
     # Refusals. A wall traced south of the cameras is the wrong side.
     behind = ((origin[0] - dlat(5.0), origin[1] - dlon(30.0)),

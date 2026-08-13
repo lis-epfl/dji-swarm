@@ -133,9 +133,13 @@ from olfati_saber import (
     polygon_to_ne,
     point_in_polygon,
     DEFAULT_SHAPES_FILE,
+    MAX_FACADES,
     MAX_OBSTACLES,
     normalize_obstacle,
+    normalize_polygon_obstacle,
+    validate_facade,
     validate_fence,
+    load_facades,
     load_shapes,
     save_shapes,
 )
@@ -838,11 +842,11 @@ def command_listener(swarming, meta, host, port, shapes_path=None):
     hardware poke stays on the control-loop thread.
 
     Shape edits also persist to `shapes_path` (atomic write) so they survive a
-    controller restart. CONCURRENCY RULE for meta["obstacles"]/meta["geofence"]:
-    REPLACE, never mutate — always assign a brand-new list (or None) in a
-    single statement. Dict item assignment is GIL-atomic, so run() sees either
-    the old or the new complete object, never a half-edited one. An in-place
-    .append() here would race the control loop's per-tick read.
+    controller restart. CONCURRENCY RULE for meta["obstacles"]/meta["geofence"]/
+    meta["facades"]: REPLACE, never mutate — always assign a brand-new list (or
+    None) in a single statement. Dict item assignment is GIL-atomic, so run()
+    sees either the old or the new complete object, never a half-edited one. An
+    in-place .append() here would race the control loop's per-tick read.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -959,6 +963,89 @@ def command_listener(swarming, meta, host, port, shapes_path=None):
                     save_shapes(shapes_path, meta["obstacles"], meta.get("geofence"))
                 print(f"[gui] obstacle {new_ob['id']} added "
                       f"({len(meta['obstacles'])} total)")
+            elif action == "add_building":
+                # GUI "Pick building": a real footprint resolved from the map
+                # click (building_footprint.py). Stored as a polygon obstacle,
+                # which ALSO carries its bounding box — see the compatibility
+                # contract in olfati_saber.py. The flock avoids the outline
+                # rather than a box around it; the box is only what an older
+                # reader of shapes.json falls back to.
+                if meta is None:
+                    continue
+                new_ob = normalize_polygon_obstacle(
+                    msg.get("vertices"), msg.get("label"), msg.get("source"))
+                if new_ob is None:
+                    print("[gui] building rejected: invalid outline")
+                    continue
+                current = meta.get("obstacles") or []
+                if len(current) >= MAX_OBSTACLES:
+                    print(f"[gui] building rejected: limit of "
+                          f"{MAX_OBSTACLES} reached")
+                    continue
+                new_ob["id"] = max([ob["id"] for ob in current] or [0]) + 1
+                meta["obstacles"] = current + [new_ob]   # replace, not mutate
+                if shapes_path:
+                    save_shapes(shapes_path, meta["obstacles"],
+                                meta.get("geofence"), meta.get("facades"))
+                print(f"[gui] building {new_ob['id']} added: "
+                      f"{new_ob.get('label', 'building')} "
+                      f"({len(new_ob['vertices'])} walls, "
+                      f"{len(meta['obstacles'])} obstacles total)")
+            elif action == "add_facade":
+                # One wall of a footprint, kept as a PLANAR inspection plane.
+                # Inert for flight — nothing in run() reads meta["facades"];
+                # it is echoed only so the GUI and shapes.json agree, and so
+                # clip_replay.py --set-plane-from-facade can find it later.
+                if meta is None:
+                    continue
+                pair = validate_facade(msg.get("p1"), msg.get("p2"))
+                if pair is None:
+                    print("[gui] facade rejected: not a wall")
+                    continue
+                current = meta.get("facades") or []
+                if len(current) >= MAX_FACADES:
+                    print(f"[gui] facade rejected: limit of "
+                          f"{MAX_FACADES} reached")
+                    continue
+                rec = {"id": max([f["id"] for f in current] or [0]) + 1,
+                       "p1": pair[0], "p2": pair[1]}
+                try:
+                    if msg.get("obstacle_id") is not None:
+                        rec["obstacle_id"] = int(msg["obstacle_id"])
+                except (TypeError, ValueError):
+                    pass
+                for key in ("label", "source"):
+                    if msg.get(key):
+                        rec[key] = str(msg[key])[:120]
+                meta["facades"] = current + [rec]        # replace, not mutate
+                if shapes_path:
+                    save_shapes(shapes_path, meta.get("obstacles") or [],
+                                meta.get("geofence"), meta["facades"])
+                print(f"[gui] facade {rec['id']} saved: "
+                      f"{rec.get('label', 'wall')} "
+                      f"(--set-plane-from-facade {rec['id']})")
+            elif action == "delete_facade":
+                if meta is None:
+                    continue
+                try:
+                    fa_id = int(msg.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                current = meta.get("facades") or []
+                meta["facades"] = [f for f in current if f["id"] != fa_id]
+                if shapes_path:
+                    save_shapes(shapes_path, meta.get("obstacles") or [],
+                                meta.get("geofence"), meta["facades"])
+                print(f"[gui] facade {fa_id} deleted "
+                      f"({len(meta['facades'])} remain)")
+            elif action == "clear_facades":
+                if meta is None:
+                    continue
+                meta["facades"] = []
+                if shapes_path:
+                    save_shapes(shapes_path, meta.get("obstacles") or [],
+                                meta.get("geofence"), [])
+                print("[gui] all facades cleared")
             elif action == "delete_obstacle":
                 if meta is None:
                     continue
@@ -1521,7 +1608,14 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
         # command_listener (never mutated), so reading them here is safe.
         obstacles = (meta or {}).get("obstacles") or []
         fence = (meta or {}).get("geofence")
-        rects_ne = [rect_to_ne(ob, lat_ref, lon_ref) for ob in obstacles]
+        # Partition by kind. A polygon obstacle (a picked building footprint)
+        # ALSO carries a bounding box for old readers, so it satisfies both
+        # branches — feeding it to both would count its repulsion TWICE.
+        rects_ne = [rect_to_ne(ob, lat_ref, lon_ref) for ob in obstacles
+                    if ob.get("kind") != "poly"]
+        polys_ne = [polygon_to_ne(ob["vertices"], lat_ref, lon_ref)
+                    for ob in obstacles
+                    if ob.get("kind") == "poly" and ob.get("vertices")]
         fence_ne = (polygon_to_ne(fence, lat_ref, lon_ref)
                     if fence and len(fence) >= 3 else None)
 
@@ -1835,9 +1929,9 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                 # stronger authority and the plane's restoring term is clamped
                 # (MAX_PLANE_MPS) so it can never win an argument with it.
                 o_n, o_e = 0.0, 0.0
-                if avoid is not None and (rects_ne or fence_ne):
+                if avoid is not None and (rects_ne or polys_ne or fence_ne):
                     o_n, o_e = avoid.GetObstacleForce(
-                        self_pos, self_vel, rects_ne, fence_ne)
+                        self_pos, self_vel, rects_ne, fence_ne, polys_ne)
                 v_n_total = v_n_des + v_n_corr + o_n
                 v_e_total = v_e_des + v_e_corr + o_e
                 v_n_total, v_e_total = clamp_mag2(v_n_total, v_e_total, MAX_CMD_MPS)
@@ -2611,7 +2705,11 @@ def main():
         shapes_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), shapes_path)
     obstacles, geofence = load_shapes(shapes_path)
-    print(f"  Shapes: {len(obstacles)} obstacle(s), "
+    facades = load_facades(shapes_path)
+    n_poly = sum(1 for ob in obstacles if ob.get("kind") == "poly")
+    print(f"  Shapes: {len(obstacles)} obstacle(s)"
+          f"{f' ({n_poly} building footprint(s))' if n_poly else ''}, "
+          f"{len(facades)} facade(s), "
           f"geofence {'with ' + str(len(geofence)) + ' vertices' if geofence else 'none'} "
           f"({shapes_path})")
 
@@ -2684,6 +2782,10 @@ def main():
         # ids, refreshed each tick by run() for the GUI's FENCED OUT badges.
         "obstacles": obstacles,
         "geofence": geofence,
+        # PLANAR inspection walls picked off a building footprint. Inert for
+        # flight — nothing in run() reads them; they ride in meta only so the
+        # GUI echo and shapes.json stay symmetric with the obstacle lists.
+        "facades": facades,
         "removed": [],
         "obstacle_params": {
             "d_obs_m": args.d_obs,

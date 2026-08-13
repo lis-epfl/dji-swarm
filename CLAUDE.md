@@ -80,14 +80,18 @@ no video.
   - `olfati_saber.py` — the flocking math, extracted from `swarm_flocking.py`: the
     `OlfatiSaber` cohesion/velocity-consensus class, plus `ObstacleAvoidance` — a port of
     the Unity sim's `GetObstacleForce` β-agent term for 2D **virtual obstacles** (axis-
-    aligned rectangles) and one **geofence polygon** whose edges repel inward. Shapes are
-    **drawn on the GUI map** ("Add obstacle" click-drag / "Add geofence" vertex clicks →
-    `/command` POST → UDP :5098 → `command_listener` → `meta["obstacles"]`/`meta["geofence"]`,
-    persisted to `AOS server/shapes.json`, gitignored). Shape validation + shapes.json
-    persistence live in this module and are shared with `swarm_gui.py`, whose own
+    aligned rectangles *and* real building-footprint polygons, `poly_force`) and one
+    **geofence polygon** whose edges repel inward. Shapes are
+    **drawn on the GUI map** ("Add obstacle" click-drag / "Pick building" click /
+    "Add geofence" vertex clicks →
+    `/command` POST → UDP :5098 → `command_listener` → `meta["obstacles"]`/`meta["geofence"]`/
+    `meta["facades"]`, persisted to `AOS server/shapes.json`, gitignored). Shape validation +
+    shapes.json persistence live in this module and are shared with `swarm_gui.py`, whose own
     `ShapesStore` also applies/saves every edit — so drawing works and shapes stay visible
     with NO controller running (the GUI serves them as `data.shapes`; a live controller's
-    meta echo remains authoritative). `d_obs`/`r0_obs` params are PHYSICAL
+    meta echo remains authoritative). See the
+    [shapes.json compatibility gotcha](#critical-gotchas) before touching the file format.
+    `d_obs`/`r0_obs` params are PHYSICAL
     metres (divided by `scale` internally — Unity's raw d_obs=5.0 scaled would be 50 m
     physical). Geofence is also a hard cutoff: a drone outside it is braked, gets a
     per-drone DISABLE_VS, and leaves the flock (not a neighbour, excluded from hull
@@ -142,6 +146,23 @@ no video.
     in-flight instead of only in offline log analysis. No `ds_wrapper` import.
   - `udp_joystick_receiver.py` — receives joystick JSON over UDP :5055 (used by the above).
   - `joyreporter.py` — pygame joystick debug readout.
+  - `building_footprint.py` — the **"Pick building"** lookup: one map click → a real
+    building outline, from **OpenStreetMap via Overpass** (`lookup()`, plus a
+    `FootprintCache` keyed by GEOMETRY — a click inside a ring already on file hits, so a
+    site surveyed at the office answers in the field with no connectivity). Proxied through
+    `swarm_gui.py`'s `/footprint` route rather than fetched by the browser, for that cache.
+    OSM was chosen after the Swiss federal alternatives were checked and **do not work**:
+    `ch.swisstopo.vec25-gebaeude` (api3 identify) answers at EPFL with ONE generalized
+    117 425 m² MultiPolygon — the whole block merged at 1:25 000 — and
+    `ch.kantone.cadastralwebmap-farbe` is identify-queryable and ground-true but returns
+    the cadastral **parcel** (`egris_egrid`), not a building; swissTLM3D / swissBUILDINGS3D
+    have the accuracy but are download-only (STAC). So swisstopo enters this feature as a
+    **basemap** (the cadastral layer is the ground-true visual cross-check) and OSM supplies
+    the geometry. **OSM is crowd-sourced, not surveyed** — `clip_scene_plane.analyse()`
+    warns when a facade's source is `osm:` and prints the clip's own `tolerance_m`, which is
+    what actually decides whether an outline was good enough. Pure stdlib (`urllib`), no
+    `ds_wrapper`; `python building_footprint.py` self-checks offline,
+    `python building_footprint.py LAT LON` does a live probe.
   - `swarm_gui.py` — browser GUI server: a satellite map (default EPFL Lausanne) showing
     each drone's position + heading, a complete graph of inter-drone distance lines
     (**3D** metres labelled, split into horizontal/vertical when the pair is stacked), and
@@ -153,7 +174,18 @@ no video.
     `meta["plane_gain"]`, with the controller free to refuse the toggle and echo it back off)
     plus the **Record clip** button and its REC chip (`meta["recording"]`, see
     `clip_recorder.py`; the button hides itself if the controller doesn't publish that key).
-    **Does NOT import `ds_wrapper`** — it
+    A **basemap switcher** (the layer control, top right) offers Esri World Imagery
+    (default, worldwide) plus **SWISSIMAGE** and the **swisstopo cadastral webmap** — the
+    latter renders the official cadastral survey, so its outlines are TRUE GROUND outlines
+    with none of the roof lean that makes a satellite roofline worth 5-7 m (see the
+    [satellite-parallax gotcha](#critical-gotchas)); both swisstopo layers are
+    Switzerland/Liechtenstein only, hence Esri staying the default. The choice persists in
+    `localStorage`. **"Pick building"** clicks a building → `/footprint`
+    (`building_footprint.py`) → its outline previews → **Add obstacle** stores it as a
+    polygon obstacle, or clicking one **wall** of that outline stores the wall as a
+    **facade** (amber on the map; the popup carries a ready-to-paste
+    `--set-plane-from-facade <id>`). That is the accurate route to a PLANAR scene plane —
+    see `clip_scene_plane.py`. **Does NOT import `ds_wrapper`** — it
     only LISTENS on UDP :5099 for telemetry pushed by a running controller (so it runs
     unprivileged, in its own terminal, on any Python ≥3.7; it does import the pure
     `olfati_saber` module for the shared shapes helpers, and owns a `ShapesStore` that
@@ -243,7 +275,8 @@ no video.
     version, intrinsics and scene plane, all three of which
     `StitcherThreading.planar_inputs_ready()` requires; the settings to match are printed
     at startup, including the **measured standoff** when the clip carries one
-    (`--set-plane-from-line` / `--set-plane-from-shape` / `--set-plane-standoff`, see
+    (`--set-plane-from-facade` / `--set-plane-from-line` / `--set-plane-from-shape` /
+    `--set-plane-standoff`, see
     `clip_scene_plane.py`) and then **checked against what the scene is actually
     publishing** (`unity_stitch_meta.py`): the startup banner lists the inspector fields
     that disagree, `--check-unity` does only that check and exits (0 = ready, 1 = not), and
@@ -265,13 +298,16 @@ no video.
     georeferenced frame (`meta["pose_origin_latlon"]` + the `pos_*` columns), so the
     standoff is a subtraction as soon as the **surface** has a lat/lon — computable
     **after** the flight, which is what makes it retro-fittable to footage flown with no
-    obstacle drawn. Two georeferenced sources plus an escape hatch, wired into
-    `clip_replay.py`: `--set-plane-from-line LAT1,LON1,LAT2,LON2` (two points along the
-    wall, any bearing — the accurate route), `--set-plane-from-shape [ID]` (an obstacle
-    rectangle from `shapes.json`, which the GUI draws and persists with **no controller
-    running**, so no flight is needed to place one; its faces are axis-aligned, so the
-    wall's azimuth is snapped to N/S/E/W), and `--set-plane-standoff M` for a number
-    measured any other way. `--plane-offset M` moves the surface M metres beyond the traced
+    obstacle drawn. Three georeferenced sources plus an escape hatch, wired into
+    `clip_replay.py`: **`--set-plane-from-facade [ID]`** (one wall of a real building
+    footprint, picked on the GUI map with "Pick building" — it routes to
+    `facade_from_line`, so the azimuth is the wall's TRUE bearing: **the accurate route,
+    and the easy one**), `--set-plane-from-line LAT1,LON1,LAT2,LON2` (two points along the
+    wall, any bearing — the same accuracy, typed by hand), `--set-plane-from-shape [ID]` (an
+    obstacle rectangle from `shapes.json`, which the GUI draws and persists with **no
+    controller running**, so no flight is needed to place one; a rectangle has no rotation
+    to report, so the wall's azimuth is snapped to N/S/E/W — the last resort), and
+    `--set-plane-standoff M` for a number measured any other way. `--plane-offset M` moves the surface M metres beyond the traced
     line, which is what makes a **drone hover track** (or a cadastral outline with a ledge
     in front of it) usable as the trace — see the
     [satellite-parallax gotcha](#critical-gotchas). The result is stored as `meta["scene_plane"]` **inside the
@@ -514,6 +550,25 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   requested vs reported. Two independent reports, and neither replaces the other because a
   set can be accepted and still not take: the app's `AIRLINKRES:` sees the SDK's accept/reject
   *reason*, the PC's scan re-reads the radio through a different key path later.
+- **A polygon obstacle in `shapes.json` MUST also carry its bounding box.**
+  `olfati_saber.load_shapes` reads `float(ob["lat_min"])` inside a loop wrapped in
+  `except (OSError, ValueError, KeyError, TypeError)` that returns `([], None)` for the
+  **whole file** — so one record missing those keys does not degrade one shape, it
+  discards every obstacle *and the geofence*, which is a hard flight failsafe. The file is
+  read by three processes (`swarm_gui.py`, `swarm_flocking.py`, `clip_scene_plane.py`) that
+  can be at different versions on one machine. Hence the v2 contract: a `kind: "poly"`
+  obstacle stores `vertices` **and** `lat_min/lat_max/lon_min/lon_max`, always recomputed
+  from the ring by `normalize_polygon_obstacle` and never trusted from the wire. An old
+  reader then sees a plain rectangle — degraded but strictly **conservative**, since the
+  bbox contains the footprint, so avoidance is never weaker than the file describes. Do
+  not add a shape type that cannot state a bbox. Two consequences that bite:
+  `save_shapes(path, obstacles, geofence)` with no 4th argument means "**preserve the
+  facades on disk**" (a read-modify-write) so pre-v2 call sites cannot erase them — pass
+  `[]` to clear; and the control loop must **partition obstacles by `kind`** so a polygon
+  goes to `polys_ne` XOR `rects_ne` (it satisfies both, and feeding both counts its
+  repulsion twice — `olfati_saber.py`'s self-check asserts that double-count is real).
+  `python olfati_saber.py` carries the version-skew regression test; run it after any
+  change to the format.
 - **Multi-drone = 1-based `drone_id`** everywhere, mapping to `DroneSwarmServer` shared-memory slots.
 - **Drone identity has TWO independent sources when `DroneIPs` is an explicit list — keep
   them reconciled.** Commands go to the N-th `DroneIPs` entry (RC/switch-port = the
@@ -628,13 +683,20 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   **only** that. Consequences when drawing a facade on the map: all buildings in one tile
   lean the same way, so the lean is measurable off any corner where a wall face is visible;
   the base of the facade *facing* the sensor is visible and traceable, while the far side's
-  base is hidden under its own displaced roof and cannot be traced at all. Two ways round
-  it, both better than the tile: Swiss cadastral footprints (`map.geo.admin.ch`, true
-  ground outlines, right-click gives WGS84) — or fly a drone along the facade a metre or
-  two off it, trace **its GPS track**, and pass that offset as
-  `clip_replay.py --plane-offset`. The drone route is the most accurate available here
+  base is hidden under its own displaced roof and cannot be traced at all. Three ways round
+  it, all better than tracing the tile:
+  **(1)** the GUI's **"Pick building"** — an OSM footprint is a ground outline, so it
+  carries no lean at all; pick the wall you filmed and use `--set-plane-from-facade`. This
+  is the default route now. Sanity-check the outline against the **Cadastral (swisstopo)**
+  basemap in the layer control, which draws the official cadastral survey; OSM is
+  crowd-sourced and `analyse()` says so in a warning.
+  **(2)** Swiss cadastral footprints read by hand (`map.geo.admin.ch`, true ground
+  outlines, right-click gives WGS84) → `--set-plane-from-line`.
+  **(3)** fly a drone along the facade a metre or two off it, trace **its GPS track**, and
+  pass that offset as `clip_replay.py --plane-offset`. Still the most accurate available,
   because the aircraft's absolute GPS bias is then common-mode with the clip's and cancels
-  out of the subtraction, leaving differential error (~0.5 m) instead of absolute (~2 m).
+  out of the subtraction, leaving differential error (~0.5 m) instead of absolute (~2 m) —
+  no map, OSM or cadastral, can do that.
 - **The `.ps1` launchers are the real entry points — keep them in sync.** The operator does
   not run `python …` by hand; they run `.\dji-joystick.ps1` / `.\dji-flocking.ps1` /
   `.\dji-gui.ps1` (all in `AOS server/`). Each launcher hard-codes the `python` command line
@@ -661,7 +723,7 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
 | --- | --- | --- |
 | `.\dji-joystick.ps1` | `joystick_controller.py` + `readController.py` | `-Slow`→`--slow` |
 | `.\dji-flocking.ps1` | `swarm_flocking.py` + `readController.py` + `swarm_gui.py` | reads **`flocking.config.psd1`** for defaults; CLI flags override it. `-Drones`→`--drones`, `-Slow`→`--slow`, `-GimbalPitch`→`--gimbal-pitch`, `-ConvexHull`→`--heading convexhull`, `-PointInwards`→`--point-inwards`, `-DemoStitch`→`--heading demostitch` / `-StitchOffset`→`--stitch-offset` (demostitch fan offset deg/rank, config key `StitchOffset`), `-Cvm`→`--c-vm`, `-R0`→`--r0`, `-Scale`→`--scale`, `-NoGui`→`--no-gui` (also drops the GUI pane), `-ImageStream`→`--image-stream` (in-process stitcher feed; **no** separate image_stream.py pane), `-DroneIPs`→`--drone-ips` (explicit RC IPs in drone-id order, needs ≥ Drones entries, extras ignored; **empty config `@()` = auto-discover from the running server**, `-DroneIPs server` = force legacy server path), `-NoIdentityCheck`→`--no-identity-check` (skip the command↔telemetry identity probe; config key `IdentityCheck`), `-MinSeparation`→`--min-separation` (auto-STOP distance, m; config key `MinSeparation`), `-DObs`→`--d-obs` / `-R0Obs`→`--r0-obs` / `-CObs`→`--c-obs` (virtual-obstacle/geofence repulsion cutoff, detection radius [physical m] and gain; config keys `DObs`/`R0Obs`/`CObs`; the shapes themselves are drawn in the GUI and persist in `shapes.json`), `-AirlinkBands`→`--airlink-bands` / `-AirlinkBandwidth`→`--airlink-bandwidth` / `-VideoMode`→`--video-mode` (per-drone RF band + channel bandwidth in MHz `40\|20\|10\|5` + camera-stream cap, sent to each RC as an `AIRLINK:` one-shot at startup; config keys `AirlinkBands`/`AirlinkBandwidth`/`VideoMode`; empty = send nothing, which leaves whatever was last applied — **not** a reset, see the [AirLink gotcha](#critical-gotchas)), `-NoLinkScan`→`--no-link-scan` (skip the read-only pre-flight link/interference scan; config key `LinkScan`), `-AirlinkMode auto\|manual`→`--airlink-mode` (channel-selection mode; `manual` is the only way `-AirlinkBandwidth` sticks but freezes the channel, `auto` restores DJI's adaptation and is the way back out; config key `AirlinkMode`), `-RecordingDir`→`--recording-dir` / `-RecordMaxSeconds`→`--record-max-s` (root folder and per-clip duration cap for the GUI's **Record clip** button — per-drone 1080p MP4 + frame index + the flight-data CSVs for that window; config keys `RecordingDir`/`RecordMaxSeconds`; separate from `--log-dir` and gitignored), `-PlaneMode`→`--plane-mode` / `-PlaneGain`→`--plane-gain` / `-PlaneLeash`→`--plane-leash` / `-MaxAlt`→`--max-alt` (vertical-plane "wall" swarming seed, its restoring gain [m/s per m of out-of-plane offset] and vertical leash, plus the ceiling every commanded altitude is clamped to; config keys `PlaneMode`/`PlaneGain`/`PlaneLeash`/`MaxAlt`; the toggle and gain are live in the GUI — this only seeds them), `-HttpPort`→`swarm_gui.py --http-port`, `-Config`→alternate config path |
-| `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0` |
+| `.\dji-gui.ps1` | `swarm_gui.py` only | `-HttpPort`→`--http-port`, `-Lan`→`--http-host 0.0.0.0`, `-NoBuildingLookup`→`--no-footprint-lookup` (kills the map's outbound OSM Overpass queries; map tiles are fetched by the browser and are unaffected) |
 
 `dji-flocking.ps1`'s launch settings live in **`AOS server/flocking.config.psd1`** (a
 code-free PowerShell data file read with `Import-PowerShellDataFile`). Precedence is
@@ -736,6 +798,6 @@ The root `.gitignore` excludes build output (`build/`, `.gradle/`, `x64/`, NuGet
 regenerable C++ binaries (`*.exe`, `*.lib`, `*.a`, `*.pyd`, `python37.dll` — rebuild via
 `AOS server/README.md`), heap dumps (`*.hprof`), `__pycache__/`, the bundled WebView2
 runtime, and the field-session artifacts (`flight_logs/`, `recordings/`, `saved_streams/`,
-`shapes.json`). The prebuilt Android `.so` libs and assets under `lis-swarm-app/app/src/main/`
+`shapes.json`, `footprint_cache.json`). The prebuilt Android `.so` libs and assets under `lis-swarm-app/app/src/main/`
 **are** committed (no source exists for them); the largest, `libdjisdk_jni.so` (~55 MB),
 trips GitHub's >50 MB warning but is under the 100 MB hard limit.
