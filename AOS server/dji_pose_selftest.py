@@ -21,13 +21,28 @@ The one thing this cannot pin is the sign of DJI's *roll*: there is no independe
 statement of that convention available here, only self-consistency.  A stabilised
 gimbal holds roll within about a degree of zero, so it is also the term that
 matters least -- but verify it on hardware before trusting a rolled camera.
+
+Section 8 is a different kind of check from the rest.  Sections 1-7 pin sign and
+frame conventions, which are properties of the maths.  Section 8 pins where the
+bearing is *sourced from*, which is a property of the hardware: `gimbal_yaw` slips
+by a per-aircraft amount at every takeoff, so a pose built from it points the
+fleet's cameras up to 18 degrees apart when they are physically parallel.  That
+cost 11.3 m of seam on the 2026-08-11 MED clips and is invisible to sections 1-7,
+because every one of those angles is self-consistent -- just wrong.  It uses the
+real measured slips as its fixture.
 """
 
 import math
 import sys
 
-from dji_camera_pose import CameraPoseSolver, quat_from_gimbal, POSE_VALID
+from dji_camera_pose import (CameraPoseSolver, camera_bearing, quat_from_gimbal,
+                             POSE_VALID, YAW_SOURCES)
 from olfati_saber import EARTH_M_PER_DEG
+
+# Median `gimbal_yaw - heading` per drone on clip MED_facade_stationary_1
+# (clip_20260811_162553). The cameras were physically parallel; these are the
+# slips section 8 asserts never reach the pose.
+MED_SLIP_DEG = (2.8, -15.4, -6.6)
 
 _failures = []
 
@@ -261,13 +276,17 @@ def test_facade_scenario():
     dlon = 1.0 / (EARTH_M_PER_DEG * math.cos(math.radians(lat0)))
 
     # Five drones spread 8 m apart along an east-west line, all facing north at a
-    # facade, gimbal level.
+    # facade, gimbal level. Their `gimbal_yaw` carries the per-aircraft takeoff
+    # slip the real fleet reports, so this is the configuration as telemetry
+    # actually delivers it, not an idealised one.
     poses = []
     for i in range(5):
         east = (i - 2) * 8.0
+        slip = MED_SLIP_DEG[i % len(MED_SLIP_DEG)]
         pos, quat, status = solver.pose_for({
             'lat': lat0, 'lon': lon0 + dlon * east, 'alt': 15.0,
-            'gimbal_yaw': 0.0, 'gimbal_pitch': 0.0, 'gimbal_roll': 0.0})
+            'heading': 0.0, 'gimbal_yaw': slip,
+            'gimbal_pitch': 0.0, 'gimbal_roll': 0.0})
         poses.append((pos, quat, status))
 
     check("all five are posed", all(p[2] == POSE_VALID for p in poses))
@@ -280,8 +299,64 @@ def test_facade_scenario():
           "worst |z| = %.2e m" % max(abs(p[0][2]) for p in poses))
 
     fwds = [quat_to_columns(p[1])[2] for p in poses]
-    check("every camera faces north at the facade",
+    check("every camera faces north at the facade, despite the gimbal_yaw slip",
           all(_maxdiff(f, (0.0, 0.0, 1.0)) < 1e-9 for f in fwds))
+
+
+def test_yaw_source():
+    """The bearing comes off the compass, and a gimbal_yaw slip cannot reach it."""
+    print("\n8. Bearing source (the gimbal-yaw slip)")
+
+    check("the default source is the compass",
+          CameraPoseSolver().yaw_source == 'heading',
+          "yaw_source = %r" % CameraPoseSolver().yaw_source)
+
+    base = {'heading': 137.0, 'gimbal_pitch': -30.0, 'gimbal_roll': 0.0}
+
+    # The whole point: the same aircraft, the same physical camera bearing, with
+    # every slip the 2026-08-11 fleet showed. The pose must not move.
+    clean = quat_from_gimbal(137.0, -30.0, 0.0)
+    worst = 0.0
+    for slip in MED_SLIP_DEG + (0.0, 55.5, -22.1, 157.6):
+        telem = dict(base, gimbal_yaw=137.0 + slip)
+        worst = max(worst, _maxdiff(quat_from_gimbal(
+            camera_bearing(telem), -30.0, 0.0), clean))
+    check("a gimbal_yaw slip of up to 158 deg does not move the pose",
+          worst < 1e-12, "worst quaternion error %.2e" % worst)
+
+    # ...and the old reading is still reachable, or the slip could not be
+    # re-measured after a fleet change.
+    biased = camera_bearing(dict(base, gimbal_yaw=137.0 - 15.4), 'gimbal')
+    check("yaw_source='gimbal' still reports the raw field",
+          abs(biased - 121.6) < 1e-9, "bearing = %.4f deg" % biased)
+
+    # A partial telem dict must not silently point the camera North: 0.0 is a
+    # legal bearing, so a missing field has to fall through to the other one.
+    check("a missing heading falls back to gimbal_yaw",
+          abs(camera_bearing({'gimbal_yaw': 41.0}) - 41.0) < 1e-9)
+    check("a missing gimbal_yaw falls back to heading",
+          abs(camera_bearing({'heading': 41.0}, 'gimbal') - 41.0) < 1e-9)
+    check("NaN is skipped like a missing field",
+          abs(camera_bearing({'heading': float('nan'),
+                              'gimbal_yaw': 41.0}) - 41.0) < 1e-9)
+
+    bad = True
+    try:
+        CameraPoseSolver(yaw_source='compass')
+        bad = False
+    except ValueError:
+        pass
+    check("an unknown yaw_source is refused, not silently accepted", bad,
+          "valid sources: %s" % (YAW_SOURCES,))
+
+    # What the slip was worth, so the number in the docstring stays honest. A
+    # rotation error dtheta puts two views Z*tan(dtheta) apart on the plane.
+    spread = max(MED_SLIP_DEG) - min(MED_SLIP_DEG)
+    seam = 34.255 * math.tan(math.radians(spread))
+    check("the MED fleet's 18.2 deg spread was worth 11.3 m of seam",
+          abs(spread - 18.2) < 0.05 and abs(seam - 11.3) < 0.1,
+          "spread %.1f deg -> %.2f m at a 34.255 m standoff (%.0f px at f=525)"
+          % (spread, seam, seam * 525.0 / 34.255))
 
 
 def main():
@@ -295,6 +370,7 @@ def main():
     test_position()
     test_no_fix()
     test_facade_scenario()
+    test_yaw_source()
 
     print("\n" + "=" * 74)
     if _failures:

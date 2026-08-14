@@ -681,6 +681,15 @@ class ClipRecorder:
                      'NONE — no pose solver was attached, so pose_status is 0 '
                      'on every frame and this clip cannot drive the PLANAR '
                      'stitcher'),
+            # Which telemetry field the stored quat_* took its bearing from.
+            # Clips recorded before the gimbal-yaw fix have no key here and their
+            # poses are wrong by a per-aircraft, per-takeoff offset; clip_replay
+            # checks for exactly this and migrate_clip_poses.py writes the same
+            # marker when it corrects one. Recorded rather than assumed, because
+            # the two are numerically indistinguishable on a clip whose slip
+            # happened to be small.
+            'pose_yaw_source': (self._pose_solver.yaw_source
+                                if self._pose_solver is not None else None),
             # Nominal, not measured. Recorded so an offline consumer scales fx
             # to the clip's own resolution instead of inheriting the sim's
             # 800x450 numbers, and so a later real calibration has something
@@ -868,11 +877,29 @@ if __name__ == "__main__":
         assert float(rows[-1]['pos_z']) > float(rows[0]['pos_z'])
         assert float(rows[-1]['pos_y']) > float(rows[0]['pos_y'])
         # ...and match what the same solver produces from the same telemetry.
-        want = solver.pose_for({'lat': 46.5, 'lon': 6.56, 'alt': 10.0,
-                                'gimbal_yaw': 0.0, 'gimbal_pitch': -2.0,
-                                'gimbal_roll': 0.0})
-        assert abs(float(rows[0]['quat_x']) - want[1][0]) < 1e-6, rows[0]
-        assert abs(float(rows[0]['quat_w']) - want[1][3]) < 1e-6, rows[0]
+        # Checked on a LATER row, not row 0: the fixture's heading starts at 0
+        # and its gimbal_yaw is 0 throughout, so row 0 cannot tell the two
+        # bearing sources apart, which is exactly the confusion this asserts
+        # against. By row 10 the aircraft has turned 30 deg.
+        probe = rows[10]
+        assert float(probe['heading']) != float(probe['gimbal_yaw']), probe
+        want = solver.pose_for({'lat': float(probe['lat']),
+                                'lon': float(probe['lon']),
+                                'alt': float(probe['alt']),
+                                'heading': float(probe['heading']),
+                                'gimbal_yaw': float(probe['gimbal_yaw']),
+                                'gimbal_pitch': float(probe['gimbal_pitch']),
+                                'gimbal_roll': float(probe['gimbal_roll'])})
+        for k, got in zip(('quat_x', 'quat_y', 'quat_z', 'quat_w'), want[1]):
+            assert abs(float(probe[k]) - got) < 1e-6, (k, probe)
+        # The stored pose must follow the compass, not the gimbal's reported
+        # bearing -- see dji_camera_pose's "gimbal-yaw slip". A regression here
+        # is silent: the mosaic still renders, it just never lines up.
+        from dji_camera_pose import quat_from_gimbal
+        by_heading = quat_from_gimbal(float(probe['heading']),
+                                      float(probe['gimbal_pitch']),
+                                      float(probe['gimbal_roll']))
+        assert abs(float(probe['quat_y']) - by_heading[1]) < 1e-9, probe
 
     with open(os.path.join(clip_dir, "session.json")) as f:
         info = json.load(f)
@@ -884,6 +911,9 @@ if __name__ == "__main__":
     # The latched origin must survive to disk: it exists nowhere else once the
     # controller exits, and without it the clip's poses cannot be georeferenced.
     assert info['meta']['pose_origin_latlon'] == [46.5, 6.56], info['meta']
+    # And so must the bearing convention: clip_replay refuses a clip without it,
+    # because a stale pose and a corrected one look identical in the numbers.
+    assert info['meta']['pose_yaw_source'] == 'heading', info['meta']
     assert info['meta']['camera']['fx'] == round(_focal_px(1080, 46.4), 2)
     for fname in ('telemetry.csv', 'drone_commands.csv',
                   'user_commands.csv', 'swarm_debug.csv'):

@@ -49,7 +49,10 @@ failing.
     were already solved by `dji_camera_pose.CameraPoseSolver` against one fleet-wide
     latched origin. They are NOT re-derived — re-deriving would relatch the origin
     from whichever row happened to be read first and put the replay in a different
-    frame from the recording.
+    frame from the recording. The corollary is that a clip recorded before the
+    gimbal-yaw fix still carries the bad camera bearing in those columns, and no
+    amount of replaying fixes it: run `migrate_clip_poses.py` on the clip once.
+    `pose_convention_note` refuses to let one through quietly.
   * `captureTime` is seconds since the REPLAY started — the same "since the producer
     started" clock `image_stream_feed.py` publishes live, so the consumer cannot tell a
     replay from a flight. It is rebased off `t_epoch - t0` (`t0` = the earliest frame in
@@ -156,6 +159,33 @@ def label_of(clip_dir):
     if isinstance(lab, str) and lab.strip():
         return lab.strip()
     return None
+
+
+def pose_convention_note(clip_dir):
+    """A warning string when the clip's stored poses predate the gimbal-yaw fix.
+
+    `dji_camera_pose` used to build the camera bearing from telemetry
+    `gimbal_yaw`, which on this fleet carries a per-aircraft offset re-rolled at
+    every takeoff. That pointed the cameras up to 18 deg apart while they were
+    physically parallel — 11.3 m of seam at the MED facade's 34 m standoff, and
+    the reason PLANAR would not stitch those clips.
+
+    Replay publishes the stored `quat_*` verbatim, so an unmigrated clip replays
+    the bad bearing and looks like a stitcher fault rather than a stale file.
+    The marker is the only honest test: a clip whose slip happened to be near
+    zero is numerically indistinguishable from a corrected one.
+
+    Returns None when the clip is fine or carries no pose at all.
+    """
+    meta = _session_meta(clip_dir)
+    if meta.get('pose_yaw_source') == 'heading':
+        return None
+    if not meta.get('pose_origin_latlon'):
+        return None  # no solved pose in this clip; nothing to be stale.
+    return ("stored poses predate the gimbal-yaw fix (no meta.pose_yaw_source). "
+            "PLANAR will not line up. Fix the clip on disk with:\n"
+            "    python migrate_clip_poses.py --clip {} --apply"
+            .format(label_of(clip_dir) or os.path.basename(clip_dir)))
 
 
 def iter_clips(root):
@@ -565,6 +595,13 @@ def _pose_of(row):
 
     Returning None makes write_memory publish poseStatus 0 — the same thing the
     live publisher does for a drone without a fix.
+
+    The stored pose is published verbatim, deliberately: re-deriving it here
+    would relatch the GPS origin and put the replay in a different frame from
+    the recording. A clip recorded before the gimbal-yaw fix therefore carries
+    the bad bearing in these columns and has to be corrected on disk first —
+    `migrate_clip_poses.py` does that, and `pose_convention_note` is what stops
+    one being replayed unnoticed.
     """
     try:
         if not int(row.get('pose_status') or 0):
@@ -938,11 +975,17 @@ def main():
 
     want = unity_requirements(clip_dir, _session_meta(clip_dir).get('camera') or {},
                               len(drones))
+    # A stale pose convention is a not-ready condition exactly like a mis-set
+    # inspector field: the scene is correct, the clip is not, and the mosaic
+    # fails the same way. So it gates --check-unity's exit code too.
+    stale_pose = pose_convention_note(clip_dir)
     if args.check_unity:
         print("{}{}\n".format(os.path.basename(clip_dir),
                               "  [{}]".format(label_of(clip_dir))
                               if label_of(clip_dir) else ""))
-        sys.exit(0 if check_unity(want) else 1)
+        if stale_pose:
+            print("  [NOT READY] {}\n".format(stale_pose))
+        sys.exit(0 if (check_unity(want) and not stale_pose) else 1)
 
     # Two forms of the same facts: one line per topic by default, the long form
     # under --verbose. The banner is read on every run, so what earns a line is
@@ -1021,6 +1064,10 @@ def main():
         print("  WARNING no frame carries a camera pose. PLANAR will drop every "
               "view and fall back to the individual feeds; STABSTITCH is fine. "
               "(A clip recorded before the pose columns existed?)")
+    if stale_pose:
+        # Loud, because the failure it prevents is the one that started all this:
+        # a mosaic that will not converge with nothing anywhere saying why.
+        print("  !! STALE CAMERA POSES: {}".format(stale_pose))
 
     # Intrinsics are the sim's to supply — print what the clip was taken with so a
     # mismatch is caught in the inspector instead of showing up as a bent mosaic.

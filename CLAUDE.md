@@ -257,6 +257,30 @@ no video.
     without a stored plane, exactly as before. Its **no-flight-log** `session.json` now
     nests under `'meta'` like `FlightLogger`'s does; it used to write flat, which every
     reader (`_session_meta` does `doc.get('meta')`) got wrong the same silent way.
+    `session.json` also records `meta["pose_yaw_source"]` — which telemetry field the
+    stored `quat_*` took its bearing from — because a clip predating the
+    [gimbal-yaw fix](#critical-gotchas) is numerically indistinguishable from a corrected
+    one when that aircraft's slip happened to be small.
+  - `dji_camera_pose.py` — telemetry → Unity-world camera pose (`CameraPoseSolver`,
+    `quat_from_gimbal`, `camera_bearing`), the pose behind `PLANAR` on both the live
+    feed and recorded clips. One instance per **fleet**, not per drone: a shared latched
+    GPS origin is the entire point. The camera bearing comes from telemetry `heading`,
+    **not** `gimbal_yaw` — see the [gimbal-yaw gotcha](#critical-gotchas);
+    `yaw_source='gimbal'` restores the old reading for re-measuring the slip and nothing
+    else. Pitch/roll still come off the gimbal. Pure module, no `ds_wrapper`;
+    `python dji_pose_selftest.py` checks it against an independent axis construction
+    that shares no code, and its section 8 pins the bearing *source* with the real
+    measured slips as its fixture.
+  - `migrate_clip_poses.py` — one-shot: re-solves the `quat_*` columns of already-recorded
+    clips after the gimbal-yaw fix, since `clip_replay.py` publishes the stored pose
+    verbatim and cannot correct one at replay time. Rebuilds through the same
+    `dji_camera_pose.quat_from_gimbal` the recorder calls, so a migrated clip is
+    byte-identical to what the fixed recorder would write. Backs each CSV up to
+    `*.pre_yawfix`, writes via temp + `os.replace`, and stamps
+    `meta["pose_yaw_source"]` so it is **idempotent by marker, never by inspecting the
+    numbers**. **Dry run by default** — `--apply` to write; the dry run prints the
+    per-drone slip it would remove, which is the number to check against the flight log
+    before committing. No `ds_wrapper`, no drones.
   - `clip_replay.py` — replays a recorded clip into `DroneFeedSharedMemory` **as if the
     drones were flying**, so the Unity DJI scene + stitcher run with no change from a live
     flight: same map, same 48-byte v2 header, same 800×450 BGR payload, same per-frame
@@ -267,6 +291,11 @@ no video.
     silent (the consumer reads image bytes as a header), so it must not be possible to
     introduce one. Poses are taken from the CSV, never re-derived: re-deriving would
     relatch the GPS origin and put the replay in a different frame from the recording.
+    The corollary is that a clip recorded before the
+    [gimbal-yaw fix](#critical-gotchas) still carries the bad bearing in `quat_*` and no
+    amount of replaying fixes it — `pose_convention_note` checks
+    `meta["pose_yaw_source"]` and both warns loudly at startup and fails `--check-unity`,
+    pointing at `migrate_clip_poses.py`.
     `--loop` for tuning against fixed footage, `--speed`, and `--pose-lead-s` to re-pair
     frames with earlier/later poses — the one knob for pose/video skew, which the sim's
     error budget makes the dominant term. It also **publishes the clip's standoff** into
@@ -710,6 +739,41 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   to force a constant rate, because that would destroy the frame↔telemetry correspondence.
   Stale-command handling matters — see the UDP staleness window in
   `udp_joystick_receiver.py`.
+- **Telemetry `gimbal_yaw` is NOT the camera bearing — it slips at every takeoff.** The
+  field (the app's `GimbalKey.KeyGimbalAttitude` yaw) really is world-referenced: regress
+  it on `heading` over the 2026-08-11 clips' 187° of rotation and the slope is 1.0000 with
+  a 0.22° residual. But it carries a per-aircraft offset that is **re-rolled every
+  fast yaw**: 0 on the ground pre-takeoff on every airframe on every date on file, nonzero
+  airborne, and different every flight — across 30 airborne flights in `flight_logs/`,
+  drone 1 spans −22° to +158°, drone 2 −15° to +50°, drone 3 −14° to +48°. It is a
+  **random walk that steps during fast yaw and holds between steps**: bucketing every
+  fresh sample in `flight_logs/` by yaw rate, the offset moves a median 1.30° (p95 18°)
+  per sample above 25 °/s against 0.10° (p95 2.0°) below it. Drone 2 in
+  `flight_20260811_161828` sat at −9°, stepped to −15.5° in 0.2 s while the aircraft
+  yawed 6° — at a constant 14.7 m, **not** a takeoff — then held −15.5 ± 0.1° for nine
+  minutes and 620° of cumulative yaw travel. It slips because the gimbal's yaw has **no
+  absolute reference**: pitch and roll are corrected continuously by gravity (which is
+  why those fields are faithful — commanded −90.0 reads −90.0), and there is no
+  magnetometer in the gimbal to do the same for yaw, so an error made during a slew just
+  persists. It is the gimbal that moved, not the compass — a magnetometer-referenced
+  heading cannot hold a constant 15.5° error through 620° of rotation without a
+  heading-dependent signature, and the 1.0000 slope says there is none. It differs *per
+  aircraft* because the **maneuver history** does, not the hardware. So
+  **`dji_camera_pose` takes the bearing from `heading`**. Consequences: **no stored
+  constant can fix this** — not per-fleet (one derived on 2026-08-11 applied to a
+  2026-07-13 flight is off by 50°) and not even per-flight, since the offset can step
+  mid-flight as drone 2 did between two clips of one hover; and nothing is lost by ignoring
+  the field, because `SwarmActivity.sendGimbalCommand` already issues an `ABSOLUTE_ANGLE`
+  yaw of 0 at 20 Hz and the gimbal never goes there — the Mini 3 Pro's pan axis is not
+  user-controllable, so there is no genuine pan for `gimbal_yaw` to carry. Why it matters
+  more than the plane: the error is **differential and rotational**, so two cameras whose
+  bearings disagree by `δθ` land `Z·tan(δθ)` apart on the scene plane, which no per-view
+  translation can absorb and the PLANAR pose refiner is structurally unable to help with.
+  The MED fleet's 18.2° spread was **11.3 m of seam at a 34.255 m standoff**, or 173 px —
+  bigger than every other term in the budget combined, and the reason those clips would
+  not stitch. Recorded clips bake the bearing into `quat_*`, so old ones need
+  `migrate_clip_poses.py` once; `clip_replay.py` refuses to replay an unmarked clip
+  quietly. `dji_pose_selftest.py` section 8 is the regression test.
 - **Whether a traced scene plane is good enough is decided by the standoff, not the trace.**
   PLANAR's plane error displaces a view by `f·B·δZ/Z²` px — **quadratic in standoff**,
   linear in baseline. The 2026-08-11 MED facade clips
