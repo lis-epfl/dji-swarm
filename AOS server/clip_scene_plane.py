@@ -279,6 +279,29 @@ def facade_from_obstacle(rect, origin, toward_xz):
             "rect_ne": [n_min, n_max, e_min, e_max]}
 
 
+def ground_plane(offset_m=0.0):
+    """The horizontal plane a NADIR clip films: y = -offset_m, normal up.
+
+    A ground mosaic has a scene plane like any other, and this one needs no trace
+    at all — which is the point. The pose frame's y IS height above the latched
+    origin (dji_camera_pose builds it from the aircraft's own takeoff-relative
+    altitude), so the standoff is simply the flying height, and `analyse`
+    re-measures it per frame like any other plane. That last part is what a
+    hand-typed `--set-plane-standoff` cannot do: a survey that climbs 3 m during
+    the clip is described by a scalar only at one instant.
+
+    The normal points up, toward the cameras, matching both `standoff_of`'s
+    convention and what `formation_normal` returns for drones at one altitude —
+    so the tilt reads ~0 instead of the 90 deg that a vertical facade earns from
+    this same geometry.
+
+    `offset_m` is how far the imaged ground lies BELOW the launch pad (the pad is
+    y = 0). Sloping site, or taking off from a roof: measure the drop and pass it.
+    """
+    return {"n": (0.0, 1.0, 0.0), "d": -float(offset_m), "kind": "ground",
+            "ground_below_pad_m": round(float(offset_m), 3)}
+
+
 def offset_facade(facade, offset_m):
     """Move the plane `offset_m` metres further from the cameras (negative: nearer).
 
@@ -963,12 +986,25 @@ def analyse(clip_dir, facade, meta=None):
             "the standoff moved {:.2f} m during the clip ({:.0f}% of it), so one "
             "scalar cannot describe this footage. Split the clip, or replay the "
             "stationary part.".format(spread, 100.0 * spread / mean_standoff))
+    # A ground plane has no trace, so the trace-accuracy note below would be
+    # wrong in kind rather than merely pessimistic. What this standoff is worth
+    # instead is whatever the aircraft's own height above its pad is worth, plus
+    # the site's slope — both site facts, so the honest thing is to name them and
+    # quote the clip's own tolerance rather than assert a number for either.
+    if facade["kind"] == "ground":
+        warnings.append(
+            "this standoff is the aircraft's altitude above its launch pad, so "
+            "it carries no map-trace error — what is left is altitude drift and "
+            "any drop between the pad and the ground being imaged. {:.0f} px of "
+            "seam needs it within {:.2f} m; if the site is not level, measure "
+            "the drop and pass it as --plane-offset."
+            .format(SEAM_TARGET_PX, tol_m))
     # Graded, not a threshold: what matters is how many pixels the trace's own
     # error is worth at THIS standoff, and the same 2 m is a rounding error at
     # 60 m and a wrecked mosaic at 12. Quoting the px directly also keeps the
     # note honest when the geometry is good.
     trace_px = px_per_m * TRACE_ACCURACY_M
-    if trace_px >= SEAM_TARGET_PX:
+    if facade["kind"] != "ground" and trace_px >= SEAM_TARGET_PX:
         note = ("a trace is worth ~{:.0f} m of standoff once DJI's absolute GPS "
                 "is included, so ~{:.0f} px of seam here. {:.0f} px would need "
                 "{:.2f} m."
@@ -1072,6 +1108,10 @@ def _facade_str(facade):
                                              facade.get("face"), tail)
     if facade.get("kind") == "manual":
         return "standoff given by hand"
+    if facade.get("kind") == "ground":
+        drop = facade.get("ground_below_pad_m")
+        return "the ground, from flying altitude{}".format(
+            "" if not drop else " ({:+.2f} m below the pad)".format(drop))
     ll = facade.get("latlon") or []
     if len(ll) == 2:
         return "traced line {:.6f},{:.6f} -> {:.6f},{:.6f}{}".format(

@@ -396,15 +396,27 @@ def set_scene_plane(clip_dir, args):
     given = [bool(args.set_plane_from_line),
              args.set_plane_from_shape is not None,
              args.set_plane_from_facade is not None,
-             args.set_plane_standoff is not None]
+             args.set_plane_standoff is not None,
+             bool(args.set_plane_from_altitude)]
     if sum(given) > 1:
         sys.exit("give one plane source: --set-plane-from-line, "
-                 "--set-plane-from-facade, --set-plane-from-shape or "
-                 "--set-plane-standoff")
+                 "--set-plane-from-facade, --set-plane-from-shape, "
+                 "--set-plane-from-altitude or --set-plane-standoff")
 
     if args.set_plane_standoff is not None:
         try:
             report = scene_plane.manual_report(args.set_plane_standoff, clip_dir)
+        except ValueError as e:
+            sys.exit(str(e))
+    elif args.set_plane_from_altitude:
+        # No georeferencing needed and none wanted: the ground plane is already
+        # in the clip's own pose frame, so unlike every branch below this one
+        # needs no origin, no trace and no shapes.json. --plane-offset carries
+        # its one site measurement (how far the ground sits below the pad).
+        try:
+            report = scene_plane.analyse(
+                clip_dir, scene_plane.ground_plane(args.plane_offset),
+                _session_meta(clip_dir))
         except ValueError as e:
             sys.exit(str(e))
     else:
@@ -509,11 +521,23 @@ def video_health(meta):
     """
     per = meta.get('drones') or {}
     nominal = meta.get('fps_nominal') or 0.0
+    duration = meta.get('clip_duration_s') or 0.0
     rates = []
     for did in sorted(per, key=lambda k: str(k)):
-        got = (per[did] or {}).get('fps_actual')
+        entry = per[did] or {}
+        got = entry.get('fps_actual')
         if isinstance(got, (int, float)):
             rates.append((str(did), float(got)))
+            continue
+        # No rate recorded. NOT the same as "no such drone": the recorder writes
+        # an entry per aircraft it opened a video for, and leaves fps_actual null
+        # when there were too few frames to measure one. That is the worst case
+        # there is — clip_20260814_181306's drone 6 managed a single frame in
+        # 120 s — so falling through to "unknown, assume fine" hid a dead view
+        # behind an `ok`. Rate it from the frame count instead.
+        frames = entry.get('frames')
+        if isinstance(frames, (int, float)) and duration > 0:
+            rates.append((str(did), float(frames) / duration))
     if not rates or not nominal:
         return 'OK', ''
     worst = min(f for _, f in rates)
@@ -533,7 +557,7 @@ def list_clips(root):
     if not clips:
         print("  (none)")
         return
-    print("  {:<32}{:<24}{:>7}  {:<6}{}".format(
+    print("  {:<32}{:<32}{:>7}  {:<6}{}".format(
         "LABEL", "FOLDER", "DUR", "VIDEO", "FRAMES POSED"))
     flagged = []
     for d in clips:
@@ -545,7 +569,7 @@ def list_clips(root):
         level, note = video_health(meta)
         if level != 'OK':
             flagged.append((label_of(d) or os.path.basename(d), level, note))
-        print("  {:<32}{:<24}{:>7}  {:<6}{}".format(
+        print("  {:<32}{:<32}{:>7}  {:<6}{}".format(
             label_of(d) or "(unlabelled)",
             os.path.basename(d),
             "{:.1f}s".format(dur) if isinstance(dur, (int, float)) else "?",
@@ -897,6 +921,13 @@ def main():
                             "snapped to N/S/E/W — prefer --set-plane-from-facade "
                             "or --set-plane-from-line for a wall on a bearing. "
                             "ID is optional when only one obstacle is on file.")
+    plane.add_argument("--set-plane-from-altitude", action="store_true",
+                       help="NADIR clips: the surface is the ground, so the "
+                            "standoff is the flying height, which the clip "
+                            "already knows. Needs no trace and no origin, and "
+                            "is re-measured per frame, so a survey that climbs "
+                            "is still described. --plane-offset says how far "
+                            "the ground sits below the launch pad.")
     plane.add_argument("--set-plane-standoff", metavar="METRES", type=float,
                        help="Store a standoff measured by other means (site "
                             "plan, laser). Nothing checks it against the clip.")
@@ -962,7 +993,8 @@ def main():
         return
     if (args.set_plane_from_line or args.set_plane_from_shape is not None
             or args.set_plane_from_facade is not None
-            or args.set_plane_standoff is not None):
+            or args.set_plane_standoff is not None
+            or args.set_plane_from_altitude):
         set_scene_plane(clip_dir, args)
         return
     if args.speed <= 0:

@@ -330,8 +330,8 @@ no video.
     version, intrinsics and scene plane, all three of which
     `StitcherThreading.planar_inputs_ready()` requires; the settings to match are printed
     at startup, including the **measured standoff** when the clip carries one
-    (`--set-plane-from-facade` / `--set-plane-from-line` / `--set-plane-from-shape` /
-    `--set-plane-standoff`, see
+    (`--set-plane-from-altitude` for nadir; `--set-plane-from-facade` /
+    `--set-plane-from-line` / `--set-plane-from-shape` / `--set-plane-standoff`, see
     `clip_scene_plane.py`) and then **checked against what the scene is actually
     publishing** (`unity_stitch_meta.py`): the startup banner lists the inspector fields
     that disagree, `--check-unity` does only that check and exits (0 = ready, 1 = not), and
@@ -353,7 +353,17 @@ no video.
     georeferenced frame (`meta["pose_origin_latlon"]` + the `pos_*` columns), so the
     standoff is a subtraction as soon as the **surface** has a lat/lon — computable
     **after** the flight, which is what makes it retro-fittable to footage flown with no
-    obstacle drawn. Three georeferenced sources plus an escape hatch, wired into
+    obstacle drawn. **A NADIR clip needs none of that** — the surface is the ground, the
+    pose frame's `y` already IS height above the launch pad, so
+    **`--set-plane-from-altitude`** (`ground_plane`) takes the standoff straight from the
+    flying height with no trace, no origin and no `shapes.json`, and — being a real plane
+    rather than a scalar — it is re-measured per frame, so a survey that climbs is still
+    described (`nadir_6drone_40m` replays 39.72→41.70 m rather than one 40.93 m average).
+    Its tilt reads ~0° because `formation_normal` returns a vertical normal for drones at
+    one altitude, which is the same geometry that makes those clips useless against a
+    *vertical* wall. `--plane-offset` carries the one site fact it cannot know: how far the
+    imaged ground lies below the pad. For a FACADE, three georeferenced sources plus an
+    escape hatch, wired into
     `clip_replay.py`: **`--set-plane-from-facade [ID]`** (one wall of a real building
     footprint, picked on the GUI map with "Pick building" — it routes to
     `facade_from_line`, so the azimuth is the wall's TRUE bearing: **the accurate route,
