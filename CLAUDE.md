@@ -10,8 +10,8 @@ back. There is **no waypoint navigation in the active path** — control is dire
 virtual-stick (joystick) commands. This is a rewrite of an older waypoint-based
 "AOS" (Aerial Observation System) app into a leaner app called **LIS_Swarm**.
 
-The repo has three independently-built components plus the end-to-end data flow that
-ties them together. Understanding the flow is the key to working here:
+The repo has three independently-built components (a fourth, `rc-joystick/`, is in progress —
+see below) plus the end-to-end data flow that ties them together. Understanding the flow is the key to working here:
 
 ```
 joystick → Python script ──ds_wrapper.sendWayPointData()──► [shared memory]
@@ -145,6 +145,9 @@ no video.
     (`meta["resp"]`), so a drone executing commands in the wrong frame is visible
     in-flight instead of only in offline log analysis. No `ds_wrapper` import.
   - `udp_joystick_receiver.py` — receives joystick JSON over UDP :5055 (used by the above).
+    Also owns `JoystickWatchdog`, the pure policy for what an ARMED swarm flies when that
+    feed goes stale (see the [arm-gate gotcha](#critical-gotchas));
+    `python udp_joystick_receiver.py --selftest` checks it, bare it's a live listener.
   - `joyreporter.py` — pygame joystick debug readout.
   - `building_footprint.py` — the **"Pick building"** lookup: one map click → a real
     building outline, from **OpenStreetMap via Overpass** (`lookup()`, plus a
@@ -468,6 +471,64 @@ Runs on the DJI RC (RC Pro). Package `com.lisswarm`, DJI SDK v5 (`5.3.0`), arm64
 - Native `.so` libs live in `app/src/main/jniLibs/` and `app/src/main/lib/` (RtspServer,
   ffmpeg_ext, DJI libs, etc.) — these are prebuilt; there is no NDK source here.
 
+### 3. `rc-joystick/` — a DJI RC Pro as the swarm joystick (in progress)
+It replaces the Taranis X9D + `readController.py` with a **dedicated spare RC Pro that is never
+linked to an aircraft**. An app on the RC streams its sticks, dials and buttons over the RC's
+Ethernet (UDP :5070, the RC is the server): sticks and dials from the RC's built-in gamepad
+(~70 Hz), everything else, plus the sticks' fallback, from MSDK. `rcjoy bridge` re-emits
+readController.py's exact JSON on :5055, so no consumer changes. The folder imports nothing from
+`AOS server/` or `lis-swarm-app/`. Contract: `rc-joystick/PROTOCOL.md`; status, checks and the
+MSDK 5.3.0 RC key inventory: `rc-joystick/README.md`.
+- `pc/rcjoy/` — **done**: stdlib, Python ≥ 3.7 (`python -m rcjoy selftest|monitor|bridge|fake-rc`,
+  run from `rc-joystick/pc`).
+- `android/` — the **LIS_CONTROLLER** app, package **`com.liscontroller`**. Its DJI App Key in the
+  manifest is bound to that package, so they change together. It is its own Gradle project with
+  MSDK 5.3.0 and lis-swarm-app's build config minus Moquette; the build steps are in the README.
+  - `StreamService` (foreground) owns MSDK init, the read-only `RcInputReader`, and
+    `UdpStreamServer`. `MainActivity` renders stick pads, lamps and a diagnostics panel, and feeds
+    `GamepadInput` (joystick events reach only the focused window); `RcInputReader.snapshot()`
+    merges the two sources, so the stream, `info` and the screen always agree.
+  - **Version 1.5 runs on the RC Pro** (Android 10, 2026-09-25), and its protocol code, gamepad
+    path included, passes a JVM run against the real `RcJoystickClient`. 1.0 crashed on open (the
+    `sdkclasses.bangcle` gotcha below). 1.1 was the first to run. Two MSDK facts surfaced then
+    that any MSDK code here must respect:
+    - **`ProductKey.KeyConnection` is TRUE on an RC Pro with no aircraft.** MSDK counts the RC's
+      own link as product `UNRECOGNIZED` (`onProductConnect(0)`). An aircraft link is
+      `FlightControllerKey.KeyConnection`, or a product type naming an aircraft. lis-swarm-app
+      waits for product **and** FC for the same reason.
+    - **MSDK's analytics replaces the process-wide crash handler**
+      (`dji.v5.inner.analytics.handler`). LIS_CONTROLLER's `CrashLog.reassert` puts its own back
+      on top after each SDK step.
+
+    The async `getValue` of the RC's `KeyConnection` is rejected at first, so the liveness probe
+    tries candidate keys (`PROTOCOL.md`, `rc_ok`); `KeyConnection` then answers in 0–30 ms.
+  - **MSDK serves the sticks with no aircraft**: pushed on change at 6–10 per second per axis,
+    ±660. Their signs match the wire's convention (+ = up / right), checked against the gamepad.
+  - **The RC Pro has a built-in gamepad**: USB "DJI DJI Virtual Joystick" (`0x2ca3:0x1501`,
+    Xbox 360 protocol, `xpad`), which Android names "DJI embedded joystick". It reports at **~70 Hz**
+    in its fast mode; the HID's stick "up" is negative. **DJI's framework hides it from
+    third-party apps** unless three global settings are on (see the
+    [RC Pro gamepad gotcha](#critical-gotchas)). 1.5 takes the sticks and dials from it while the
+    app is in front, with MSDK as the witness that it still delivers, the fallback when it
+    doesn't, and a sign cross-check that withholds an axis rather than fly it inverted.
+    `stick_src` in every `state` says which source is live.
+  - Open: the gamepad also has a **slow mode** (~100 ms between reports, so only MSDK's rate),
+    seen once with MSDK registered, **trigger unknown**. Every trace, `info.gamepad.gap_ms` and
+    the PC monitor record the mode. Also open: Ethernet (S5) and the zero-code RF / idle / pairing
+    checks (README).
+  - Crash handling: `CrashLog` writes `crash.txt` plus a step `trace.txt` that survives native
+    crashes. After a crash the app opens in safe mode, whose stage buttons bisect stream → MSDK →
+    keys. `collect-debug.ps1` gathers it all over USB (`DEBUGGING.md`).
+  - The APK was audited against lis-swarm-app's (`DEBUGGING.md` §7): native `DT_NEEDED`,
+    SDK dex classes, assets, merged manifest, dependency versions and resource shadowing all
+    match. The theme is AppCompat like lis-swarm-app's; keep it so.
+  - The launchers have no `-Controller` switch yet.
+- The bridge **sends only while the RC is fresh and usable**. `aircraft_linked` blocks it: a
+  linked RC's sticks would also be flying that aircraft. It never pads a gap with neutral packets,
+  so a dead RC reaches the swarm's [dropout failsafe](#critical-gotchas) exactly like an unplugged
+  Taranis. Output is ≤ 20 Hz because Unity's `UDPReceiverManager` drains one datagram per frame.
+  `s2` is clamped to ±0.999 because `joystick_controller.py` reads `int(s2) == 1` as LAND.
+
 ## Two protocols you will touch constantly
 
 **Command string** (Python → app; MQTT payload to the RC's broker, published either
@@ -714,8 +775,19 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   arrived on :5055 inside the receiver's staleness window (readController.py running +
   controller connected). The GUI mirrors it via `meta["joystick"]`: Start greys out and a
   NO JOYSTICK banner chip shows. Stop / 'q' still work with no joystick; `--dry-run`
-  skips the gate. A joystick lost *mid-flight* does NOT auto-stop — flocking continues
-  with zero stick input.
+  skips the gate. **A joystick lost while armed** (`udp_joystick_receiver.JoystickWatchdog`):
+  the swarm flies **neutral sticks** — velocity and climb zeroed, yaw on pure heading-hold,
+  the spacing knob `angular_x` kept so `d_ref` doesn't jump — with flocking and every
+  failsafe still running, for `JOYSTICK_LOST_STOP_S` (3 s, counted after the receiver's
+  0.5 s staleness window), then **auto-STOPs** through the min-separation path (zero →
+  brake → DISABLE_VS). EVENTs `JOYSTICK_LOST` / `JOYSTICK_RESTORED:<s>` /
+  `JOYSTICK_LOST_STOP:<s>`; the NO JOYSTICK chip shows throughout. Until 2026-09 this
+  branch just skipped the tick, so every drone's send thread kept repeating its last
+  velocity **and yaw rate** with no min-separation or geofence check — a swarm that lost
+  the joystick mid-turn kept turning. "Neutral" means `angular_x = 1.0` (`NEUTRAL_JS`),
+  NOT `JoystickState()`'s 0.0, which `d_ref_from_ax` clamps to the tightest spacing
+  (4 m); a `--dry-run` that never saw a joystick flies `NEUTRAL_JS` (8 m) and never
+  auto-stops. `python udp_joystick_receiver.py --selftest` checks the policy.
 - **Python must be 3.7.** The wrapper is built as `ds_wrapper.cp37-win_amd64.pyd`; a
   different Python won't load it. Run scripts from `AOS server/` so the `.pyd` and
   `python37.dll` resolve.
@@ -865,6 +937,32 @@ In `getImageAndTelemetryData(droneN)`'s returned array: image YUV is `[0:3110400
   also spawn `readController.py` (the UDP joystick source on :5055) from an *external* repo
   (`vr_swarm_simulation/Assets/Scripts/Control`) under conda env `stitching` — those paths and
   the env name are hard-coded near the top of the `.ps1` files; flag them if they need editing.
+- **Every MSDK app must ship `assets/sdkclasses.bangcle`, or it dies on launch.** MSDK 5.3.0's
+  protected classes are that file: 2,328,116 bytes, inside the aircraft AAR's `classes.jar`.
+  `Helper.install()` loads it before anything else runs, so an APK without it crashes on open
+  ("keeps stopping") with nothing of the app's own code executed.
+  - lis-swarm-app's `build.gradle` `exclude 'assets/sdkclasses.bangcle'` strips the jar copy.
+    That is safe **only** because lis-swarm-app keeps a byte-identical duplicate in
+    `app/src/main/assets/`. That file looks like an AOS leftover but is load-bearing: deleting it
+    breaks lis-swarm-app exactly this way.
+  - `rc-joystick/android` must **not** exclude it. Version 1.0 copied the exclude without the
+    duplicate and crashed on open.
+  - That build now **fails** if the APK lacks the file (`app/build.gradle`), and the app traces the
+    payload size as its first step. `rc-joystick/android/DEBUGGING.md` is the crash procedure.
+- **DJI's firmware hides the RC Pro's built-in gamepad from third-party apps.** The kernel sees
+  the "DJI embedded joystick" at ~70 Hz, but `com.dji.comkey.ComKeyManager.interceptMotion`
+  (system_server, `services.jar`) drops its events before they are queued for any app, unless:
+  - global `dji_lab_game_mode` is on (a hidden "Lab" switch; system apps are exempt), and
+  - for stick axes, `dji_motion_via_left_joystick_enabled` / `_right_` is `"1"`.
+
+  DJI's flight apps (`config_FocusOffApps`: DJI Fly, Pilot, Agras…) never receive it. Nothing is
+  logged when it drops: an app just sees no joystick events at all, however it wraps its window.
+  `rc-joystick/android/enable-gamepad.ps1` sets the three settings (they persist).
+  - **Only on the dedicated joystick RC, never a fleet RC.** With game mode on, stick motion
+    reaches whatever app is in front, and Android turns unconsumed joystick motion into D-pad
+    focus navigation, on a fleet RC that would be lis-swarm-app's screen. The script refuses an
+    RC with `com.lisswarm` installed.
+  - LIS_CONTROLLER consumes the events for the same reason.
 
 ## Building & running
 

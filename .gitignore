@@ -72,3 +72,5 @@ shapes.json
 # Building outlines the GUI's "Pick building" tool fetched from OSM Overpass
 # (a cache — refetched on demand, and site-specific)
 footprint_cache.json
+# RC debug captures from rc-joystick/android/collect-debug.ps1 (device logs)
+rc-joystick/android/debug-logs/

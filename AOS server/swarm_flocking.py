@@ -99,7 +99,7 @@ except (AttributeError, ValueError):
     except AttributeError:
         pass  # Python <3.7
 
-from udp_joystick_receiver import JoystickReceiver
+from udp_joystick_receiver import JoystickReceiver, JoystickWatchdog
 from flight_logger import FlightLogger
 from swarm_telemetry_feed import (
     TelemetryFeedPublisher,
@@ -1208,6 +1208,9 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
     # app re-sends the last VS command at its own 20 Hz).
     removed = set()
     pending_disable = {}
+    # Joystick dropout while armed: neutral sticks (flocking, heading-hold and
+    # every failsafe keep running) for JOYSTICK_LOST_STOP_S, then auto-STOP.
+    js_watch = JoystickWatchdog()
 
     # Live command->response rotation fit per drone (logged to swarm_debug +
     # published as meta["resp"] for the GUI). Fed only with what was actually
@@ -1322,6 +1325,7 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
                       f"(re-admitting drones {sorted(removed)})")
                 removed.clear()
             pending_disable.clear()
+            js_watch.arm(js)
             swarm.enable_vs_all()
             vs_on = True
             print(f"[swarm] START: VS armed  heading={target_yaw:+.1f}°  "
@@ -1545,9 +1549,33 @@ def run(swarm, receiver, olfati, swarming, dry_run=False, vel_frame="ned",
             time.sleep(0.02)
             continue
 
-        # Armed but stale joystick → hold last commands, don't integrate.
-        if js is None:
-            time.sleep(0.05)
+        # Armed: fly the fresh joystick, or ride a dropout out on neutral sticks
+        # (the spacing knob is kept) so flocking, heading-hold and every
+        # failsafe below keep running, then auto-STOP through the same path as
+        # the min-separation failsafe. This used to `continue`, which skipped
+        # all of that while each drone's send thread kept repeating its last
+        # velocity and yaw RATE: a swarm that lost the joystick mid-turn kept
+        # turning. meta["joystick"] above still reads the raw feed, so the GUI
+        # shows NO JOYSTICK for the whole grace period.
+        js, js_event, js_outage = js_watch.step(js, now)
+        if js_event == "lost":
+            print(f"[joystick] LOST — flying neutral sticks, auto-STOP in "
+                  f"{js_watch.stop_after:.0f} s unless it comes back")
+            if logger:
+                logger.log_drone_command(0, "EVENT", cmd="JOYSTICK_LOST")
+        elif js_event == "restored":
+            print(f"[joystick] back after {js_outage:.1f} s")
+            if logger:
+                logger.log_drone_command(
+                    0, "EVENT", cmd=f"JOYSTICK_RESTORED:{js_outage:.1f}s")
+        elif js_event == "stop":
+            print(f"[FAILSAFE] no joystick for {js_outage:.1f} s — "
+                  f"STOPPING swarm")
+            if logger:
+                logger.log_drone_command(
+                    0, "EVENT", cmd=f"JOYSTICK_LOST_STOP:{js_outage:.1f}s")
+            swarming.clear()
+            time.sleep(0.02)
             continue
 
         # Stick channels

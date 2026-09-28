@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- DJI's USB-accessory identities, as in lis-swarm-app. MSDK attaches to the RC's
+     controller board through one of these. -->
+<resources>
+    <usb-accessory
+        manufacturer="DJI"
+        model="T600"/>
+    <usb-accessory
+        manufacturer="DJI"
+        model="HG210"/>
+    <usb-accessory
+        manufacturer="DJI"
+        model="WM160"/>
+    <usb-accessory
+        manufacturer="DJI"
+        model="com.dji.logiclink"/>
+    <usb-accessory
+        manufacturer="DJI"
+        model="com.dji.link"/>
+</resources>

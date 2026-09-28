@@ -1,0 +1,96 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Build config copied from lis-swarm-app/app/build.gradle (the combination known to
+// work with DJI MSDK 5.3.0), minus Moquette. The DJI App Key in the manifest is bound
+// to this applicationId, so the two must change together.
+android {
+    namespace "com.liscontroller"
+    compileSdkVersion 34
+
+    defaultConfig {
+        applicationId 'com.liscontroller'
+        minSdkVersion 26
+        targetSdkVersion 34
+        versionCode 6
+        versionName "1.5"
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    packagingOptions {
+        pickFirst '**/*.so'
+        exclude 'META-INF/*'
+        // Deliberately NOT excluded, unlike lis-swarm-app: assets/sdkclasses.bangcle.
+        // MSDK ships its protected classes as that file inside the AAR's classes.jar,
+        // and Helper.install() loads it at startup; without it the app dies on
+        // launch. lis-swarm-app can exclude the jar copy only because it carries a
+        // byte-identical duplicate in its own src/main/assets. Version 1.0 of this app
+        // copied the exclude without the duplicate and crashed on open.
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+
+    lintOptions {
+        abortOnError false
+    }
+}
+
+// Fail the build rather than ship an APK that crashes on launch: MSDK's
+// Helper.install() needs assets/sdkclasses.bangcle (see packagingOptions above).
+android.applicationVariants.all { variant ->
+    variant.packageApplicationProvider.configure { task ->
+        task.doLast {
+            fileTree(task.outputDirectory.get().asFile).matching { include '*.apk' }.each { apk ->
+                def zip = new java.util.zip.ZipFile(apk)
+                try {
+                    def payload = zip.getEntry('assets/sdkclasses.bangcle')
+                    if (payload == null || payload.size <= 0) {
+                        throw new org.gradle.api.GradleException("${apk.name} has no assets/sdkclasses.bangcle: " +
+                                "MSDK's Helper.install() would crash the app at launch. " +
+                                "Check packagingOptions in app/build.gradle.")
+                    }
+                    logger.lifecycle("MSDK payload check: ${apk.name} carries " +
+                            "assets/sdkclasses.bangcle (${payload.size} bytes)")
+                } finally {
+                    zip.close()
+                }
+            }
+        }
+    }
+}
+
+configurations.all {
+    resolutionStrategy {
+        force 'org.jetbrains.kotlin:kotlin-stdlib:1.8.22'
+        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22'
+        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22'
+    }
+}
+
+dependencies {
+    // DJI MSDK v5, the same version as lis-swarm-app. The RC key inventory for this
+    // version is in rc-joystick/README.md.
+    implementation 'com.dji:dji-sdk-v5-aircraft:5.3.0'
+    implementation 'com.dji:dji-sdk-v5-networkImp:5.3.0'
+    compileOnly 'com.dji:dji-sdk-v5-aircraft-provided:5.3.0'
+
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.core:core:1.12.0'
+}

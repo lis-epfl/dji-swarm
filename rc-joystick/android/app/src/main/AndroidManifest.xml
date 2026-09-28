@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- The set lis-swarm-app holds, because MSDK checks some of these at init.
+         Holding a radio permission never switches that radio on: this app only
+         READS state (RfStatus) and never enables Wi-Fi or Bluetooth. -->
+    <uses-permission android:name="android.permission.BLUETOOTH"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>
+    <uses-permission android:name="android.permission.VIBRATE"/>
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+    <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+    <!-- The streaming service. CHANGE_NETWORK_STATE is also what Android 14 accepts
+         as the prerequisite for a connectedDevice foreground service. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+
+    <uses-feature android:name="android.hardware.usb.host" android:required="false"/>
+    <!-- MSDK reaches the RC's own controller board through Android's USB-accessory
+         path; this, the intent filter and accessory_filter.xml are what let it attach. -->
+    <uses-feature android:name="android.hardware.usb.accessory" android:required="true"/>
+    <uses-feature android:glEsVersion="0x20000" android:required="true"/>
+    <uses-feature android:name="android.hardware.wifi" android:required="false"/>
+
+    <application
+        android:name="com.liscontroller.LisControllerApplication"
+        android:label="@string/app_name"
+        android:icon="@drawable/ic_launcher"
+        android:allowBackup="true"
+        android:supportsRtl="true"
+        android:extractNativeLibs="true"
+        android:usesCleartextTraffic="true"
+        tools:replace="android:usesCleartextTraffic"
+        android:requestLegacyExternalStorage="true"
+        android:theme="@style/AppTheme">
+
+        <!-- Bound to applicationId com.liscontroller on developer.dji.com. -->
+        <meta-data
+            android:name="com.dji.sdk.API_KEY"
+            android:value="d17d3f2c622689ceeb831945"/>
+
+        <!-- singleTask: an accessory attach while running must not stack a second
+             instance. The configChanges list keeps an input device appearing or
+             disappearing from recreating the activity. -->
+        <activity
+            android:name="com.liscontroller.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
+                android:resource="@xml/accessory_filter"/>
+        </activity>
+
+        <service
+            android:name="com.liscontroller.StreamService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice"/>
+
+        <meta-data
+            android:name="CLOUDCONTROL_ENV"
+            android:value="PROD"/>
+    </application>
+</manifest>
