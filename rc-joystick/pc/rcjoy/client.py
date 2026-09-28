@@ -2,19 +2,31 @@
 
     client = RcJoystickClient()            # auto-discover by broadcast
     client = RcJoystickClient("192.168.100.50")
+    client = RcJoystickClient(remember=default_remember_path())   # + the last RC used
     client.start()
     s = client.get_state()                 # RcState, or None = "no joystick"
+
+With `remember`, the RC it locks onto is saved, and auto mode tries that address first
+(a unicast subscribe, alongside the broadcast) on every later start. The reply to a
+unicast subscribe is never blocked by a firewall that drops replies to broadcasts, so
+one `--rc IP` (or one working broadcast) is enough for every later launch.
 
 get_state() has the same contract as AOS server's JoystickReceiver.get_state():
 None unless the input is fresh AND usable (rc_ok, no aircraft link, all four
 sticks served). not_ok_reason() says why in words.
+
+Two rates, which are not the same thing. stats()["rx_hz"] is the RC's send clock:
+it samples its latest input at the rate_hz asked for, whatever the input does.
+stats()["fresh_hz"] counts states whose sticks or dials differ from the previous
+one. The RC's gamepad reports only on change, so while a stick moves, that is the
+rate at which its reports actually reach this PC.
 """
 
 import collections
+import os
 import select
 import socket
 import threading
-import time
 
 from . import protocol as P
 
@@ -37,12 +49,46 @@ def local_ipv4_addresses():
     return sorted(a for a in addrs if not a.startswith("127."))
 
 
+def default_remember_path():
+    """Where the bridge and the monitor keep the last RC they locked onto (per user)."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "rcjoy", "last_rc.txt")
+
+
+def remember_path_for(rc):
+    """default_remember_path(), or None when --rc names this PC: a loopback fake RC
+    (the selftest's, fake-rc's) must never replace the real RC's address."""
+    r = str(rc or "").lower()
+    return None if r.startswith("127.") or r == "localhost" else default_remember_path()
+
+
+def read_remembered(path):
+    """The IPv4 saved at `path`, or None (no file, unreadable, or not an address)."""
+    try:
+        with open(path) as f:
+            ip = f.read().strip()
+        socket.inet_aton(ip)
+        return ip if ip.count(".") == 3 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_remembered(path, ip):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(ip + "\n")
+    except OSError:
+        pass        # a convenience only: never let it stop the joystick
+
+
 class RcJoystickClient:
     def __init__(self, rc=None, port=P.DEFAULT_PORT, rate_hz=P.RATE_DEFAULT_HZ,
                  stale_after=0.3, client_name="rcjoy", local_addrs=None,
-                 discovery_targets=None):
+                 discovery_targets=None, remember=None, chooser=None):
         """
-        rc           None or 'auto' = discover by broadcast; else the RC's IP or host name.
+        rc           None or 'auto' = discover (the remembered RC, and a broadcast);
+                     else the RC's IP or host name.
         port         the RC's UDP port.
         rate_hz      requested state rate (the RC clamps to 10..100).
         stale_after  seconds without a state before get_state() returns None.
@@ -50,6 +96,13 @@ class RcJoystickClient:
                      auto-mode overrides, mainly for the selftest: the local IPv4s to
                      open a discovery socket on, and the (ip, port) list every
                      discovery subscribe goes to (default: 255.255.255.255:port).
+        remember     a file to save the RC it locks onto in, and in auto mode to try
+                     first next time (default_remember_path()). None = neither.
+        chooser      auto mode, several RCs answering: chooser(options, remembered,
+                     cancelled) -> ip or None asks the operator (chooser.choose_rc, a
+                     pop-up). options are [(ip, info)]. None = no asking: the
+                     remembered RC wins, else the operator must pass --rc. A dismissed
+                     chooser is not shown again until the set of answering RCs changes.
         """
         self.auto = rc is None or str(rc).lower() == "auto"
         self.port = int(port)
@@ -59,6 +112,11 @@ class RcJoystickClient:
         self._rc_ip = None if self.auto else socket.gethostbyname(str(rc))
         self._local_addrs = local_addrs
         self._targets = discovery_targets
+        self._remember = remember
+        self.remembered = read_remembered(remember) if (remember and self.auto) else None
+        self._saved = None              # the IP last written to `remember`
+        self._chooser = chooser
+        self._declined = None           # the set of RCs the operator last said "not now" to
 
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
@@ -74,8 +132,10 @@ class RcJoystickClient:
         self._last_rx = 0.0
         self._last_seq = None
         self._arrivals = collections.deque()
+        self._fresh_arrivals = collections.deque()
         self._gaps = collections.deque()
         self._packets = 0
+        self._fresh = 0                 # states whose inputs changed (see stats)
         self._lost = 0
         self._foreign = 0
         self._bad = 0
@@ -84,6 +144,7 @@ class RcJoystickClient:
         self._events = collections.deque(maxlen=50)
         self._press = P.PressCounter()
         self._press_cbs = []
+        self._state_cbs = []
 
     # --- lifecycle ---------------------------------------------------------------
 
@@ -111,7 +172,7 @@ class RcJoystickClient:
             self._socks.append(s)
             with self._lock:
                 self._locked, self._lock_sock = self._rc_ip, s
-                self._last_rx = time.monotonic()
+                self._last_rx = P.now()
         for target, name in ((self._rx_loop, "rcjoy-rx"),
                              (self._keepalive_loop, "rcjoy-sub")):
             t = threading.Thread(target=target, name=name, daemon=True)
@@ -140,7 +201,7 @@ class RcJoystickClient:
 
     def get_state(self):
         """The latest RcState if fresh and usable, else None."""
-        now = time.monotonic()
+        now = P.now()
         with self._lock:
             s = self._state
         if s is None or now - s.received_at > self.stale_after:
@@ -155,21 +216,23 @@ class RcJoystickClient:
             return self._state
 
     def is_fresh(self):
-        now = time.monotonic()
+        now = P.now()
         with self._lock:
             s = self._state
         return s is not None and now - s.received_at <= self.stale_after
 
     def not_ok_reason(self):
         """Why get_state() is None, in words; None when it is not."""
-        now = time.monotonic()
+        now = P.now()
         with self._lock:
             locked, multi, s, bye = self._locked, list(self._multi), self._state, self._bye
         if locked is None:
             if multi:
-                return ("several RCs answered (%s) - pick one with --rc"
-                        % ", ".join(multi))
-            return "searching for the RC (broadcast on :%d)" % self.port
+                return ("several RCs answered (%s) - %s" % (", ".join(multi),
+                        "choose one in the pop-up, or pass --rc" if self._chooser
+                        else "pick one with --rc"))
+            return "searching for the RC (%sbroadcast on :%d)" % (
+                "last used %s, and a " % self.remembered if self.remembered else "", self.port)
         if s is None:
             if bye is not None:
                 return "the RC app said bye (%s)" % (bye[1] or "no reason")
@@ -190,6 +253,11 @@ class RcJoystickClient:
     def on_press(self, callback):
         """callback(button, n) for n new presses of `button` (from `presses` deltas)."""
         self._press_cbs.append(callback)
+
+    def on_state(self, callback):
+        """callback(state, fresh) for every accepted `state`, on the rx thread; `fresh`
+        is whether its sticks or dials changed. Keep it quick: it delays the next packet."""
+        self._state_cbs.append(callback)
 
     def locked_rc(self):
         with self._lock:
@@ -244,18 +312,22 @@ class RcJoystickClient:
         return out
 
     def stats(self):
-        now = time.monotonic()
+        now = P.now()
         with self._lock:
-            while self._arrivals and now - self._arrivals[0] > RATE_WINDOW_S:
-                self._arrivals.popleft()
+            for q in (self._arrivals, self._fresh_arrivals):
+                while q and now - q[0] > RATE_WINDOW_S:
+                    q.popleft()
             while self._gaps and now - self._gaps[0][0] > GAP_WINDOW_S:
                 self._gaps.popleft()
             # Divide by the span actually covered, not the full window: a stream
             # that started 1 s ago is not half as fast as one running for 2 s.
+            # Both rates share it, so fresh_hz can never exceed rx_hz.
             span = now - self._arrivals[0] if self._arrivals else 0.0
             return {
                 "rc": self._locked,
                 "rx_hz": len(self._arrivals) / span if span >= 0.2 else 0.0,
+                "fresh_hz": len(self._fresh_arrivals) / span if span >= 0.2 else 0.0,
+                "fresh": self._fresh,
                 "packets": self._packets,
                 "lost": self._lost,
                 "max_gap_ms": (max(g for _, g in self._gaps) * 1000.0
@@ -291,7 +363,7 @@ class RcJoystickClient:
                     if self._stop_evt.is_set():
                         return
                     continue
-                self._handle(s, data, addr, time.monotonic())
+                self._handle(s, data, addr, P.now())
 
     def _handle(self, sock, data, addr, now):
         ip, port = addr[0], addr[1]
@@ -308,7 +380,7 @@ class RcJoystickClient:
                 self._bad += 1
             return
         typ = msg["type"]
-        fire = {}
+        fire, accepted, fresh, save = {}, None, False, None
         with self._lock:
             if self._locked is None:
                 if typ == "info" and port == self.port:
@@ -349,11 +421,21 @@ class RcJoystickClient:
                         self._press.reset()  # never apply a press late
                 self._arrivals.append(now)
                 self._packets += 1
+                # A new input sample, not the RC re-sending its last one. Only the
+                # values this PC acts on count; the first state has nothing to differ from.
+                fresh = prev is not None and (st.raw_sticks != prev.raw_sticks
+                                              or st.raw_dials != prev.raw_dials)
+                if fresh:
+                    self._fresh_arrivals.append(now)
+                    self._fresh += 1
                 self._state = st
                 self._bye = None
                 fire = self._press.update(st.presses)
+                accepted = st
             elif typ == "info":
                 self._info = msg
+                if self._remember and ip != self._saved:
+                    save = self._saved = ip     # an RC answered from here: next launch tries it
                 et = msg.get("echo_t")
                 if isinstance(et, (int, float)) and not isinstance(et, bool):
                     rtt = now - et
@@ -366,6 +448,14 @@ class RcJoystickClient:
                 self._press.reset()
                 self._event("the RC at %s said bye (%s)"
                             % (ip, msg.get("reason") or "no reason"))
+        if save is not None:
+            _write_remembered(self._remember, save)
+        if accepted is not None:
+            for cb in self._state_cbs:
+                try:
+                    cb(accepted, fresh)
+                except Exception:
+                    pass
         for name, n in fire.items():
             for cb in self._press_cbs:
                 try:
@@ -380,7 +470,7 @@ class RcJoystickClient:
             return
         try:
             sock.sendto(P.encode(P.subscribe(self.client_name, self.rate_hz,
-                                             time.monotonic())),
+                                             P.now())),
                         (locked, self.port))
         except OSError:
             pass    # interface down; keep trying
@@ -388,8 +478,10 @@ class RcJoystickClient:
     def _discover_round(self):
         with self._lock:
             self._candidates = {}
-        payload = P.encode(P.subscribe(self.client_name, self.rate_hz, time.monotonic()))
-        targets = self._targets or [("255.255.255.255", self.port)]
+        payload = P.encode(P.subscribe(self.client_name, self.rate_hz, P.now()))
+        targets = list(self._targets or [("255.255.255.255", self.port)])
+        if self.remembered and (self.remembered, self.port) not in targets:
+            targets.append((self.remembered, self.port))    # unicast: no firewall issue
         for s in self._socks:
             for tgt in targets:
                 try:
@@ -399,26 +491,67 @@ class RcJoystickClient:
         self._stop_evt.wait(DISCOVERY_WAIT_S)
         with self._lock:
             cands = dict(self._candidates)
-            if len(cands) == 1:
-                ip, (sock, info, t) = next(iter(cands.items()))
-                self._locked, self._lock_sock = ip, sock
-                self._info, self._last_rx = info, t
+        pick, how = None, ""
+        if len(cands) == 1:
+            pick = next(iter(cands))
+        elif len(cands) > 1 and self._chooser is not None:
+            pick = self._ask(cands)                 # blocks this (keepalive) thread only
+            # _ask drops the chooser if no dialog could be shown, and falls back itself.
+            how = "chosen" if self._chooser is not None else "the one used last"
+        if pick is None and len(cands) > 1 and self._chooser is None and self.remembered in cands:
+            pick, how = self.remembered, "the one used last"    # several, nobody to ask
+        with self._lock:
+            if pick is not None:
+                sock, info, _t = cands[pick]
+                self._locked, self._lock_sock = pick, sock
+                # Now, not when it answered: the operator may have taken a while to choose,
+                # and RELOCK_AFTER_S must not count that as silence.
+                self._info, self._last_rx = info, P.now()
                 self._state, self._last_seq, self._bye = None, None, None
                 self._press.reset()
                 self._multi = []
-                self._event("locked onto the RC at %s (sn %s, %s)"
-                            % (ip, info.get("sn") or "?", info.get("rc_type") or "?"))
+                self._event("locked onto the RC at %s (sn %s, %s)%s"
+                            % (pick, info.get("sn") or "?", info.get("rc_type") or "?",
+                               "" if len(cands) == 1 else
+                               ", %s; also answering: %s" % (how, ", ".join(
+                                   sorted(c for c in cands if c != pick)))))
             else:
                 self._multi = sorted(cands)
-        if len(cands) != 1:
+        if pick is None:
             self._stop_evt.wait(max(0.0, P.SUBSCRIBE_PERIOD_S - DISCOVERY_WAIT_S))
+
+    def _ask(self, cands):
+        """Several RCs answered: ask the operator which one, unless they already said "not
+        now" to exactly this set. Returns the chosen IP or None. When no dialog can be shown
+        at all, it stops asking and falls back to the non-interactive rule."""
+        key = frozenset(cands)
+        if key == self._declined:
+            return None
+        options = [(ip, cands[ip][1]) for ip in sorted(cands)]
+        with self._lock:
+            self._multi = sorted(cands)             # the status says why while the pop-up is up
+        self._event("several RCs answered (%s): asking which one" % ", ".join(sorted(cands)))
+        try:
+            ip = self._chooser(options, self.remembered, self._stop_evt.is_set)
+        except Exception as e:
+            self._chooser = None
+            self._event("cannot ask (%s): %s" % (e, "using the one used last"
+                                                  if self.remembered in cands else "pass --rc"))
+            return self.remembered if self.remembered in cands else None
+        if ip in cands:
+            self._declined = None
+            return ip
+        self._declined = key
+        if not self._stop_evt.is_set():
+            self._event("no RC chosen: asking again when the set of RCs changes (or pass --rc)")
+        return None
 
     def _keepalive_loop(self):
         while not self._stop_evt.is_set():
             if self.auto:
                 with self._lock:
                     locked, last_rx = self._locked, self._last_rx
-                if locked is not None and time.monotonic() - last_rx > RELOCK_AFTER_S:
+                if locked is not None and P.now() - last_rx > RELOCK_AFTER_S:
                     with self._lock:
                         self._locked, self._lock_sock, self._state = None, None, None
                     self._event("the RC at %s has been silent for %.0f s - searching again"

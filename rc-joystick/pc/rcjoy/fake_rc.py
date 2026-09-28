@@ -1,14 +1,16 @@
 """FakeRc: the RC side of protocol v1, driven by synthetic inputs.
 
     python -m rcjoy fake-rc [--bind IP] [--port 5070] [--pattern steps|sweep|still]
-                            [--aircraft-linked] [--no-rc-ok] [--null lv,r,...]
-                            [--msdk-sticks]
+                            [--input-hz 70] [--aircraft-linked] [--no-rc-ok]
+                            [--null lv,r,...] [--msdk-sticks]
 
 Stands in for the Android app so the PC package, the bridge and the launchers
 can be tested with no hardware. The `steps` pattern moves one physical control at
 a time and prints what it did, so the bridge's output can be checked for the
-right field and sign. It mirrors what the real app must do (see PROTOCOL.md), so
-keep the two in step.
+right field and sign. The `sweep` pattern moves every input continuously, stepping
+--input-hz times a second like the RC's gamepad reporting, so `monitor --rate 100`
+can be checked for reading that rate back as `fresh`. It mirrors what the real app
+must do (see PROTOCOL.md), so keep the two in step.
 """
 
 import math
@@ -17,6 +19,15 @@ import threading
 import time
 
 from . import protocol as P
+
+
+def sweep_inputs(t):
+    """The sweep pattern's raw inputs at time t: the right stick circling once a second,
+    as in the Ethernet rate check, so every sample moves it; the rest on slow sines."""
+    a = 2.0 * math.pi * t
+    return {"rh": int(660 * math.cos(a)), "rv": int(660 * math.sin(a)),
+            "lh": int(660 * math.sin(t * 0.7)), "lv": int(660 * math.sin(t * 0.5)),
+            "l": int(660 * math.sin(t * 0.3)), "r": int(660 * math.sin(t * 0.4))}
 
 
 class FakeRc:
@@ -39,11 +50,18 @@ class FakeRc:
         self.gamepad_why = None         # why the gamepad is not in use (with "msdk")
         self.inverted = []              # axes the app's cross-check found inverted
         self.muted = False              # stop streaming state, no bye (cable pulled)
+        # Set: the inputs follow sweep_inputs(), stepping sweep_hz times a second the
+        # way the gamepad reports, and each state carries whichever sample is current,
+        # as the app's tx thread does. None: the inputs are whatever set() last put.
+        self.sweep_hz = None
+        self.gamepad_hz = 70            # what info.gamepad.hz claims
+        self.fresh_sent = 0             # states sent whose sticks/dials changed
+        self._last_inputs = None
         self.battery = 87
         self.rf = {"wifi": False, "wifi_scan": False, "bt": False, "ble_scan": False,
                    "airplane": True}
         self.on_subscriber_change = None
-        self._t0 = time.monotonic()
+        self._t0 = P.now()
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._threads = []
@@ -79,10 +97,14 @@ class FakeRc:
 
     def build_state(self):
         with self.lock:
+            if self.sweep_hz:
+                n = int((P.now() - self._t0) * self.sweep_hz)
+                for k, v in sweep_inputs(n / float(self.sweep_hz)).items():
+                    (self.sticks if k in self.sticks else self.dials)[k] = v
             linked = self.aircraft_linked
             return {
                 "type": "state", "v": self.version, "seq": self.seq,
-                "t_ms": int((time.monotonic() - self._t0) * 1000),
+                "t_ms": int((P.now() - self._t0) * 1000),
                 "rc_ok": self.rc_ok and not linked, "aircraft_linked": linked,
                 "stick_src": self.stick_src,
                 "sticks": {k: self._val(k, v) for k, v in self.sticks.items()},
@@ -107,7 +129,7 @@ class FakeRc:
                 "subscribers": len(self.subscribers), "keys": keys,
                 "rf": dict(self.rf, aircraft_linked=self.aircraft_linked),
                 "gamepad": {
-                    "hz": 70 if self.stick_src == "gamepad" else 0,
+                    "hz": self.gamepad_hz if self.stick_src == "gamepad" else 0,
                     "gap_ms": 14 if self.stick_src == "gamepad" else None,
                     "why": self.gamepad_why if self.stick_src != "gamepad" else None,
                     "gate": True, "verified": ["lh", "lv", "rh", "rv"],
@@ -128,6 +150,13 @@ class FakeRc:
         return self
 
     def stop(self, bye=True):
+        self._stop.set()
+        self._wake.set()
+        # As the app does: no state may follow the bye, or the PC takes it as the
+        # stream resuming and waits out stale_after instead of going stale at once.
+        for t in self._threads:
+            if t.name == "fake-rc-tx":
+                t.join(timeout=1.0)
         if bye:
             with self.lock:
                 subs = list(self.subscribers)
@@ -138,8 +167,6 @@ class FakeRc:
                     self.sock.sendto(P.encode(msg), addr)
                 except OSError:
                     pass
-        self._stop.set()
-        self._wake.set()
         try:
             self.sock.close()
         except OSError:
@@ -168,7 +195,7 @@ class FakeRc:
                     self.subscribers[addr] = {
                         "client": str(msg.get("client", "?")),
                         "rate": P.clamp_rate(msg.get("rate_hz")),
-                        "last": time.monotonic()}
+                        "last": P.now()}
                 if new and self.on_subscriber_change:
                     self.on_subscriber_change("+", addr, msg.get("client"))
                 try:
@@ -182,9 +209,9 @@ class FakeRc:
                     self.on_subscriber_change("-", addr, gone["client"])
 
     def _tx(self):
-        next_t = time.monotonic()
+        next_t = P.now()
         while not self._stop.is_set():
-            now = time.monotonic()
+            now = P.now()
             with self.lock:
                 for addr in [a for a, s in self.subscribers.items()
                              if now - s["last"] > P.SUBSCRIPTION_TTL_S]:
@@ -195,21 +222,27 @@ class FakeRc:
                 rate = self._rate_locked()
                 muted = self.muted
             if subs and not muted:
-                payload = P.encode(self.build_state())
+                st = self.build_state()
+                payload = P.encode(st)
                 for addr in subs:
                     try:
                         self.sock.sendto(payload, addr)
                     except OSError:
                         pass
+                inputs = (st["sticks"], st["dials"])
                 with self.lock:
                     self.seq += 1
+                    # Counted as the PC counts `fresh`, so the two can be compared.
+                    if self._last_inputs is not None and inputs != self._last_inputs:
+                        self.fresh_sent += 1
+                    self._last_inputs = inputs
             next_t += 1.0 / rate
-            delay = next_t - time.monotonic()
+            delay = next_t - P.now()
             if delay > 0:
                 self._wake.wait(delay)
                 self._wake.clear()
             else:
-                next_t = time.monotonic()
+                next_t = P.now()
 
 
 # --- CLI patterns -------------------------------------------------------------------
@@ -229,6 +262,9 @@ STEPS = (
 
 
 def main(args):
+    if args.input_hz <= 0:
+        print("--input-hz must be > 0")
+        return 2
     rc = FakeRc(bind=args.bind, port=args.port)
     rc.null_keys = set(k.strip() for k in (args.null or "").split(",") if k.strip())
     rc.aircraft_linked = args.aircraft_linked
@@ -236,23 +272,29 @@ def main(args):
     if args.msdk_sticks:
         rc.stick_src = "msdk"
         rc.gamepad_why = "the app is not in front (fake)"
+    if args.pattern == "sweep":
+        rc.sweep_hz = args.input_hz
+        rc.gamepad_hz = int(round(args.input_hz))   # the app sends an int
+    else:
+        rc.gamepad_hz = 0           # the real app reads 0 while nothing moves
     rc.on_subscriber_change = lambda how, addr, client: print(
         "[fake-rc] subscriber %s %s:%d (%s)" % (
             {"+": "joined", "-": "left", "x": "expired"}[how], addr[0], addr[1], client),
         flush=True)
     rc.start()
-    print("[fake-rc] listening on %s:%d  pattern=%s%s%s%s%s  (Ctrl+C to quit)" % (
+    print("[fake-rc] listening on %s:%d  pattern=%s%s%s%s%s%s  (Ctrl+C to quit)" % (
         rc.ip, rc.port, args.pattern,
+        ("  input %g/s" % rc.sweep_hz) if rc.sweep_hz else "",
         "  AIRCRAFT-LINKED" if rc.aircraft_linked else "",
         "  rc_ok=false" if not rc.rc_ok else "",
         ("  null=" + ",".join(sorted(rc.null_keys))) if rc.null_keys else "",
         "  sticks=MSDK" if rc.stick_src == "msdk" else ""),
         flush=True)
-    t0 = time.monotonic()
+    t0 = P.now()
     step = -1
     try:
         while True:
-            t = time.monotonic() - t0
+            t = P.now() - t0
             if args.pattern == "steps":
                 i = int(t // STEP_S) % len(STEPS)
                 if i != step:
@@ -264,11 +306,7 @@ def main(args):
                     if press:
                         rc.press(press)
                     print("[fake-rc] %s" % label, flush=True)
-            elif args.pattern == "sweep":
-                rc.set(lh=int(660 * math.sin(t * 0.7)), lv=int(660 * math.sin(t * 0.5)),
-                       rh=int(660 * math.sin(t * 0.9)), rv=int(660 * math.sin(t * 1.1)),
-                       l=int(660 * math.sin(t * 0.3)), r=int(660 * math.sin(t * 0.4)))
-            time.sleep(0.02)
+            time.sleep(0.02)            # sweep: the tx thread samples sweep_inputs()
     except KeyboardInterrupt:
         pass
     finally:

@@ -4,16 +4,22 @@ The fake RC stands in for the Android app. Everything runs over 127.0.0.x on
 ephemeral ports, so it never touches a real RC or the swarm's :5055.
 """
 
+import csv
 import json
+import os
+import re
 import socket
+import tempfile
 import threading
 import time
 import traceback
 
 from . import protocol as P
-from .bridge import Bridge
-from .client import RcJoystickClient
+from .bridge import Bridge, parse_range
+from .chooser import ChooserUnavailable, label as chooser_label, payload as chooser_payload
+from .client import RcJoystickClient, read_remembered, remember_path_for
 from .fake_rc import FakeRc
+from .monitor import CsvLog
 
 
 class _Checks:
@@ -29,8 +35,8 @@ class _Checks:
 
 
 def _wait(pred, timeout, step=0.01):
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
+    end = P.now() + timeout
+    while P.now() < end:
         if pred():
             return True
         time.sleep(step)
@@ -149,6 +155,9 @@ def t_client(ck):
         ck("RTT measured from the info echo (%s ms)" % (
             "-" if st["rtt_ms"] is None else "%.2f" % st["rtt_ms"]),
            st["rtt_ms"] is not None and st["rtt_ms"] < 100)
+        # time.monotonic() ticks every 15.625 ms on Windows and read this as 0.0.
+        ck("RTT resolves below a millisecond (loopback reads non-zero)",
+           st["rtt_ms"] is not None and 0.0 < st["rtt_ms"] < 50)
         ck("a press made before subscribing never fires", fired == [])
 
         rc.set(lh=660, lv=-330, rh=0, rv=700, l=165, r=-660)
@@ -230,9 +239,9 @@ def t_client(ck):
             rogue.close()
 
         rc.muted = True                         # the cable is pulled: no bye
-        t0 = time.monotonic()
+        t0 = P.now()
         ok = _wait(lambda: cl.get_state() is None, 1.0, step=0.005)
-        dt = time.monotonic() - t0
+        dt = P.now() - t0
         ck("silence -> None within stale_after + 0.15 s (%.2f s)" % dt,
            ok and dt <= cl.stale_after + 0.15)
         ck("... and says why (%s)" % _reason(cl), "stale" in _reason(cl))
@@ -240,15 +249,90 @@ def t_client(ck):
         ck("... and is usable again when it resumes",
            _wait(lambda: cl.get_state() is not None, 0.5))
 
-        t0 = time.monotonic()
+        t0 = P.now()
         rc.stop(bye=True)
         ok = _wait(lambda: cl.get_state() is None, 0.5, step=0.002)
-        dt = time.monotonic() - t0
+        dt = P.now() - t0
         ck("bye -> None at once (%.3f s)" % dt, ok and dt < 0.1)
         ck("... and says why (%s)" % _reason(cl), "bye" in _reason(cl))
     finally:
         cl.stop()
         rc.stop(bye=False)
+
+
+def t_rates(ck):
+    """The fresh-sample count: what the Ethernet rate check reads against the app."""
+    rc = FakeRc(bind="127.0.0.1", port=0)
+    rc.sweep_hz = 70                    # the gamepad's fast mode
+    rc.start()
+    cl = RcJoystickClient("127.0.0.1", port=rc.port, rate_hz=100, client_name="selftest")
+    seen = []
+    cl.on_state(lambda s, fresh: seen.append(fresh))
+    cl.start()
+    try:
+        _wait(lambda: cl.get_state() is not None, 1.0)
+        time.sleep(0.3)
+        rc0, cl0 = rc.fresh_sent, cl.stats()["fresh"]
+        time.sleep(1.5)
+        rc1, st = rc.fresh_sent, cl.stats()
+        sent, got = rc1 - rc0, st["fresh"] - cl0
+        ck("the wire runs at the rate asked for, not the input's (%.1f Hz, 100 asked)"
+           % st["rx_hz"], st["rx_hz"] >= 75)
+        ck("every changed state the RC sent is counted fresh (sent %d, counted %d)"
+           % (sent, got), sent > 50 and abs(sent - got) <= 2)
+        ck("fresh follows the 70/s input, below the wire rate (%.1f/s)" % st["fresh_hz"],
+           40 <= st["fresh_hz"] <= 72 and st["fresh_hz"] <= st["rx_hz"])
+        ck("on_state sees every accepted state with its fresh flag (%d states, %d fresh)"
+           % (len(seen), sum(seen)),
+           abs(len(seen) - st["packets"]) <= 2 and abs(sum(seen) - st["fresh"]) <= 2)
+        rc.sweep_hz = None              # inputs freeze where they are
+        time.sleep(2.3)                 # the rate window (2 s) empties of sweep samples
+        st = cl.stats()
+        ck("held still: fresh reads 0 while the wire keeps running (fresh %.1f, wire %.1f)"
+           % (st["fresh_hz"], st["rx_hz"]), st["fresh_hz"] == 0 and st["rx_hz"] >= 75)
+    finally:
+        cl.stop()
+        rc.stop(bye=False)
+
+
+class _InfoStub:
+    def info(self):
+        return {"gamepad": {"hz": 70, "gap_ms": 14}}
+
+
+def t_csv(ck):
+    path = os.path.join(tempfile.mkdtemp(prefix="rcjoy-selftest-"), "run.csv")
+    log = CsvLog(path, _InfoStub())
+    a = _st({"rv": 330})
+    a.received_at, a.seq = log._t0 + 0.010, 7
+    b = _st({"rv": 340})
+    b.received_at, b.seq = log._t0 + 0.020, 8
+    b.dials["r"] = b.raw_dials["r"] = None
+    log.write(a, False)
+    log.write(b, True)
+    log.close()
+    with open(path, newline="") as f:
+        rows = list(csv.reader(f))
+    ck("csv: a header, then one row per state",
+       len(rows) == 3 and tuple(rows[0]) == CsvLog.COLUMNS)
+    r = dict(zip(rows[0], rows[2])) if len(rows) == 3 else {}
+    ck("csv: seq, fresh, raw inputs and the app's gamepad figures ride along",
+       r.get("seq") == "8" and r.get("fresh") == "1" and r.get("rv") == "340"
+       and r.get("app_gp_hz") == "70" and r.get("app_gp_gap_ms") == "14")
+    ck("csv: a null input is an empty cell, never a zero", r.get("r") == "")
+    ck("csv: each row carries the PC's wall-clock time (%s)" % r.get("wall"),
+       re.match(r"^\d\d:\d\d:\d\d\.\d{3}$", r.get("wall") or "") is not None)
+    ck("csv: the summary counts states and fresh ones (%s)" % log.summary(),
+       log.summary().startswith("csv: 2 states, 1 fresh"))
+    again = CsvLog(path, _InfoStub())         # the same name for a second run
+    again.close()
+    with open(path, newline="") as f:
+        kept = len(list(csv.reader(f)))
+    ck("csv: reusing a name never overwrites a run (%s)" % os.path.basename(again.path),
+       again.path.endswith("run-2.csv") and kept == 3)
+    for p in (path, again.path):
+        os.remove(p)
+    os.rmdir(os.path.dirname(path))
 
 
 def t_version(ck):
@@ -288,6 +372,147 @@ def t_discovery(ck):
         cl.stop()
         a.stop(bye=False)
         b.stop(bye=False)
+
+
+def t_remember(ck):
+    """The last RC used is saved, and tried by unicast alongside the broadcast."""
+    try:
+        a = FakeRc(bind="127.0.0.2", port=0).start()
+        b = FakeRc(bind="127.0.0.3", port=a.port).start()
+    except OSError:
+        print("  skip  remember (cannot bind 127.0.0.2/.3 here)")
+        return
+    folder = tempfile.mkdtemp(prefix="rcjoy-selftest-")
+    path = os.path.join(folder, "last_rc.txt")
+
+    def client(targets):
+        return RcJoystickClient(None, port=a.port, local_addrs=["127.0.0.1"],
+                                discovery_targets=targets, remember=path).start()
+    try:
+        cl = client([("127.0.0.2", a.port)])
+        try:
+            ok = (_wait(lambda: cl.locked_rc() == "127.0.0.2", 3.0)
+                  and _wait(lambda: read_remembered(path) == "127.0.0.2", 2.0))
+        finally:
+            cl.stop()
+        ck("the RC it locks onto is remembered (%s)" % read_remembered(path), ok)
+
+        cl = client([("127.0.0.9", a.port)])           # the "broadcast" finds nobody
+        try:
+            ck("the remembered RC is found by unicast when the broadcast finds none",
+               _wait(lambda: cl.locked_rc() == "127.0.0.2", 3.0))
+            ck("... and streams", _wait(lambda: cl.get_state() is not None, 1.0))
+        finally:
+            cl.stop()
+
+        with open(path, "w") as f:
+            f.write("127.0.0.3\n")
+        cl = client([("127.0.0.2", a.port), ("127.0.0.3", a.port)])
+        try:
+            ck("two RCs answering: it stays with the remembered one",
+               _wait(lambda: cl.locked_rc() == "127.0.0.3", 3.0))
+        finally:
+            cl.stop()
+
+        with open(path, "w") as f:
+            f.write("not an address\n")
+        ck("a garbled memory is ignored, not trusted", read_remembered(path) is None)
+        ck("--rc on this PC (a fake RC) never replaces the remembered real RC",
+           remember_path_for("127.0.0.1") is None and remember_path_for("localhost") is None
+           and remember_path_for("192.168.100.50") and remember_path_for(None))
+    finally:
+        a.stop(bye=False)
+        b.stop(bye=False)
+        if os.path.exists(path):
+            os.remove(path)
+        os.rmdir(folder)
+
+
+def t_chooser(ck):
+    """Several RCs answering: the operator is asked (a stand-in chooser here: no window)."""
+    try:
+        a = FakeRc(bind="127.0.0.2", port=0).start()
+        b = FakeRc(bind="127.0.0.3", port=a.port).start()
+    except OSError:
+        print("  skip  chooser (cannot bind 127.0.0.2/.3 here)")
+        return
+    both = [("127.0.0.2", a.port), ("127.0.0.3", a.port)]
+    folder = tempfile.mkdtemp(prefix="rcjoy-selftest-")
+    path = os.path.join(folder, "last_rc.txt")
+
+    def client(chooser):
+        return RcJoystickClient(None, port=a.port, local_addrs=["127.0.0.1"],
+                                discovery_targets=both, remember=path, chooser=chooser).start()
+    calls = []
+    try:
+        def pick_3(options, remembered, cancelled):
+            calls.append((options, remembered))
+            return "127.0.0.3"
+        cl = client(pick_3)
+        try:
+            ok = _wait(lambda: cl.locked_rc() == "127.0.0.3", 3.0)
+            opts = calls[0][0] if calls else []
+            ck("several RCs: the operator's pick is locked onto", ok)
+            ck("... the pop-up is offered each RC with its serial (%s)"
+               % ", ".join(ip for ip, _ in opts),
+               [ip for ip, _ in opts] == ["127.0.0.2", "127.0.0.3"]
+               and all(info.get("sn") == "FAKE0001" for _, info in opts))
+            ck("... and the pick is remembered", _wait(lambda: read_remembered(path) == "127.0.0.3", 2.0))
+        finally:
+            cl.stop()
+
+        calls[:] = []
+        cl = client(lambda options, remembered, cancelled: calls.append(remembered))
+        try:
+            time.sleep(2.6)                         # three discovery rounds
+            ck("'Not now': nothing is locked, and the same RCs are not asked about again (%d)"
+               % len(calls), cl.locked_rc() is None and len(calls) == 1)
+            ck("... the status says why (%s)" % _reason(cl), "pop-up" in _reason(cl))
+            ck("... and the pop-up was told which RC was used last", calls == ["127.0.0.3"])
+        finally:
+            cl.stop()
+
+        def unavailable(options, remembered, cancelled):
+            raise ChooserUnavailable("no desktop")
+        cl = client(unavailable)
+        try:
+            ck("no pop-up possible: it falls back to the one used last",
+               _wait(lambda: cl.locked_rc() == "127.0.0.3", 3.0))
+        finally:
+            cl.stop()
+
+        # A slow choice must not count as the RC being silent (RELOCK_AFTER_S shrunk to 1 s).
+        import rcjoy.client as client_module
+        saved, client_module.RELOCK_AFTER_S = client_module.RELOCK_AFTER_S, 1.0
+        calls[:] = []
+
+        def slow(options, remembered, cancelled):
+            calls.append(1)
+            time.sleep(1.5)
+            return "127.0.0.2"
+        cl = client(slow)
+        try:
+            ok = _wait(lambda: cl.locked_rc() == "127.0.0.2", 4.0)
+            time.sleep(1.5)
+            ck("a slow choice is not taken for silence: locked once, streaming (%d asked)"
+               % len(calls), ok and len(calls) == 1 and cl.get_state() is not None)
+        finally:
+            cl.stop()
+            client_module.RELOCK_AFTER_S = saved
+    finally:
+        a.stop(bye=False)
+        b.stop(bye=False)
+        if os.path.exists(path):
+            os.remove(path)
+        os.rmdir(folder)
+
+    text = chooser_label("192.168.100.50", {"rc_type": "DJI_RC_PRO", "sn": "4QQZ", "battery": 86,
+                                            "app": "1.6"}, last_used=True)
+    ck("pop-up labels lead with the IP and carry the serial and battery",
+       text.startswith("192.168.100.50") and "last used" in text and "sn 4QQZ" in text
+       and "battery 86%" in text)
+    blob = chooser_payload([("10.0.0.1", {"sn": "été"})], "10.0.0.1")
+    ck("the pop-up's input is plain ASCII, whatever an RC reports", all(ord(c) < 128 for c in blob))
 
 
 # --- bridge ----------------------------------------------------------------------------
@@ -423,6 +648,46 @@ def t_bridge(ck):
     ck("joystick profile: the LEFT (gimbal) dial drives angular.x",
        m["angular"]["x"] > 1.0 and m["switches"]["s2"] < 0.0)
 
+    # --ax-range: the Unity sim takes angular.x unclamped as its spread (readController 0.4..1.6)
+    ck("--ax-range parses LO,HI", parse_range("0.4,1.6") == (0.4, 1.6))
+    try:
+        parse_range("0.4")
+        ok = False
+    except ValueError:
+        ok = True
+    ck("--ax-range rejects anything but LO,HI", ok)
+    try:
+        Bridge(cl, ax_range=(1.2, 1.6))
+        ok = False
+    except ValueError:
+        ok = True
+    ck("an --ax-range without the 1.0 start is refused", ok)
+    cl.state = _st(dials={"r": 660})
+    bw, t = Bridge(cl, ax_range=(0.4, 1.6)), 0.0
+    bw.tick(t)
+    for _ in range(15):
+        t += 0.05
+        m = bw.tick(t)
+    ck("a wider range sweeps in the same knob_sweep_s (0.75 s -> 1.3)",
+       abs(m["angular"]["x"] - 1.3) < 1e-6)
+    for _ in range(400):
+        t += 0.05
+        top = bw.tick(t)["angular"]["x"]
+    cl.state = _st(dials={"r": -660})
+    for _ in range(400):
+        t += 0.05
+        bottom = bw.tick(t)["angular"]["x"]
+    ck("--ax-range 0.4,1.6 reaches both ends (%.2f, %.2f)" % (bottom, top),
+       top == 1.6 and bottom == 0.4)
+    bs = Bridge(cl, profile="sim")
+    ck("sim profile: flocking's dials with readController.py's 0.4..1.6 spacing",
+       bs.dials["ax_dial"] == "r" and bs.dials["s2_dial"] == "l"
+       and (bs.ax_lo, bs.ax_hi) == (0.4, 1.6))
+    ck("an explicit --ax-range overrides the profile's",
+       Bridge(cl, profile="sim", ax_range=(0.6, 1.4)).ax_lo == 0.6)
+    ck("flocking keeps swarm_flocking.py's 0.6..1.4",
+       (Bridge(cl).ax_lo, Bridge(cl).ax_hi) == (0.6, 1.4))
+
 
 def t_bridge_e2e(ck):
     rc = FakeRc(bind="127.0.0.1", port=0).start()
@@ -438,8 +703,8 @@ def t_bridge_e2e(ck):
     try:
         _wait(lambda: cl.get_state() is not None, 1.0)
         th.start()
-        got, end = [], time.monotonic() + 1.0
-        while time.monotonic() < end:
+        got, end = [], P.now() + 1.0
+        while P.now() < end:
             try:
                 got.append(sink.recvfrom(4096)[0])
             except socket.timeout:
@@ -455,12 +720,12 @@ def t_bridge_e2e(ck):
                          and int(sw["s2"]) == 0 and type(sw["s1"]) is int)
         ck("every datagram reads like readController.py's JSON", ok)
         rc.muted = True
-        t0, last = time.monotonic(), None
+        t0, last = P.now(), None
         end = t0 + 1.0
-        while time.monotonic() < end:
+        while P.now() < end:
             try:
                 sink.recvfrom(4096)
-                last = time.monotonic()
+                last = P.now()
             except socket.timeout:
                 pass
         quiet = (last or t0) - t0
@@ -477,9 +742,11 @@ def t_bridge_e2e(ck):
 
 def main(_args=None):
     ck = _Checks()
-    t_start = time.monotonic()
+    t_start = P.now()
     for title, fn in (("protocol", t_protocol), ("client <-> fake RC", t_client),
+                      ("rates: wire vs fresh", t_rates), ("monitor csv", t_csv),
                       ("version mismatch", t_version), ("discovery", t_discovery),
+                      ("remembered RC", t_remember), ("choosing among RCs", t_chooser),
                       ("bridge mapping", t_bridge), ("bridge end to end", t_bridge_e2e)):
         print("[%s]" % title, flush=True)
         try:
@@ -487,7 +754,7 @@ def main(_args=None):
         except Exception as e:
             traceback.print_exc()
             ck("%s ran without an exception (%r)" % (title, e), False)
-    took = time.monotonic() - t_start
+    took = P.now() - t_start
     if ck.failed:
         print("\nselftest: %d of %d checks FAILED (%.1f s):" % (len(ck.failed), ck.n, took))
         for name in ck.failed:

@@ -6,6 +6,7 @@ rather than being defaulted, because a silently defaulted stick is a stick at ze
 """
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -19,6 +20,12 @@ RATE_MAX_HZ = 100
 RATE_DEFAULT_HZ = 50
 MAX_INFO_BYTES = 1200           # `info` must fit one unfragmented datagram
 RECV_BUFFER = 8192
+
+# The one clock every rcjoy module times with. Not time.monotonic(): on Windows that is
+# GetTickCount64, 15.625 ms per tick, which reads a 2 ms RTT as 0 or 15.6 and cannot
+# resolve the gamepad's ~14 ms report spacing. perf_counter is QueryPerformanceCounter
+# there (sub-microsecond) and is monotonic everywhere.
+now = time.perf_counter
 
 STICKS = ("lh", "lv", "rh", "rv")
 DIALS = ("l", "r")
@@ -141,7 +148,7 @@ class RcState:
     mode_switch: Optional[str]
     raw_sticks: Dict[str, Optional[float]]
     raw_dials: Dict[str, Optional[float]]
-    received_at: float = 0.0        # PC time.monotonic() when it arrived
+    received_at: float = 0.0        # PC now() (perf_counter) when it arrived
     # Where the sticks/dials came from: "gamepad" (the RC's built-in HID, ~70 Hz) or
     # "msdk" (~10 Hz, the fallback). None from an app older than 1.5.
     stick_src: Optional[str] = None

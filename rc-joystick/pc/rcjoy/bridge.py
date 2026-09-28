@@ -1,14 +1,17 @@
 """Bridge: RC Pro state -> the exact JSON readController.py sends (Taranis path).
 
     python -m rcjoy bridge [--rc IP] [--out HOST:PORT]... [--rate 20]
-                           [--stick-mode 1|2|3] [--profile flocking|joystick]
-                           [--knob-sweep-s 3]
+                           [--stick-mode 1|2|3] [--profile flocking|joystick|sim]
+                           [--knob-sweep-s 3] [--ax-range LO,HI]
+
+Without --rc it finds the RC by itself: the last RC this PC used (saved on every
+lock-on), and a broadcast on the switch. One --rc IP is enough for every later launch.
 
 Every consumer of readController.py's JSON (AOS server's udp_joystick_receiver.py,
 the Unity sim's UDPReceiverManager.cs) runs unchanged:
 
     {"linear": {"x": fwd, "y": right, "z": climb*|climb|},
-     "angular": {"x": knob in [0.6, 1.4], "y": 0.0, "z": yaw},
+     "angular": {"x": knob in --ax-range (default [0.6, 1.4]), "y": 0.0, "z": yaw},
      "switches": {"s1": +1|-1 (JSON int), "s2": knob in [-0.999, 0.999]}}
 
 The RC's dials spring back to centre, so each one drives an integrated KNOB. The
@@ -26,10 +29,10 @@ import shutil
 import socket
 import sys
 import threading
-import time
 
 from . import protocol as P
-from .client import RcJoystickClient
+from .chooser import choose_rc
+from .client import RcJoystickClient, remember_path_for
 
 # Physical stick -> function, per DJI stick mode. Mode 2 is throttle/yaw on the
 # left, as with the Taranis setup readController.py was written for.
@@ -43,13 +46,18 @@ STICK_MODES = {
 # angular.x means: swarm_flocking.py reads it as SPACING (and owns the gimbal in its
 # GUI), while joystick_controller.py reads it as the GIMBAL and treats s2 only as a
 # LAND edge. The joystick profile therefore puts the RC's gimbal dial (the left one)
-# on angular.x.
+# on angular.x. The sim profile is flocking's mapping with the Taranis's spacing range:
+# the Unity sim takes angular.x unclamped as its spread (Olfati-Saber d_ref).
 PROFILES = {
     "flocking": {"ax_dial": "r", "s2_dial": "l"},
     "joystick": {"ax_dial": "l", "s2_dial": "r"},
+    "sim": {"ax_dial": "r", "s2_dial": "l", "ax_range": (0.4, 1.6)},
 }
 
-AX_MIN, AX_MAX, AX_START = 0.6, 1.4, 1.0    # consumers clamp angular.x to [0.6, 1.4]
+# swarm_flocking.py clamps angular.x to [0.6, 1.4], so the knob stops there by default.
+# The Unity sim uses it unclamped as its spread (Olfati-Saber d_ref), and readController.py's
+# pot spans [0.4, 1.6]: --ax-range 0.4,1.6 gives the sim the Taranis's range.
+AX_MIN, AX_MAX, AX_START = 0.6, 1.4, 1.0
 # Never +-1.0: JoystickReceiver casts s2 to int, and joystick_controller.py treats
 # s2 == 1 as a LAND edge. int(+-0.999) == 0.
 S2_LIMIT, S2_START = 0.999, 0.0
@@ -64,13 +72,18 @@ def _clamp(x, lo, hi):
 
 class Bridge:
     def __init__(self, client, stick_mode=2, profile="flocking",
-                 knob_sweep_s=3.0, dial_deadband=DIAL_DEADBAND):
+                 knob_sweep_s=3.0, dial_deadband=DIAL_DEADBAND, ax_range=None):
         if stick_mode not in STICK_MODES:
             raise ValueError("stick_mode must be 1, 2 or 3")
         if profile not in PROFILES:
             raise ValueError("profile must be one of %s" % ", ".join(PROFILES))
         if knob_sweep_s <= 0:
             raise ValueError("knob_sweep_s must be > 0")
+        # An explicit range wins over the profile's; flocking and joystick have none.
+        ax_range = ax_range or PROFILES[profile].get("ax_range") or (AX_MIN, AX_MAX)
+        self.ax_lo, self.ax_hi = float(ax_range[0]), float(ax_range[1])
+        if not self.ax_lo < AX_START < self.ax_hi:
+            raise ValueError("ax_range must contain the start value %.1f, e.g. 0.6,1.4" % AX_START)
         self.client = client
         self.sticks = STICK_MODES[stick_mode]
         self.dials = PROFILES[profile]
@@ -114,8 +127,8 @@ class Bridge:
 
         d = self._dial(st, self.dials["ax_dial"])
         if d is not None:
-            self.ax = _clamp(self.ax + d * (AX_MAX - AX_MIN) / self.sweep * dt,
-                             AX_MIN, AX_MAX)
+            self.ax = _clamp(self.ax + d * (self.ax_hi - self.ax_lo) / self.sweep * dt,
+                             self.ax_lo, self.ax_hi)
         d = self._dial(st, self.dials["s2_dial"])
         if d is not None:
             self.s2 = _clamp(self.s2 + d * (2 * S2_LIMIT) / self.sweep * dt,
@@ -143,10 +156,10 @@ class Bridge:
         period = 1.0 / rate_hz
         tty = verbose and sys.stdout.isatty()
         sending, last_status, last_warn = None, 0.0, None
-        next_t = time.monotonic()
+        next_t = P.now()
         try:
             while not stop_evt.is_set():
-                now = time.monotonic()
+                now = P.now()
                 msg = self.tick(now)
                 if msg is not None:
                     payload = json.dumps(msg).encode("utf-8")
@@ -173,11 +186,11 @@ class Bridge:
                         last_status = now
                         self._status(msg, tty)
                 next_t += period
-                delay = next_t - time.monotonic()
+                delay = next_t - P.now()
                 if delay > 0:
                     stop_evt.wait(delay)
                 else:
-                    next_t = time.monotonic()   # fell behind: resync, don't burst
+                    next_t = P.now()   # fell behind: resync, don't burst
         finally:
             sock.close()
 
@@ -216,6 +229,15 @@ def _outs_desc(outs):
     return ", ".join("%s:%d" % o for o in outs)
 
 
+def parse_range(s):
+    """'LO,HI' -> (lo, hi): the angular.x knob's range."""
+    try:
+        lo, hi = (float(x) for x in str(s).split(","))
+    except ValueError:
+        raise ValueError("--ax-range must be LO,HI (got %r)" % s)
+    return lo, hi
+
+
 def parse_out(s):
     host, sep, port = s.rpartition(":")
     if not sep or not host:
@@ -230,12 +252,21 @@ def main(args):
               "datagram per frame, so anything faster builds a growing backlog"
               % MAX_RATE_HZ, file=sys.stderr)
         return 2
-    client = RcJoystickClient(args.rc, port=args.port, client_name="rcjoy-bridge")
-    bridge = Bridge(client, stick_mode=args.stick_mode, profile=args.profile,
-                    knob_sweep_s=args.knob_sweep_s)
-    print("[bridge] RC %s:%d -> %s at %g Hz  mode %d  profile %s  knob sweep %gs"
-          % (args.rc or "auto", args.port, _outs_desc(outs), args.rate,
-             args.stick_mode, args.profile, args.knob_sweep_s))
+    try:
+        ax_range = parse_range(args.ax_range) if args.ax_range else None
+        client = RcJoystickClient(args.rc, port=args.port, client_name="rcjoy-bridge",
+                                  remember=remember_path_for(args.rc), chooser=choose_rc)
+        bridge = Bridge(client, stick_mode=args.stick_mode, profile=args.profile,
+                        knob_sweep_s=args.knob_sweep_s, ax_range=ax_range)
+    except ValueError as e:
+        print("[bridge] %s" % e, file=sys.stderr)
+        return 2
+    rc = args.rc or ("auto: the last RC used (%s), and a broadcast" % client.remembered
+                     if client.remembered else "auto: broadcast")
+    print("[bridge] RC %s  port %d -> %s at %g Hz  mode %d  profile %s  knob sweep %gs  "
+          "angular.x %g..%g" % (rc, args.port, _outs_desc(outs), args.rate,
+                                args.stick_mode, args.profile, args.knob_sweep_s,
+                                bridge.ax_lo, bridge.ax_hi))
     print("[bridge] C1 = panorama toggle (s1)   C2 = reset knobs   Ctrl+C = quit")
     client.start()
     stop = threading.Event()
