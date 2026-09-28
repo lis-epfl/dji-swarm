@@ -4,19 +4,21 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.hardware.input.InputManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
-import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -39,6 +41,11 @@ import java.util.Map;
  * service's reader sees at 10 Hz. Everything that must keep running lives in the
  * service.
  *
+ * The screen is the operator's: one status line with the Ethernet address, the PC link and
+ * the battery; the sticks and dials; the stick source and the gamepad's mode; C1/C2; and
+ * alerts only when something needs doing. Every diagnostic the bench and DEBUGGING.md use
+ * is in the Details panel over it.
+ *
  * It also feeds GamepadInput: the RC's built-in gamepad is the fast (~70 Hz) source for the
  * sticks and dials, and Android delivers joystick events only to the FOCUSED window, which
  * is why this lives here and not in the service. The events are consumed here, so Android
@@ -47,8 +54,8 @@ import java.util.Map;
  *
  * SAFE MODE (rc-joystick/android/DEBUGGING.md) is entered automatically when the last
  * run left a crash report, or on request (adb shell am start -n
- * com.liscontroller/.MainActivity --ez safe true). Nothing starts by itself: the report
- * and the previous run's last steps are shown, and the stage buttons start the service
+ * com.liscontroller/.MainActivity --ez safe true). Nothing starts by itself: Details opens
+ * with the report and the previous run's last steps, and its stage buttons start the service
  * one piece at a time (1 stream only, 2 + MSDK, 3 + key reading), which bisects the crash.
  */
 public class MainActivity extends Activity implements InputManager.InputDeviceListener {
@@ -56,16 +63,33 @@ public class MainActivity extends Activity implements InputManager.InputDeviceLi
     /** The RC Pro's built-in gamepad, "DJI embedded joystick" (README). */
     static final int GAMEPAD_VENDOR = 0x2ca3, GAMEPAD_PRODUCT = 0x1501;
     private static final int REQ_PERMS = 7;
-    private static final int C_OK = 0xFF2E7D32, C_WAIT = 0xFFEF6C00, C_BAD = 0xFFC62828,
-            C_IDLE = 0xFF37474F;
+    // res/values/colors.xml, as ints for the code that colours at runtime.
+    private static final int C_OK = 0xFF3FB950, C_WARN = 0xFFD29922, C_BAD = 0xFFF85149,
+            C_TEXT = 0xFFE6EDF3, C_DIM = 0xFF8B949E, C_FAINT = 0xFF545D68,
+            C_SURFACE_HI = 0xFF1A2029, C_ACCENT = 0xFF58A6FF;
+    /** Battery below this is an alert; the bridge warns at the same level. */
+    private static final int BATTERY_LOW_PCT = 25;
+    /** The C1/C2 pills stay lit this long after a press, so a quick tap is seen. */
+    private static final long PRESS_FLASH_MS = 350;
+    /** Protocol.BUTTONS indexes of the two buttons the PC uses (bridge: C1 panorama, C2 reset). */
+    private static final int[] PILL_BUTTONS = {0, 1};
 
     private final Handler ui = new Handler(Looper.getMainLooper());
-    private TextView status, rfBanner, linkedBanner, diag;
+    private TextView statusWord, statusDetail, chipNet, chipPc, chipBatt;
+    private TextView srcLabel, srcMode, srcRate, diag, detailsTitle;
+    private View details, safeRow;
+    private LinearLayout alerts;
     private StickPadView padL, padR;
     private DialBarView dialL, dialR;
-    private final TextView[] lamps = new TextView[Protocol.BUTTONS.length];
-    private Button retry, grant;
-    private View safeRow;
+    private TextView retry, grant;
+    private final GradientDrawable dot = new GradientDrawable();
+    private final TextView[] pills = new TextView[PILL_BUTTONS.length];
+    private final GradientDrawable[] pillBg = new GradientDrawable[PILL_BUTTONS.length];
+    private final int[] lastPresses = new int[PILL_BUTTONS.length];
+    private final boolean[] pressesSeen = new boolean[PILL_BUTTONS.length];
+    private final long[] flashUntil = new long[PILL_BUTTONS.length];
+    private String alertsKey = "";
+    private float density;
     private InputManager inputManager;
     private boolean safe;
     private int pendingStage;              // stage to start once permissions allow; 0 = none
@@ -96,34 +120,48 @@ public class MainActivity extends Activity implements InputManager.InputDeviceLi
         } catch (PackageManager.NameNotFoundException ignored) {
         }
         setContentView(R.layout.activity_main);
+        density = getResources().getDisplayMetrics().density;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         // Not a keyboard (IME) target. On Android 10, joystick MotionEvents are not pointer
         // events, so ViewRootImpl offers them to a bound IME (Gboard on this RC) before the
         // view hierarchy. That was NOT what blocked the gamepad (DJI's framework was, see
         // GamepadInput), but this app has no text input, so the IME is kept out of the path.
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
-        status = findViewById(R.id.status);
-        rfBanner = findViewById(R.id.rf_banner);
-        linkedBanner = findViewById(R.id.linked_banner);
-        diag = findViewById(R.id.diag);
+        dot.setShape(GradientDrawable.OVAL);
+        dot.setColor(C_FAINT);
+        findViewById(R.id.status_dot).setBackground(dot);
+        statusWord = findViewById(R.id.status_word);
+        statusDetail = findViewById(R.id.status_detail);
+        chipNet = findViewById(R.id.chip_net);
+        chipPc = findViewById(R.id.chip_pc);
+        chipBatt = findViewById(R.id.chip_batt);
+        alerts = findViewById(R.id.alerts);
+        srcLabel = findViewById(R.id.src_label);
+        srcMode = findViewById(R.id.src_mode);
+        srcRate = findViewById(R.id.src_rate);
         padL = findViewById(R.id.pad_left);
         padR = findViewById(R.id.pad_right);
         dialL = findViewById(R.id.dial_left);
         dialR = findViewById(R.id.dial_right);
+        details = findViewById(R.id.details);
+        detailsTitle = findViewById(R.id.details_title);
+        diag = findViewById(R.id.diag);
         retry = findViewById(R.id.btn_retry);
         grant = findViewById(R.id.btn_grant);
-        buildLamps();
+        safeRow = findViewById(R.id.safe_row);
+        buildPills();
 
         findViewById(R.id.btn_stop).setOnClickListener(v -> {
             stopService(new Intent(this, StreamService.class));   // sends bye
             finishAndRemoveTask();
         });
+        findViewById(R.id.btn_details).setOnClickListener(v -> showDetails(true));
+        findViewById(R.id.btn_close).setOnClickListener(v -> showDetails(false));
         retry.setOnClickListener(v -> {
             StreamService s = StreamService.instance;
             if (s != null) s.retryRegistration();
         });
         grant.setOnClickListener(v -> ensurePermissionsThenStart());
-        safeRow = findViewById(R.id.safe_row);
         findViewById(R.id.btn_stage1).setOnClickListener(v -> requestStage(StreamService.STAGE_SERVICE));
         findViewById(R.id.btn_stage2).setOnClickListener(v -> requestStage(StreamService.STAGE_SDK));
         findViewById(R.id.btn_stage3).setOnClickListener(v -> requestStage(StreamService.STAGE_FULL));
@@ -135,6 +173,7 @@ public class MainActivity extends Activity implements InputManager.InputDeviceLi
         });
         inputManager = (InputManager) getSystemService(INPUT_SERVICE);
         loadReports();
+        showDetails(safe);                      // safe mode: the report is the point
         if (safe) {
             ensurePermissionsThenStart();       // asks for permissions, starts nothing
         } else {
@@ -161,6 +200,15 @@ public class MainActivity extends Activity implements InputManager.InputDeviceLi
         inputManager.unregisterInputDeviceListener(this);
         GamepadInput.INSTANCE.focus(false);     // the gamepad goes elsewhere now: back to MSDK
         super.onPause();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (details.getVisibility() == View.VISIBLE) {
+            showDetails(false);
+            return;
+        }
+        super.onBackPressed();
     }
 
     // --- permissions + service ------------------------------------------------------
@@ -221,21 +269,42 @@ public class MainActivity extends Activity implements InputManager.InputDeviceLi
 
     // --- rendering ------------------------------------------------------------------
 
-    private void buildLamps() {
-        LinearLayout row1 = findViewById(R.id.lamps_row1);
-        LinearLayout row2 = findViewById(R.id.lamps_row2);
-        float d = getResources().getDisplayMetrics().density;
-        for (int i = 0; i < lamps.length; i++) {
+    private int dp(float v) {
+        return Math.round(v * density);
+    }
+
+    private void buildPills() {
+        LinearLayout row = findViewById(R.id.buttons);
+        for (int i = 0; i < pills.length; i++) {
             TextView t = new TextView(this);
+            t.setText(Protocol.BUTTONS[PILL_BUTTONS[i]].toUpperCase(Locale.US));
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+            t.setLetterSpacing(0.08f);
             t.setGravity(Gravity.CENTER);
-            t.setTextSize(11);
-            t.setPadding(0, (int) (3 * d), 0, (int) (3 * d));
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
-                    LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-            lp.setMargins((int) (2 * d), (int) (2 * d), (int) (2 * d), (int) (2 * d));
-            (i < 7 ? row1 : row2).addView(t, lp);
-            lamps[i] = t;
+            t.setMinWidth(dp(52));
+            t.setPadding(dp(14), dp(6), dp(14), dp(6));
+            GradientDrawable bg = new GradientDrawable();
+            bg.setCornerRadius(dp(14));
+            t.setBackground(bg);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.setMargins(dp(5), 0, dp(5), 0);
+            row.addView(t, lp);
+            pills[i] = t;
+            pillBg[i] = bg;
+            stylePill(i, false);
         }
+    }
+
+    private void stylePill(int i, boolean lit) {
+        pillBg[i].setColor(lit ? C_ACCENT : C_SURFACE_HI);
+        pills[i].setTextColor(lit ? 0xFF0B0E13 : C_DIM);
+    }
+
+    private void showDetails(boolean show) {
+        details.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (show) lastDiag = 0;                 // fill it on the next tick, not in 0.5 s
     }
 
     private final Runnable refresh = new Runnable() {
@@ -304,22 +373,33 @@ public class MainActivity extends Activity implements InputManager.InputDeviceLi
                 lastUiError = msg;
                 CrashLog.error("UI render", e);
             }
-            bar(C_BAD, "UI error: " + msg);
+            state(C_BAD, "UI ERROR", msg);
         }
     }
 
     private void render() {
         long now = SystemClock.elapsedRealtime();
-        String app = getString(R.string.app_name) + " " + version + (safe ? "   SAFE MODE" : "");
+        detailsTitle.setText(getString(R.string.app_name) + " " + version
+                + (safe ? "  ·  SAFE MODE" : "") + "  ·  diagnostics");
         safeRow.setVisibility(safe ? View.VISIBLE : View.GONE);
+        boolean detailsDue = details.getVisibility() == View.VISIBLE && now - lastDiag >= 500;
         StreamService svc = StreamService.instance;
         if (svc == null) {
             List<String> miss = missing();
-            bar(safe ? C_WAIT : C_IDLE, app + "   " + (!miss.isEmpty() ? "permissions missing: " + miss
-                    : safe ? "nothing started - use the stage buttons"
-                    : "starting the stream service..."));
+            if (!miss.isEmpty()) state(C_WARN, "PERMISSIONS", "missing: " + join(miss));
+            else if (safe) state(C_WARN, "SAFE MODE", "nothing started · the stage buttons are in Details");
+            else state(C_FAINT, "STARTING", "starting the stream service");
             grant.setVisibility(miss.isEmpty() ? View.GONE : View.VISIBLE);
-            if (now - lastDiag >= 500) {
+            retry.setVisibility(View.GONE);
+            chips(null, Collections.<UdpStreamServer.Subscriber>emptyList(), null);
+            source(null);
+            padL.set("LEFT", null, null);
+            padR.set("RIGHT", null, null);
+            dialL.set(null);
+            dialR.set(null);
+            for (int i = 0; i < pills.length; i++) pills[i].setVisibility(View.GONE);
+            setAlerts(Collections.<Alert>emptyList());
+            if (detailsDue) {
                 lastDiag = now;
                 diag.setText(reportText() + "(the stream service is not running)\n\n"
                         + "THIS RUN, last steps\n" + CrashLog.recent(15));
@@ -331,42 +411,35 @@ public class MainActivity extends Activity implements InputManager.InputDeviceLi
         UdpStreamServer srv = svc.server();
         List<UdpStreamServer.Subscriber> subs = srv != null ? srv.subscribers()
                 : Collections.<UdpStreamServer.Subscriber>emptyList();
+        GamepadInput.Reading g = s.gamepad;
 
         padL.set("LEFT", s.sticks[0], s.sticks[1]);
         padR.set("RIGHT", s.sticks[2], s.sticks[3]);
-        dialL.set("left dial", s.dials[0]);
-        dialR.set("right dial", s.dials[1]);
-        for (int i = 0; i < lamps.length; i++) lamp(lamps[i], Protocol.BUTTONS[i], s.buttons[i], s.presses[i]);
-        linkedBanner.setVisibility(s.aircraftLinked ? View.VISIBLE : View.GONE);
-        if (s.aircraftLinked) linkedBanner.setText(getString(R.string.linked_banner, s.linkReason));
+        dialL.set(s.dials[0]);
+        dialR.set(s.dials[1]);
+        source(s);
+        pills(s, now);
 
-        List<String> warn = svc.rf().warnings();
-        rfBanner.setVisibility(warn.isEmpty() ? View.GONE : View.VISIBLE);
-        if (!warn.isEmpty()) {
-            rfBanner.setText("RF: " + join(warn) + "  -  switch it off (Settings; Location > "
-                    + "Wi-Fi and Bluetooth scanning)");
-        }
-
-        String eth = svc.ethIp();
-        String head = app + "   " + (eth == null ? "no Ethernet IP" : eth) + ":" + Protocol.PORT + "   ";
         String reason = s.notOkReason();
         if (svc.serverError != null) {
-            bar(C_BAD, head + svc.serverError);
+            state(C_BAD, "ERROR", svc.serverError);
         } else if (!svc.sdkRegistered) {
-            bar(svc.sdkFailed ? C_BAD : C_WAIT, head + svc.sdkStatus);
+            state(svc.sdkFailed ? C_BAD : C_WARN, svc.sdkFailed ? "SDK FAILED" : "STARTING", svc.sdkStatus);
         } else if (reason != null) {
-            bar(C_BAD, head + "NOT OK - " + reason);
+            state(C_BAD, s.aircraftLinked ? "BLOCKED" : "NOT OK", reason);
         } else if (subs.isEmpty()) {
-            bar(C_WAIT, head + "READY - no PC subscribed - " + sourceText(s));
+            state(C_WARN, "READY", "waiting for the PC");
         } else if (s.slowReason() != null) {
-            // Streaming, but degraded: the PC gets ~10 Hz sticks. Amber, with the reason.
-            bar(C_WAIT, head + "STREAMING to " + subs.size() + " @ " + srv.currentRate + " Hz - "
-                    + sourceText(s));
+            state(C_WARN, "STREAMING", "sticks via MSDK, ~10 Hz · " + s.slowReason());
+        } else if (slowMode(g)) {
+            state(C_WARN, "STREAMING", "gamepad in slow mode (~10 reports/s) · reboot the RC");
         } else {
-            bar(C_OK, head + "STREAMING to " + subs.size() + " @ " + srv.currentRate + " Hz - "
-                    + sourceText(s));
+            state(C_OK, "STREAMING", srv.currentRate + " Hz to "
+                    + (subs.size() == 1 ? "1 PC" : subs.size() + " PCs"));
         }
         retry.setVisibility(svc.sdkFailed ? View.VISIBLE : View.GONE);
+        chips(svc.ethIp(), subs, s.batteryPct);
+        setAlerts(alertsFor(svc, s, g));
 
         if (now - lastRateAt >= 1000) {
             double dt = lastRateAt == 0 ? 0 : (now - lastRateAt) / 1000.0;
@@ -377,11 +450,166 @@ public class MainActivity extends Activity implements InputManager.InputDeviceLi
             }
             lastRateAt = now;
         }
-        if (now - lastDiag >= 500) {
+        if (detailsDue) {
             lastDiag = now;
             diag.setText(reportText() + diagText(svc, s, srv, subs, now));
         }
     }
+
+    private void state(int color, String word, String detail) {
+        dot.setColor(color);
+        statusWord.setText(word);
+        statusWord.setTextColor(color == C_FAINT ? C_DIM : color);
+        statusDetail.setText(detail == null ? "" : detail);
+    }
+
+    private void chips(String eth, List<UdpStreamServer.Subscriber> subs, Integer battery) {
+        chipNet.setText(eth == null ? "No Ethernet" : eth);
+        chipNet.setTextColor(eth == null ? C_BAD : C_DIM);
+        chipPc.setText(subs.isEmpty() ? "No PC" : subs.size() == 1 ? "1 PC" : subs.size() + " PCs");
+        chipPc.setTextColor(subs.isEmpty() ? C_FAINT : C_OK);
+        chipBatt.setVisibility(battery == null ? View.GONE : View.VISIBLE);
+        if (battery != null) {
+            chipBatt.setText(battery + "%");
+            chipBatt.setTextColor(battery < BATTERY_LOW_PCT ? C_BAD : C_DIM);
+        }
+    }
+
+    /** Which source the sticks come from, and for the gamepad, its report mode and rate. */
+    private void source(RcInputReader.Snapshot s) {
+        if (s == null) {
+            srcLabel.setText("");
+            srcMode.setText("—");
+            srcMode.setTextColor(C_FAINT);
+            srcRate.setText("");
+            return;
+        }
+        GamepadInput.Reading g = s.gamepad;
+        if ("gamepad".equals(s.stickSrc) && g != null) {
+            srcLabel.setText("GAMEPAD");
+            if (g.gapMs >= 0 && g.gapMs <= 30) {
+                srcMode.setText("FAST");
+                srcMode.setTextColor(C_OK);
+            } else if (g.gapMs >= 70) {
+                srcMode.setText("SLOW");
+                srcMode.setTextColor(C_WARN);
+            } else {
+                srcMode.setText("—");               // no moving gaps measured yet
+                srcMode.setTextColor(C_DIM);
+            }
+            srcRate.setText(g.hz > 0 ? g.hz + " reports/s" : "idle");
+        } else {
+            srcLabel.setText("MSDK");
+            srcMode.setText("10 Hz");
+            srcMode.setTextColor(C_WARN);
+            String why = s.slowReason();
+            srcRate.setText(why == null ? "" : why.equals("no gamepad report yet")
+                    ? "move a stick for the gamepad" : why);
+        }
+    }
+
+    /** The gamepad path is live but the virtual joystick reports ~100 ms apart (README). */
+    private static boolean slowMode(GamepadInput.Reading g) {
+        return g != null && g.usable && g.gapMs >= 70;
+    }
+
+    private void pills(RcInputReader.Snapshot s, long now) {
+        for (int i = 0; i < pills.length; i++) {
+            int b = PILL_BUTTONS[i];
+            Boolean down = s.buttons[b];
+            if (down == null) {                 // not served by this RC
+                pills[i].setVisibility(View.GONE);
+                continue;
+            }
+            pills[i].setVisibility(View.VISIBLE);
+            int presses = s.presses[b];
+            if (pressesSeen[i] && presses > lastPresses[i]) flashUntil[i] = now + PRESS_FLASH_MS;
+            lastPresses[i] = presses;
+            pressesSeen[i] = true;
+            stylePill(i, down || now < flashUntil[i]);
+        }
+    }
+
+    // --- alerts ---------------------------------------------------------------------
+
+    private static final class Alert {
+        final int color;
+        final boolean big;
+        final String text;
+
+        Alert(int color, boolean big, String text) {
+            this.color = color;
+            this.big = big;
+            this.text = text;
+        }
+    }
+
+    /** What the operator must act on; empty in normal operation. */
+    private List<Alert> alertsFor(StreamService svc, RcInputReader.Snapshot s, GamepadInput.Reading g) {
+        List<Alert> out = new ArrayList<>();
+        if (s.aircraftLinked) {
+            out.add(new Alert(C_BAD, true, getString(R.string.linked_banner, s.linkReason)));
+        }
+        List<String> rf = svc.rf().warnings();
+        if (!rf.isEmpty()) {
+            out.add(new Alert(C_BAD, false, "Radio on: " + join(rf)
+                    + " · switch off in Settings (and Location → Wi-Fi and Bluetooth scanning)"));
+        }
+        // 2026-09-28: DJI Fly, started by the home screen at boot, took the RC link from
+        // MSDK every few seconds. Swiping it away restarts it; a force-stop keeps it down.
+        if (svc.sdkRegistered && s.running && !s.aircraftLinked && !Boolean.TRUE.equals(s.rcConnected)) {
+            out.add(new Alert(C_WARN, false, "MSDK has lost the RC. If DJI Fly is running, force-stop it:"
+                    + " Settings → Apps → DJI Fly → Force stop (swiping it away restarts it)."));
+        }
+        if (g != null && Boolean.FALSE.equals(Protocol.gate(g))) {
+            out.add(new Alert(C_WARN, false, "DJI's gamepad gate is closed · run enable-gamepad.ps1"
+                    + " (until then the sticks come from MSDK, ~10 Hz)"));
+        }
+        if (g != null) {
+            StringBuilder inv = new StringBuilder();
+            for (int i = 0; i < GamepadInput.AXES.length; i++) {
+                if (g.check[i] == GamepadInput.CHECK_INVERTED) {
+                    inv.append(inv.length() > 0 ? ", " : "").append(GamepadInput.AXES[i]);
+                }
+            }
+            if (inv.length() > 0) {
+                out.add(new Alert(C_BAD, false, "MSDK reads " + inv + " inverted against the gamepad"
+                        + " · withheld on the MSDK path"));
+            }
+        }
+        if (s.batteryPct != null && s.batteryPct < BATTERY_LOW_PCT) {
+            out.add(new Alert(C_WARN, false, "RC battery " + s.batteryPct + "%"));
+        }
+        return out;
+    }
+
+    private void setAlerts(List<Alert> list) {
+        StringBuilder key = new StringBuilder();
+        for (Alert a : list) key.append(a.color).append(a.text).append('\n');
+        if (key.toString().equals(alertsKey)) return;
+        alertsKey = key.toString();
+        alerts.removeAllViews();
+        for (Alert a : list) {
+            TextView t = new TextView(this);
+            t.setText(a.text);
+            t.setTextColor(a.color);
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, a.big ? 15 : 13);
+            if (a.big) t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+            t.setPadding(dp(14), dp(a.big ? 10 : 7), dp(14), dp(a.big ? 10 : 7));
+            GradientDrawable bg = new GradientDrawable();
+            bg.setCornerRadius(dp(12));
+            bg.setColor((a.color & 0x00FFFFFF) | 0x1F000000);
+            bg.setStroke(dp(1), (a.color & 0x00FFFFFF) | 0x59000000);
+            t.setBackground(bg);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.bottomMargin = dp(6);
+            alerts.addView(t, lp);
+        }
+        alerts.setVisibility(list.isEmpty() ? View.GONE : View.VISIBLE);
+    }
+
+    // --- details ---------------------------------------------------------------------
 
     /** The crash report and, in safe mode, where the previous run stopped. Empty when clean. */
     private String reportText() {
@@ -406,25 +634,6 @@ public class MainActivity extends Activity implements InputManager.InputDeviceLi
         return b.toString();
     }
 
-    private void bar(int color, String text) {
-        status.setBackgroundColor(color);
-        status.setText(text);
-    }
-
-    private static void lamp(TextView t, String name, Boolean down, int presses) {
-        t.setText(name + "\n" + (down == null ? "n/a" : String.valueOf(presses)));
-        if (down == null) {                 // not served by this RC
-            t.setBackgroundColor(0xFF1C2429);
-            t.setTextColor(0xFF546E7A);
-        } else if (down) {
-            t.setBackgroundColor(0xFF2E7D32);
-            t.setTextColor(0xFFFFFFFF);
-        } else {
-            t.setBackgroundColor(0xFF37474F);
-            t.setTextColor(0xFFECEFF1);
-        }
-    }
-
     private String diagText(StreamService svc, RcInputReader.Snapshot s, UdpStreamServer srv,
                             List<UdpStreamServer.Subscriber> subs, long now) {
         StringBuilder b = new StringBuilder();
@@ -438,6 +647,8 @@ public class MainActivity extends Activity implements InputManager.InputDeviceLi
                 : "not linked (product connected alone is the RC itself on an RC Pro)"));
         b.append(String.format(Locale.US, "rc_ok   %s%s%n", s.rcOk,
                 s.rcOk ? "" : "  (" + s.notOkReason() + ")"));
+        b.append("WIRE    ").append(wireText(s.sticks, s.dials)).append("   (what the PC gets)\n");
+        b.append("BUTTONS ").append(buttonsText(s)).append('\n');
         GamepadInput.Reading g = s.gamepad;
         if (g != null) {
             b.append(String.format(Locale.US, "STICKS  from %s | gamepad %d reports/s, %s, last %s | focus %s | DJI gate: %s%n",
@@ -460,8 +671,8 @@ public class MainActivity extends Activity implements InputManager.InputDeviceLi
         b.append(String.format(Locale.US, "RF      wifi %s  wifi_scan %s  bt %s  ble_scan %s  airplane %s%n",
                 rf.wifi, rf.wifiScan, rf.bt, rf.bleScan, rf.airplane));
         if (srv != null) {
-            b.append(String.format(Locale.US, "STREAM  :%d  rx %d  tx %d  rejected %d  rate %d Hz%s%n",
-                    Protocol.PORT, srv.rxPackets, srv.txPackets, srv.rejected, srv.currentRate,
+            b.append(String.format(Locale.US, "STREAM  %s:%d  rx %d  tx %d  rejected %d  rate %d Hz%s%n",
+                    svc.ethIp(), Protocol.PORT, srv.rxPackets, srv.txPackets, srv.rejected, srv.currentRate,
                     srv.lastError == null ? "" : "  last error: " + srv.lastError));
         }
         b.append("SUBSCRIBERS").append(subs.isEmpty() ? "  none\n" : "\n");
@@ -486,6 +697,17 @@ public class MainActivity extends Activity implements InputManager.InputDeviceLi
         if (err != null) b.append("last non-fatal error: ").append(err).append('\n');
         b.append(CrashLog.build()).append('\n');
         return b.toString();
+    }
+
+    /** Every button: level and press count, n/a when this RC does not serve it. */
+    private static String buttonsText(RcInputReader.Snapshot s) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < Protocol.BUTTONS.length; i++) {
+            Boolean down = s.buttons[i];
+            b.append(Protocol.BUTTONS[i]).append(' ')
+                    .append(down == null ? "n/a" : (down ? "DOWN" : "up") + "/" + s.presses[i]).append("  ");
+        }
+        return b.toString().trim();
     }
 
     private static String sourceText(RcInputReader.Snapshot s) {

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- One dark palette for the whole screen; MainActivity uses the same values. -->
+    <color name="bg">#FF0B0E13</color>
+    <color name="surface">#FF12161D</color>
+    <color name="surface_hi">#FF1A2029</color>
+    <color name="line">#FF262D38</color>
+    <color name="text">#FFE6EDF3</color>
+    <color name="text_dim">#FF8B949E</color>
+    <color name="text_faint">#FF545D68</color>
+    <color name="ok">#FF3FB950</color>
+    <color name="warn">#FFD29922</color>
+    <color name="bad">#FFF85149</color>
+    <color name="accent">#FF58A6FF</color>
+</resources>

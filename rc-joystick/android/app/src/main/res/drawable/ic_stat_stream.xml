@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar icon: a classic joystick silhouette (ball, stick, base), which reads at
+     24 dp where the launcher's two gates do not. White; Android tints it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5,16.5h14a1.5,1.5 0,0 1,1.5 1.5v1.5a1.5,1.5 0,0 1,-1.5 1.5h-14a1.5,1.5 0,0 1,-1.5 -1.5v-1.5a1.5,1.5 0,0 1,1.5 -1.5z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M11,10h2v6.5h-2z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M8.6,7.2a3.4,3.4 0,1 0,6.8 0a3.4,3.4 0,1 0,-6.8 0" />
+</vector>

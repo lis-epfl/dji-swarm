@@ -1,12 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">LIS_CONTROLLER</string>
-    <string name="stop_exit">Stop &amp; exit</string>
-    <string name="retry_sdk">Retry SDK registration</string>
+    <string name="stop_exit">Stop</string>
+    <string name="open_details">Details</string>
+    <string name="close">Close</string>
+    <string name="retry_sdk">Retry registration</string>
     <string name="grant">Grant permissions</string>
-    <string name="stage1">1: stream only</string>
-    <string name="stage2">2: + MSDK</string>
-    <string name="stage3">3: + keys</string>
-    <string name="clear_start">Clear report &amp; normal start</string>
-    <string name="linked_banner">AIRCRAFT LINKED - STREAM BLOCKED (%1$s). This RC\'s sticks are flying that aircraft: power it off, and re-pair it to its own RC.</string>
+    <string name="stage1">1 · stream only</string>
+    <string name="stage2">2 · + MSDK</string>
+    <string name="stage3">3 · + keys</string>
+    <string name="clear_start">Clear report &amp; start</string>
+    <string name="linked_banner">AIRCRAFT LINKED · stream blocked. This RC\'s sticks are flying that aircraft: power it off and re-pair it to its own RC. (%1$s)</string>
 </resources>

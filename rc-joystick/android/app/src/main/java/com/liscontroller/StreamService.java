@@ -409,7 +409,7 @@ public class StreamService extends Service implements UdpStreamServer.InfoSource
         Notification n = new Notification.Builder(this, CHANNEL)
                 .setContentTitle(getString(R.string.app_name))
                 .setContentText("Streaming RC inputs on UDP :" + Protocol.PORT)
-                .setSmallIcon(R.drawable.ic_launcher)
+                .setSmallIcon(R.drawable.ic_stat_stream)
                 .setContentIntent(open)
                 .setOngoing(true)
                 .build();

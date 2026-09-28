@@ -1,6 +1,6 @@
-// Mirrors lis-swarm-app/build.gradle (known-good with MSDK 5.3.0). No gradlew is
-// committed: build with the local Gradle 8.11.1 dist and the Android Studio JBR
-// (see rc-joystick/README.md).
+// Mirrors lis-swarm-app/build.gradle (known-good with MSDK 5.3.0). The committed gradlew
+// pins Gradle 9.0.0, which this build has never been tried with: build with the local
+// Gradle 8.11.1 dist and the Android Studio JBR (see rc-joystick/README.md).
 buildscript {
     repositories {
         google()

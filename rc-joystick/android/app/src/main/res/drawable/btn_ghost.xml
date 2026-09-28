@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A quiet outlined button: Details, Close. -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#26FFFFFF">
+    <item>
+        <shape android:shape="rectangle">
+            <corners android:radius="18dp" />
+            <solid android:color="@color/surface" />
+            <stroke
+                android:width="1dp"
+                android:color="@color/line" />
+        </shape>
+    </item>
+</ripple>

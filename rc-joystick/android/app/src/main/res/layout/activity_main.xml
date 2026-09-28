@@ -1,206 +1,307 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- The operator's screen: one status line, the sticks and dials, and alerts only when
+     something needs doing. Everything diagnostic lives behind Details. -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#FF101418">
+    android:background="@color/bg">
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:orientation="vertical">
+        android:orientation="vertical"
+        android:paddingStart="22dp"
+        android:paddingTop="14dp"
+        android:paddingEnd="22dp"
+        android:paddingBottom="12dp">
 
-        <TextView
-            android:id="@+id/status"
+        <!-- Header: state, why, and where the stream goes. -->
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:background="#FF37474F"
-            android:padding="8dp"
-            android:text="@string/app_name"
-            android:textColor="#FFFFFFFF"
-            android:textSize="17sp"
-            android:textStyle="bold" />
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
 
-        <TextView
-            android:id="@+id/rf_banner"
+            <View
+                android:id="@+id/status_dot"
+                android:layout_width="10dp"
+                android:layout_height="10dp" />
+
+            <TextView
+                android:id="@+id/status_word"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:fontFamily="sans-serif-medium"
+                android:letterSpacing="0.08"
+                android:textColor="@color/text"
+                android:textSize="19sp" />
+
+            <TextView
+                android:id="@+id/status_detail"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="14dp"
+                android:layout_weight="1"
+                android:ellipsize="end"
+                android:singleLine="true"
+                android:textColor="@color/text_dim"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/chip_net"
+                style="@style/Chip" />
+
+            <TextView
+                android:id="@+id/chip_pc"
+                style="@style/Chip"
+                android:layout_marginStart="8dp" />
+
+            <TextView
+                android:id="@+id/chip_batt"
+                style="@style/Chip"
+                android:layout_marginStart="8dp" />
+        </LinearLayout>
+
+        <!-- Alerts: empty (gone) in normal operation. -->
+        <LinearLayout
+            android:id="@+id/alerts"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:background="#FFC62828"
-            android:padding="6dp"
-            android:textColor="#FFFFFFFF"
-            android:textSize="14sp"
-            android:textStyle="bold"
+            android:layout_marginTop="10dp"
+            android:orientation="vertical"
             android:visibility="gone" />
 
-        <!-- A banner, not a full-screen overlay: the diagnostics that say WHY must stay
-             readable (1.1's overlay hid them). -->
-        <TextView
-            android:id="@+id/linked_banner"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:background="#FFB71C1C"
-            android:padding="8dp"
-            android:textColor="#FFFFFFFF"
-            android:textSize="16sp"
-            android:textStyle="bold"
-            android:visibility="gone" />
-
+        <!-- Instruments: left stick and dial, the source readout, right stick and dial. -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="0dp"
+            android:layout_marginTop="6dp"
             android:layout_weight="1"
+            android:gravity="center"
             android:orientation="horizontal">
 
             <LinearLayout
                 android:layout_width="0dp"
                 android:layout_height="match_parent"
                 android:layout_weight="1"
-                android:orientation="vertical"
-                android:padding="6dp">
+                android:gravity="center"
+                android:orientation="vertical">
 
-                <LinearLayout
+                <com.liscontroller.StickPadView
+                    android:id="@+id/pad_left"
                     android:layout_width="match_parent"
                     android:layout_height="0dp"
-                    android:layout_weight="1"
-                    android:orientation="horizontal">
+                    android:layout_weight="1" />
 
-                    <com.liscontroller.StickPadView
-                        android:id="@+id/pad_left"
-                        android:layout_width="0dp"
-                        android:layout_height="match_parent"
-                        android:layout_weight="1" />
-
-                    <com.liscontroller.StickPadView
-                        android:id="@+id/pad_right"
-                        android:layout_width="0dp"
-                        android:layout_height="match_parent"
-                        android:layout_weight="1" />
-                </LinearLayout>
-
-                <LinearLayout
+                <com.liscontroller.DialBarView
+                    android:id="@+id/dial_left"
                     android:layout_width="match_parent"
-                    android:layout_height="30dp"
-                    android:layout_marginTop="4dp"
-                    android:orientation="horizontal">
-
-                    <com.liscontroller.DialBarView
-                        android:id="@+id/dial_left"
-                        android:layout_width="0dp"
-                        android:layout_height="match_parent"
-                        android:layout_marginEnd="4dp"
-                        android:layout_weight="1" />
-
-                    <com.liscontroller.DialBarView
-                        android:id="@+id/dial_right"
-                        android:layout_width="0dp"
-                        android:layout_height="match_parent"
-                        android:layout_marginStart="4dp"
-                        android:layout_weight="1" />
-                </LinearLayout>
-
-                <LinearLayout
-                    android:id="@+id/lamps_row1"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:orientation="horizontal" />
-
-                <LinearLayout
-                    android:id="@+id/lamps_row2"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="horizontal" />
-
-                <!-- Safe mode only: start the service one stage at a time to find the one
-                     that crashes (DEBUGGING.md). -->
-                <LinearLayout
-                    android:id="@+id/safe_row"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:background="#FF4E342E"
-                    android:orientation="horizontal"
-                    android:visibility="gone">
-
-                    <Button
-                        android:id="@+id/btn_stage1"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="@string/stage1"
-                        android:textSize="11sp" />
-
-                    <Button
-                        android:id="@+id/btn_stage2"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="@string/stage2"
-                        android:textSize="11sp" />
-
-                    <Button
-                        android:id="@+id/btn_stage3"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="@string/stage3"
-                        android:textSize="11sp" />
-
-                    <Button
-                        android:id="@+id/btn_clear"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1.3"
-                        android:text="@string/clear_start"
-                        android:textSize="11sp" />
-                </LinearLayout>
-
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:orientation="horizontal">
-
-                    <Button
-                        android:id="@+id/btn_grant"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="@string/grant"
-                        android:visibility="gone" />
-
-                    <Button
-                        android:id="@+id/btn_retry"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="@string/retry_sdk"
-                        android:visibility="gone" />
-
-                    <Button
-                        android:id="@+id/btn_stop"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="@string/stop_exit" />
-                </LinearLayout>
+                    android:layout_height="26dp"
+                    android:layout_marginStart="28dp"
+                    android:layout_marginTop="6dp"
+                    android:layout_marginEnd="28dp" />
             </LinearLayout>
 
-            <ScrollView
-                android:layout_width="0dp"
+            <LinearLayout
+                android:layout_width="190dp"
                 android:layout_height="match_parent"
-                android:layout_weight="1.25"
-                android:background="#FF0B0F12">
+                android:gravity="center"
+                android:orientation="vertical">
 
                 <TextView
-                    android:id="@+id/diag"
-                    android:layout_width="match_parent"
+                    android:id="@+id/src_label"
+                    android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:fontFamily="monospace"
-                    android:padding="6dp"
-                    android:textColor="#FFCFD8DC"
-                    android:textIsSelectable="false"
-                    android:textSize="10sp" />
-            </ScrollView>
+                    android:fontFamily="sans-serif-medium"
+                    android:letterSpacing="0.18"
+                    android:textColor="@color/text_faint"
+                    android:textSize="11sp" />
+
+                <TextView
+                    android:id="@+id/src_mode"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:fontFamily="sans-serif-medium"
+                    android:letterSpacing="0.04"
+                    android:textColor="@color/text"
+                    android:textSize="30sp" />
+
+                <TextView
+                    android:id="@+id/src_rate"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:gravity="center"
+                    android:textColor="@color/text_dim"
+                    android:textSize="13sp" />
+
+                <LinearLayout
+                    android:id="@+id/buttons"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="22dp"
+                    android:gravity="center"
+                    android:orientation="horizontal" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:gravity="center"
+                android:orientation="vertical">
+
+                <com.liscontroller.StickPadView
+                    android:id="@+id/pad_right"
+                    android:layout_width="match_parent"
+                    android:layout_height="0dp"
+                    android:layout_weight="1" />
+
+                <com.liscontroller.DialBarView
+                    android:id="@+id/dial_right"
+                    android:layout_width="match_parent"
+                    android:layout_height="26dp"
+                    android:layout_marginStart="28dp"
+                    android:layout_marginTop="6dp"
+                    android:layout_marginEnd="28dp" />
+            </LinearLayout>
         </LinearLayout>
+
+        <!-- Footer. -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/btn_details"
+                style="@style/Pill"
+                android:text="@string/open_details" />
+
+            <View
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <TextView
+                android:id="@+id/btn_grant"
+                style="@style/Pill"
+                android:background="@drawable/btn_primary"
+                android:text="@string/grant"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/btn_retry"
+                style="@style/Pill"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/btn_primary"
+                android:text="@string/retry_sdk"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/btn_stop"
+                style="@style/Pill"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/btn_danger"
+                android:text="@string/stop_exit"
+                android:textColor="@color/bad" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- Details: every diagnostic the bench and DEBUGGING.md use, over the main screen.
+         Opens by itself in safe mode, where it also carries the stage buttons. -->
+    <LinearLayout
+        android:id="@+id/details"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#F80B0E13"
+        android:clickable="true"
+        android:focusable="false"
+        android:orientation="vertical"
+        android:paddingStart="22dp"
+        android:paddingTop="14dp"
+        android:paddingEnd="22dp"
+        android:paddingBottom="12dp"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/details_title"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:fontFamily="sans-serif-medium"
+                android:textColor="@color/text"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/btn_close"
+                style="@style/Pill"
+                android:text="@string/close" />
+        </LinearLayout>
+
+        <!-- Safe mode only: start the service one stage at a time to find the one that
+             crashes (DEBUGGING.md). -->
+        <LinearLayout
+            android:id="@+id/safe_row"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/btn_stage1"
+                style="@style/Pill"
+                android:text="@string/stage1" />
+
+            <TextView
+                android:id="@+id/btn_stage2"
+                style="@style/Pill"
+                android:layout_marginStart="8dp"
+                android:text="@string/stage2" />
+
+            <TextView
+                android:id="@+id/btn_stage3"
+                style="@style/Pill"
+                android:layout_marginStart="8dp"
+                android:text="@string/stage3" />
+
+            <TextView
+                android:id="@+id/btn_clear"
+                style="@style/Pill"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/btn_primary"
+                android:text="@string/clear_start" />
+        </LinearLayout>
+
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_marginTop="10dp"
+            android:layout_weight="1"
+            android:background="@drawable/chip_bg"
+            android:fadeScrollbars="false">
+
+            <TextView
+                android:id="@+id/diag"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:lineSpacingExtra="1dp"
+                android:padding="12dp"
+                android:textColor="@color/text_dim"
+                android:textIsSelectable="false"
+                android:textSize="10.5sp" />
+        </ScrollView>
     </LinearLayout>
 </FrameLayout>
