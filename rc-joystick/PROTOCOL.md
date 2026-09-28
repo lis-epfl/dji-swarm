@@ -69,7 +69,7 @@ than button levels.
 
 | field | meaning |
 |---|---|
-| `seq` | +1 per state tick; the same value goes to every subscriber. It restarts at 0 when the app starts. |
+| `seq` | +1 per state **tick**, not per input sample; the same value goes to every subscriber. It restarts at 0 when the app starts. A tick carries whatever input is current, so consecutive states can repeat one sample, and a sample replaced before the next tick is never sent. |
 | `t_ms` | the RC's monotonic clock (`SystemClock.elapsedRealtime`); for diagnostics only |
 | `rc_ok` | `true` only when **all** of: MSDK reports the RC connected (`RemoteControllerKey.KeyConnection`); `aircraft_linked` is false; and a read-only async `getValue` of the RC succeeded within the last 500 ms. That last one is liveness: change-driven listeners are silent while a stick is held still. Which keys the firmware answers asynchronously is not documented, and on the RC Pro `KeyConnection`'s read was rejected. So the app tries candidates in order (`KeyConnection`, `KeySerialNumber`, `KeyBatteryInfo`, `KeyStickLeftHorizontal`) and keeps the first that answers. If **none** ever answers, liveness is dropped, and `KeyConnection` alone decides (the app's screen and trace say so). |
 | `aircraft_linked` | This RC's sticks are flying an aircraft right now: `FlightControllerKey.KeyConnection` is true, **or** the product is connected **and** its type names an actual aircraft. **Not** `ProductKey.KeyConnection` alone: on an RC Pro with no aircraft at all, MSDK reports the RC's own link as a connected product of type `UNRECOGNIZED` (`onProductConnect(0)`, seen 2026-09-25). It forces `rc_ok = false`, and the PC must treat it as **blocked**, never as input. |
@@ -127,3 +127,9 @@ The PC goes stale at once instead of waiting for its timeout.
   (neutral sticks for 3 s, then auto-STOP) see the truth.
 - After locking onto an RC, the PC accepts `state`, `info` and `bye` **only from that RC's
   `ip:5070`**. Anything else on the LAN is dropped and counted.
+- **Input freshness is measured on the PC, not sent.** v1 has no per-sample counter. A `state`
+  whose `sticks` or `dials` differ from the previous one is **fresh**. The gamepad reports only
+  on change, so while a stick moves the fresh rate is the rate at which input reaches the PC. It
+  is bounded by the tick rate, so measuring the gamepad's ~70/s needs `rate_hz` 100. In practice
+  it tops out at **~60/s** (2026-09-28): the RC's Android hands joystick input to the app once per
+  60 Hz screen frame, so two reports in one frame arrive as one.

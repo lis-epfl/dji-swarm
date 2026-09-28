@@ -481,17 +481,38 @@ readController.py's exact JSON on :5055, so no consumer changes. The folder impo
 MSDK 5.3.0 RC key inventory: `rc-joystick/README.md`.
 - `pc/rcjoy/` — **done**: stdlib, Python ≥ 3.7 (`python -m rcjoy selftest|monitor|bridge|fake-rc`,
   run from `rc-joystick/pc`).
+  - It times everything with `time.perf_counter` (`protocol.now`). `time.monotonic` is
+    `GetTickCount64` on Windows, 15.6 ms per tick, which read RTTs as 0 or 15.6 ms.
+  - The monitor's `rx Hz` is only the RC's send clock (the requested `--rate`). The gamepad's rate
+    at the PC is `fresh`: states whose sticks or dials changed, read at `--rate 100`.
+  - `--csv` logs every state and never overwrites a file.
+  - `bridge --profile sim` is for the Unity sim: spacing 0.4–1.6, readController.py's range, because
+    the sim takes `angular.x` unclamped as its `d_ref`. The default flocking profile's 0.6–1.4 is
+    where `swarm_flocking.py` clamps. `--ax-range` overrides either.
+  - Without `--rc`, the bridge and the monitor broadcast, and also unicast to the last RC they locked
+    onto (`%LOCALAPPDATA%\rcjoy\last_rc.txt`). One `--rc` is enough for every later launch, even
+    when the firewall blocks broadcast replies. A loopback `--rc` (fake RC) is never saved.
+  - When several RCs answer, `rcjoy/chooser.py` shows a pop-up with one button per RC. It is
+    PowerShell + WinForms, because this PC's Python 3.7 has no tkinter. The fleet's RCs never
+    answer :5070, so flying the swarm doesn't trigger it.
 - `android/` — the **LIS_CONTROLLER** app, package **`com.liscontroller`**. Its DJI App Key in the
   manifest is bound to that package, so they change together. It is its own Gradle project with
   MSDK 5.3.0 and lis-swarm-app's build config minus Moquette; the build steps are in the README.
   - `StreamService` (foreground) owns MSDK init, the read-only `RcInputReader`, and
-    `UdpStreamServer`. `MainActivity` renders stick pads, lamps and a diagnostics panel, and feeds
-    `GamepadInput` (joystick events reach only the focused window); `RcInputReader.snapshot()`
-    merges the two sources, so the stream, `info` and the screen always agree.
-  - **Version 1.5 runs on the RC Pro** (Android 10, 2026-09-25), and its protocol code, gamepad
-    path included, passes a JVM run against the real `RcJoystickClient`. 1.0 crashed on open (the
-    `sdkclasses.bangcle` gotcha below). 1.1 was the first to run. Two MSDK facts surfaced then
-    that any MSDK code here must respect:
+    `UdpStreamServer`. `MainActivity` renders the screen and feeds `GamepadInput` (joystick events
+    reach only the focused window); `RcInputReader.snapshot()` merges the two sources, so the
+    stream, `info` and the screen always agree.
+    - 1.6's screen is minimal: a status line, chips for the IP, PC link and battery, the stick
+      gates and dial sliders, the stick source and gamepad mode, C1/C2, and alerts only when
+      something needs doing. Every diagnostic is behind **Details**.
+    - An app resource silently replaces a library's of the same name, so check new names against
+      the dependencies' `R.txt` (`DEBUGGING.md` §7). 1.6's `string/details` clashed with MSDK's.
+  - **Version 1.6** (2026-09-28) is 1.5's stream on that screen, with a new icon. 1.5 ran on the
+    RC Pro (Android 10) from 2026-09-25, and **over Ethernet from 2026-09-28**: 100 states/s,
+    0 lost, and the IP stable across a replug. Its protocol code, gamepad path included, passed a
+    JVM run against the real `RcJoystickClient`. 1.0 crashed on open (the `sdkclasses.bangcle`
+    gotcha below). 1.1 was the first to run. Two MSDK facts surfaced then that any MSDK code here
+    must respect:
     - **`ProductKey.KeyConnection` is TRUE on an RC Pro with no aircraft.** MSDK counts the RC's
       own link as product `UNRECOGNIZED` (`onProductConnect(0)`). An aircraft link is
       `FlightControllerKey.KeyConnection`, or a product type naming an aircraft. lis-swarm-app
@@ -512,13 +533,30 @@ MSDK 5.3.0 RC key inventory: `rc-joystick/README.md`.
     app is in front, with MSDK as the witness that it still delivers, the fallback when it
     doesn't, and a sign cross-check that withholds an axis rather than fly it inverted.
     `stick_src` in every `state` says which source is live.
-  - Open: the gamepad also has a **slow mode** (~100 ms between reports, so only MSDK's rate),
-    seen once with MSDK registered, **trigger unknown**. Every trace, `info.gamepad.gap_ms` and
-    the PC monitor record the mode. Also open: Ethernet (S5) and the zero-code RF / idle / pairing
-    checks (README).
+  - **At the PC the gamepad arrives at ~60 fresh samples/s, not ~70.** The RC's screen runs at
+    60 Hz, and Android hands joystick input to the app once per frame. The consumers are 20 Hz, so
+    it costs nothing.
+  - Open: the gamepad's **slow mode** (~100 ms between reports, so only MSDK's rate), **trigger
+    unknown**.
+    - On 2026-09-28 it lasted a whole morning and survived everything but a reboot. Every boot on
+      record came up fast.
+    - Ruled out: Wi-Fi, USB vs Ethernet, charging, battery, DJI's AndroidStatus message, MSDK's
+      connection, force-stops, and DJI Fly (`DEBUGGING.md` §8).
+    - The screen turns amber with "reboot the RC". Check the mode before flying.
+
+    Also open: S5's broadcast discovery, and the zero-code RF / idle / pairing checks (README).
+  - **DJI Fly must not run alongside it.**
+    - The RC's home screen launches DJI Fly at every boot, as the default app of the RC's
+      **role** (`RoleMgr` in `com.dpad.service`).
+    - DJI Fly then takes DJI's single app link to the RC (`dji_link`) from MSDK every ~6 s. That
+      makes `rc_ok` false, and the PC gets no joystick.
+    - Force-stop it in Settings once it is up. A swipe restarts it within 26 ms, and
+      `pm disable-user` does not survive a reboot.
+    - Never change the role to get rid of it: that can factory-reset the RC.
+    - The user keeps DJI Fly installed (2026-09-28).
   - Crash handling: `CrashLog` writes `crash.txt` plus a step `trace.txt` that survives native
     crashes. After a crash the app opens in safe mode, whose stage buttons bisect stream → MSDK →
-    keys. `collect-debug.ps1` gathers it all over USB (`DEBUGGING.md`).
+    keys. `collect-debug.ps1` gathers it all over USB or network adb (`DEBUGGING.md`).
   - The APK was audited against lis-swarm-app's (`DEBUGGING.md` §7): native `DT_NEEDED`,
     SDK dex classes, assets, merged manifest, dependency versions and resource shadowing all
     match. The theme is AppCompat like lis-swarm-app's; keep it so.
