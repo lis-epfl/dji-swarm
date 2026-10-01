@@ -47,7 +47,9 @@ def _args(argv):
                         "= s2. joystick: left (gimbal) dial = angular.x, which "
                         "joystick_controller.py reads as the gimbal. sim: flocking's "
                         "dials with spacing 0.4-1.6, readController.py's range, for the "
-                        "Unity sim (it uses angular.x unclamped as its spread)")
+                        "Unity sim (it uses angular.x unclamped as its spread); there C2 "
+                        "is the experiment's identify mark (a 'marks' count), not a "
+                        "knob reset")
     p.add_argument("--knob-sweep-s", type=float, default=3.0,
                    help="seconds of full dial deflection to sweep a knob's whole "
                         "range (default 3)")

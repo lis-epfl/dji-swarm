@@ -14,10 +14,18 @@ the Unity sim's UDPReceiverManager.cs) runs unchanged:
      "angular": {"x": knob in --ax-range (default [0.6, 1.4]), "y": 0.0, "z": yaw},
      "switches": {"s1": +1|-1 (JSON int), "s2": knob in [-0.999, 0.999]}}
 
+The sim profile adds one field, "marks": a JSON int counting C2 presses since the
+bridge started (see below). JsonUtility ignores it in an older Unity; the AOS
+profiles never send it.
+
 The RC's dials spring back to centre, so each one drives an integrated KNOB. The
 RC Pro has nothing like a Taranis pot. Full deflection sweeps a knob's whole range
 in --knob-sweep-s. C1 toggles s1 (the Unity panorama, like the Taranis click
-switch). C2 puts both knobs back to their start values.
+switch). C2 puts both knobs back to their start values, except in the sim profile,
+where it is the experiment's identify button: a reset there would snap the spread
+and the gimbal at the very moment the pilot reports a target. It is sent as a
+cumulative count rather than a level, as the RC sends it, so a press survives a lost
+or unread datagram; Unity acts on increases.
 
 It sends ONLY while the RC is fresh and usable. Silence then looks exactly like an
 unplugged Taranis, and the swarm's arm gate and dropout failsafe see the truth.
@@ -48,10 +56,11 @@ STICK_MODES = {
 # LAND edge. The joystick profile therefore puts the RC's gimbal dial (the left one)
 # on angular.x. The sim profile is flocking's mapping with the Taranis's spacing range:
 # the Unity sim takes angular.x unclamped as its spread (Olfati-Saber d_ref).
+# `c2` is what C2 does: "reset" the knobs, or "mark" (count it into the "marks" field).
 PROFILES = {
-    "flocking": {"ax_dial": "r", "s2_dial": "l"},
-    "joystick": {"ax_dial": "l", "s2_dial": "r"},
-    "sim": {"ax_dial": "r", "s2_dial": "l", "ax_range": (0.4, 1.6)},
+    "flocking": {"ax_dial": "r", "s2_dial": "l", "c2": "reset"},
+    "joystick": {"ax_dial": "l", "s2_dial": "r", "c2": "reset"},
+    "sim": {"ax_dial": "r", "s2_dial": "l", "c2": "mark", "ax_range": (0.4, 1.6)},
 }
 
 # swarm_flocking.py clamps angular.x to [0.6, 1.4], so the knob stops there by default.
@@ -91,6 +100,8 @@ class Bridge:
         self.sweep = float(knob_sweep_s)
         self.deadband = float(dial_deadband)
         self.ax, self.s2, self.s1 = AX_START, S2_START, 1
+        self.marking = self.dials["c2"] == "mark"
+        self.marks = 0
         self._presses = P.PressCounter()
         self._last_tick = None
         self._fresh = False
@@ -123,7 +134,10 @@ class Bridge:
             if name == "c1" and n % 2:
                 self.s1 = -self.s1
             elif name == "c2":
-                self.reset_knobs()
+                if self.marking:
+                    self.marks += n
+                else:
+                    self.reset_knobs()
 
         d = self._dial(st, self.dials["ax_dial"])
         if d is not None:
@@ -136,7 +150,7 @@ class Bridge:
 
         m = self.sticks
         climb = st.sticks[m["climb"]]
-        return {
+        msg = {
             "linear": {"x": round(st.sticks[m["forward"]], 4),
                        "y": round(st.sticks[m["right"]], 4),
                        # quadratic, exactly like readController.py
@@ -146,6 +160,9 @@ class Bridge:
             # s1 must stay a JSON INT: Unity declares Switches.s1 as int.
             "switches": {"s1": int(self.s1), "s2": round(self.s2, 4)},
         }
+        if self.marking:
+            msg["marks"] = int(self.marks)   # a JSON int: Unity's JoystickData.marks
+        return msg
 
     def run(self, outs, rate_hz=MAX_RATE_HZ, stop_evt=None, verbose=True):
         """Send tick() to every (host, port) in `outs` at rate_hz until stop_evt."""
@@ -156,6 +173,7 @@ class Bridge:
         period = 1.0 / rate_hz
         tty = verbose and sys.stdout.isatty()
         sending, last_status, last_warn = None, 0.0, None
+        marks_shown = self.marks
         next_t = P.now()
         try:
             while not stop_evt.is_set():
@@ -177,6 +195,9 @@ class Bridge:
                         _line("[bridge] SENDING to %s" % _outs_desc(outs) if sending
                               else "[bridge] NOT SENDING - %s"
                               % (self.client.not_ok_reason() or "starting"), tty)
+                    if self.marks != marks_shown:
+                        marks_shown = self.marks
+                        _line("[bridge] C2 mark #%d" % self.marks, tty)
                     warn = self.client.warnings()
                     if warn != last_warn:
                         last_warn = warn
@@ -267,7 +288,8 @@ def main(args):
           "angular.x %g..%g" % (rc, args.port, _outs_desc(outs), args.rate,
                                 args.stick_mode, args.profile, args.knob_sweep_s,
                                 bridge.ax_lo, bridge.ax_hi))
-    print("[bridge] C1 = panorama toggle (s1)   C2 = reset knobs   Ctrl+C = quit")
+    print("[bridge] C1 = panorama toggle (s1)   C2 = %s   Ctrl+C = quit"
+          % ("identify mark (marks)" if bridge.marking else "reset knobs"))
     client.start()
     stop = threading.Event()
     try:

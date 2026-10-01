@@ -489,6 +489,10 @@ MSDK 5.3.0 RC key inventory: `rc-joystick/README.md`.
   - `bridge --profile sim` is for the Unity sim: spacing 0.4–1.6, readController.py's range, because
     the sim takes `angular.x` unclamped as its `d_ref`. The default flocking profile's 0.6–1.4 is
     where `swarm_flocking.py` clamps. `--ax-range` overrides either.
+  - Under `--profile sim` C2 is the experiment's **identify** button, not a knob reset: it counts
+    into an extra `marks` int (cumulative, so a lost datagram loses no press) that the sim's
+    `ExperimentRecorder` logs as the moment of each identify. Only that profile sends the field,
+    so the AOS consumers still get readController.py's exact JSON.
   - Without `--rc`, the bridge and the monitor broadcast, and also unicast to the last RC they locked
     onto (`%LOCALAPPDATA%\rcjoy\last_rc.txt`). One `--rc` is enough for every later launch, even
     when the firewall blocks broadcast replies. A loopback `--rc` (fake RC) is never saved.

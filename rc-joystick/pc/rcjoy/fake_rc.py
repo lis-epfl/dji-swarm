@@ -257,7 +257,7 @@ STEPS = (
     ("right dial RIGHT   (flocking: angular.x rises to 1.4)", {"r": 660}, None),
     ("left dial LEFT     (flocking: s2 falls)", {"l": -660}, None),
     ("C1 press           (s1 flips)", {}, "c1"),
-    ("C2 press           (knobs back to ax 1.0 / s2 0.0)", {}, "c2"),
+    ("C2 press           (knobs back to ax 1.0 / s2 0.0; sim: marks +1)", {}, "c2"),
 )
 
 

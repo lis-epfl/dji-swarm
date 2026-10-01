@@ -18,7 +18,7 @@ The folder imports nothing from `AOS server/` or `lis-swarm-app/`. The wire cont
 
 | Part | State |
 |---|---|
-| PC package `pc/rcjoy/` (client, bridge, monitor, fake RC) | **done**; `python -m rcjoy selftest` passes all 117 checks |
+| PC package `pc/rcjoy/` (client, bridge, monitor, fake RC) | **done**; `python -m rcjoy selftest` passes all 122 checks |
 | Swarm dropout failsafe (`AOS server/udp_joystick_receiver.JoystickWatchdog`) | **done**; it protects the Taranis path too |
 | Android app `android/` (LIS_CONTROLLER, App Key in the manifest) | **1.6** (2026-09-28): 1.5's stream on a new minimalist screen and icon (below). 1.5 ran on the RC Pro from 2026-09-25, over Ethernet from 2026-09-28: sticks and dials from the built-in gamepad at ~70 Hz, MSDK as witness and fallback, every axis cross-checked. History: 1.0 crashed on open ([DEBUGGING.md](android/DEBUGGING.md) §0); 1.1 showed a false AIRCRAFT LINKED and its liveness read was rejected (fixed in 1.2); 1.3 retried registration by itself; 1.4 found DJI's gate on the gamepad. The protocol code passed a PC-side JVM run against the real `RcJoystickClient`, gamepad path included. |
 | Ethernet (2026-09-28) | **passes**: 100 states/s, 0 lost, IP stable across a replug, back ~3 s after one. The PC gets **~60 fresh samples/s** in fast mode, capped by the RC's 60 Hz screen (below). Open: the gamepad's **slow mode** (below). |
@@ -234,7 +234,12 @@ python -m rcjoy fake-rc  [--pattern steps|sweep|still] [--input-hz 70] [--aircra
     `--ax-range LO,HI` overrides any profile's range.
   - `--profile joystick`: the left (gimbal) dial drives `angular.x`, which `joystick_controller.py`
     reads as the gimbal.
-  - C1 toggles `s1` (Unity panorama). C2 resets both knobs.
+  - C1 toggles `s1` (Unity panorama). C2 resets both knobs, **except under `--profile sim`**,
+    where it is the experiment's identify button: it adds a `marks` field, a JSON int counting
+    C2 presses since the bridge started, and leaves the knobs alone (a reset would snap the
+    spread and the gimbal at the moment the pilot reports a target). A count rather than a
+    level, as the RC sends it, so a press survives a lost or unread datagram. The flocking and
+    joystick profiles never send `marks`.
   - `s2` never reaches ±1, because `joystick_controller.py` would read `int(s2) == 1` as LAND.
 - **Hardware-free end-to-end check:** run `fake-rc` → `bridge --rc 127.0.0.1` → the receiver
   smoke test. **Use spare ports**, e.g. `fake-rc --bind 127.0.0.1 --port 5170` and
@@ -274,7 +279,7 @@ What the simulator does with each field (`vr_swarm_simulation`, `InputManager.cs
 | `angular.x` | **spread = Olfati-Saber `d_ref`**, used unclamped | right dial drives a knob | the dial springs back, so the knob **holds** its value when released. `--profile sim` gives readController.py's 0.4–1.6 |
 | `switches.s1` | `userSwitch`: panorama on (+1) / feeds (−1), acted on when it **changes** | C1 toggles it; starts at +1 | – |
 | `switches.s2` | FPV gimbal pitch, `SetGimbalPitchNormalized` over −1..+1 | left dial drives a knob, ±0.999, starts at 0 | the pitch moves **while** the dial is turned and holds when released. It starts at mid-range, not wherever a Taranis dial happened to be |
-| C2 | – | resets both knobs (spread 1.0, pitch mid) | new |
+| `marks` (sim profile only) | `ExperimentRecorder`: each increase is an **identify** (the moment the pilot reports a target; the experimenter's 1/2/3 key then gives its outcome) | C2 adds 1; starts at 0 | new. The other profiles send no `marks`, and there C2 resets both knobs (spread 1.0, pitch mid) |
 
 Two things the simulator does that matter for these tests:
 
@@ -302,7 +307,8 @@ saying `searching for the RC`. It prints `SENDING to
 2. Right dial turned right → `ax` climbs to `ax1.60` over ~3 s and stays there when released;
    turned left → down to `ax0.40`.
 3. Left dial → `s2` moves toward ±0.999 and stays.
-4. C1 → `s1` flips between `s1+1` and `s1-1`. C2 → `ax1.00`, `s2+0.00`.
+4. C1 → `s1` flips between `s1+1` and `s1-1`. C2 → a `[bridge] C2 mark #N` line, and `ax` /
+   `s2` stay where they were (without `--profile sim`: `ax1.00`, `s2+0.00`).
 5. Pull the RC's Ethernet → `NOT SENDING - stale …` within 0.3 s. Plug it back in → `SENDING`
    again within a few seconds.
 
@@ -319,9 +325,9 @@ In the scene, `InputManager`'s Input Mode must be **JOYSTICK** (or ANY), and
 2. **Climb:** left stick up climbs, gently near the centre (the curve is quadratic).
 3. **Yaw:** left stick right turns clockwise.
 4. **Spread:** right dial right → the swarm spreads out, and holds its spacing when you let go;
-   left → it tightens. The inspector's `d_ref` follows 0.4–1.6. C2 → back to 1.0.
+   left → it tightens. The inspector's `d_ref` follows 0.4–1.6.
 5. **Gimbal:** left dial → the FPV cameras pitch while you turn it, and stay put when you let go.
-   C2 → mid-range.
+   C2 leaves both the spread and the pitch where they are.
 6. **Panorama:** C1 switches between the panorama and the feeds each press. No change at start.
 7. **Lag:** fly for 2–3 minutes, then release everything. The swarm must stop at once. If the
    response lags more and more, the scene is below 20 fps (see above).

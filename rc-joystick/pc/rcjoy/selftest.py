@@ -634,6 +634,34 @@ def t_bridge(ck):
     ck("after a stale spell: no knob jump, and a press made meanwhile never lands late",
        m["angular"]["x"] == ax_before and m["switches"]["s1"] == -1)
 
+    # sim profile: C2 is the experiment's identify mark, not a knob reset
+    bs, t = Bridge(cl, profile="sim"), 0.0
+    cl.state = _st(dials={"r": 660, "l": 660}, presses={"c1": 0, "c2": 5})
+    m = bs.tick(t)
+    ck("sim profile: marks starts at 0 however many C2 presses the RC counted before",
+       m["marks"] == 0 and type(json.loads(json.dumps(m))["marks"]) is int)
+    for _ in range(10):
+        t += 0.05
+        bs.tick(t)
+    ax_before, s2_before = bs.ax, bs.s2
+    cl.state = _st(presses={"c1": 0, "c2": 6})
+    t += 0.05
+    m = bs.tick(t)
+    ck("sim profile: C2 counts a mark and leaves both knobs alone",
+       m["marks"] == 1 and m["angular"]["x"] == round(ax_before, 4)
+       and m["switches"]["s2"] == round(s2_before, 4) and ax_before > 1.0)
+    cl.state = _st(presses={"c1": 0, "c2": 8})
+    t += 0.05
+    ck("sim profile: two C2 presses in one tick count twice", bs.tick(t)["marks"] == 3)
+    cl.state = None
+    t += 0.05
+    bs.tick(t)
+    cl.state = _st(presses={"c1": 0, "c2": 9})
+    t += 2.0
+    ck("sim profile: a C2 press made while stale is not counted late", bs.tick(t)["marks"] == 3)
+    ck("the AOS profiles never send marks",
+       "marks" not in Bridge(cl).tick(t) and "marks" not in Bridge(cl, profile="joystick").tick(t))
+
     st = _st(dials={"r": 660})
     st.dials["r"] = None
     cl.state = st
